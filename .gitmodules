@@ -1,0 +1,7 @@
+[submodule "autodex/perception/thirdparty/object-6d-tracking"]
+	path = autodex/perception/thirdparty/object-6d-tracking
+	url = https://github.com/junc0ng/object-6d-tracking.git
+[submodule "autodex/perception/thirdparty/_object_6d_tracking"]
+	path = autodex/perception/thirdparty/_object_6d_tracking
+	url = https://github.com/snuvclab/_object_6d_tracking.git
+	branch = gunhee_v0
