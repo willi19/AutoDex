@@ -20,3 +20,10 @@ env/
 # Misc
 .DS_Store
 *.log
+
+# Video/media
+*.mp4
+*.avi
+
+# Third-party dependencies
+autodex/perception/thirdparty/
