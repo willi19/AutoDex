@@ -25,5 +25,12 @@ env/
 *.mp4
 *.avi
 
+# Large model files
+*.ts
+*.pt
+*.pth
+*.onnx
+*.bin
+
 # Third-party dependencies
 autodex/perception/thirdparty/
