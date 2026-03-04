@@ -41,6 +41,10 @@ from tqdm import tqdm
 CACHE_ROOT = os.path.expanduser("~/video_cache")
 NETWORK_PREFIX = "/home/mingi/paradex1/capture"
 
+_FP_ROOT = Path(__file__).resolve().parents[2] / "autodex/perception/thirdparty/_object_6d_tracking/FoundationPose"
+MESH_COLOR = np.array([128, 0, 128], dtype=np.uint8)
+OVERLAY_ALPHA = 0.6
+
 
 def _get_cache_base(base_dir):
     base = str(Path(base_dir).resolve())
@@ -112,7 +116,7 @@ def _find_mask(idx_dir, serial):
 
 
 def collect_tasks(base_dir, serials, mesh_dir):
-    """Collect tasks from local cache — videos with mask + depth but no pose."""
+    """Collect tasks — one per episode, picks first serial with mask+depth."""
     cache_base = Path(_get_cache_base(base_dir))
     if not cache_base.is_dir():
         return []
@@ -127,21 +131,15 @@ def collect_tasks(base_dir, serials, mesh_dir):
         for idx_dir in sorted(obj_dir.iterdir()):
             if not idx_dir.is_dir():
                 continue
+            # Find first serial with video + depth + mask
+            found = False
             for serial in serials:
                 video_path = idx_dir / "videos" / f"{serial}.avi"
                 depth_path = idx_dir / "depth" / f"{serial}.avi"
                 if not (video_path.exists() and depth_path.exists()):
                     continue
-                # Skip if depth is truncated (fewer frames than rgb)
-                n_rgb = int(cv2.VideoCapture(str(video_path)).get(cv2.CAP_PROP_FRAME_COUNT))
-                n_depth = int(cv2.VideoCapture(str(depth_path)).get(cv2.CAP_PROP_FRAME_COUNT))
-                if n_depth < n_rgb:
-                    continue
                 mask_path, mask_is_video = _find_mask(idx_dir, serial)
                 if mask_path is None:
-                    continue
-                # Skip if pose already exists
-                if (idx_dir / "pose" / f"{serial}.npy").exists():
                     continue
                 # Need cam_param from network FS
                 rel = str(idx_dir.relative_to(cache_base))
@@ -151,6 +149,11 @@ def collect_tasks(base_dir, serials, mesh_dir):
                 tasks.append((str(video_path), mask_path, mask_is_video,
                               str(depth_path), str(idx_dir), str(net_dir),
                               serial, obj_name, str(mesh_path), idx_dir.name))
+                found = True
+                break
+            # Also skip if old per-serial pose exists (backward compat)
+            if not found:
+                continue
     return tasks
 
 
@@ -178,11 +181,78 @@ def _load_init_mask(mask_path, mask_is_video):
         return None
 
 
+def _to_4x4(T):
+    if T.shape == (3, 4):
+        T4 = np.eye(4, dtype=np.float64)
+        T4[:3, :] = T
+        return T4
+    return T.astype(np.float64)
+
+
+def _save_debug_images(rgb, depth, mask, out_dir):
+    """Save debug visualizations of pose init inputs: depth.png, seg_grid.png."""
+    # Depth: colorize with turbo colormap
+    valid = depth > 0
+    if valid.any():
+        d_min, d_max = depth[valid].min(), depth[valid].max()
+        depth_norm = np.zeros_like(depth, dtype=np.uint8)
+        depth_norm[valid] = np.clip(
+            (depth[valid] - d_min) / (d_max - d_min + 1e-6) * 255, 0, 255
+        ).astype(np.uint8)
+        depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_TURBO)
+        depth_color[~valid] = 0
+    else:
+        depth_color = np.zeros((*depth.shape, 3), dtype=np.uint8)
+    cv2.imwrite(os.path.join(out_dir, "depth.png"), depth_color)
+
+    # Seg mask: overlay mask contour on RGB
+    rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    overlay = rgb_bgr.copy()
+    mask_u8 = (mask * 255).astype(np.uint8)
+    # Tint masked region green
+    overlay[mask > 0, 1] = np.clip(
+        overlay[mask > 0, 1].astype(np.int16) + 80, 0, 255
+    ).astype(np.uint8)
+    # Draw contour
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(overlay, contours, -1, (0, 255, 0), 2)
+    cv2.imwrite(os.path.join(out_dir, "seg_grid.png"), overlay)
+
+    print(f"  Debug saved: depth.png (range {depth[valid].min():.3f}-{depth[valid].max():.3f}m), seg_grid.png"
+          if valid.any() else "  Debug saved: depth.png (EMPTY), seg_grid.png", flush=True)
+
+
+def _save_pose_overlay(rgb, pose_4x4, K, mesh_tensors, glctx, device, out_dir):
+    """Render mesh overlay on RGB using estimated pose and save as overlay.png."""
+    from Utils import nvdiffrast_render
+
+    H, W = rgb.shape[:2]
+    pose_t = torch.as_tensor(pose_4x4, device=device, dtype=torch.float32).reshape(1, 4, 4)
+
+    render_color, _, _ = nvdiffrast_render(
+        K=K, H=H, W=W, ob_in_cams=pose_t, glctx=glctx,
+        mesh_tensors=mesh_tensors, use_light=False,
+    )
+    render_mask = render_color[0].detach().cpu().numpy().sum(axis=2) > 0
+
+    overlay = rgb.copy()
+    overlay[render_mask] = (
+        overlay[render_mask].astype(np.float32) * (1.0 - OVERLAY_ALPHA)
+        + MESH_COLOR.astype(np.float32) * OVERLAY_ALPHA
+    ).astype(np.uint8)
+    cv2.imwrite(os.path.join(out_dir, "overlay.png"),
+                cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+    print("  Debug saved: overlay.png", flush=True)
+
+
 def process_one_video(tracker, video_path, mask_path, mask_is_video, depth_path,
-                      cache_dir, net_dir, serial, obj_name, downscale, est_refine_iter):
-    """Run FoundationPose tracking on one video. Saves pose/{serial}.npy (N,4,4)."""
+                      cache_dir, net_dir, serial, obj_name, downscale, est_refine_iter,
+                      mesh_tensors=None, glctx=None, device="cuda:0"):
+    """Run FoundationPose tracking on one video. Saves pose/pose_world.npy (N,4,4)."""
     intrinsics, extrinsics = load_cam_param(Path(net_dir))
     K = intrinsics[serial].copy()
+    T_cam = _to_4x4(extrinsics[serial])
+    T_cam_inv = np.linalg.inv(T_cam)
 
     # Load init mask once
     init_mask = _load_init_mask(mask_path, mask_is_video)
@@ -193,15 +263,11 @@ def process_one_video(tracker, video_path, mask_path, mask_is_video, depth_path,
     cap_rgb = cv2.VideoCapture(video_path)
     cap_depth = cv2.VideoCapture(depth_path)
 
-    n_rgb = int(cap_rgb.get(cv2.CAP_PROP_FRAME_COUNT))
-    n_depth = int(cap_depth.get(cv2.CAP_PROP_FRAME_COUNT))
-    n_frames = min(n_rgb, n_depth)
+    # Use RGB frame count only (FFV1 depth may report wrong count)
+    n_frames = int(cap_rgb.get(cv2.CAP_PROP_FRAME_COUNT))
     W = int(cap_rgb.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap_rgb.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    if n_rgb != n_depth:
-        print(f"  {W}x{H}, rgb={n_rgb} depth={n_depth} -> using {n_frames} (mask: {'video' if mask_is_video else 'image'})", flush=True)
-    else:
-        print(f"  {W}x{H}, {n_frames} frames (mask: {'video' if mask_is_video else 'image'})", flush=True)
+    print(f"  {W}x{H}, {n_frames} frames (mask: {'video' if mask_is_video else 'image'})", flush=True)
 
     # Downscale intrinsics if needed
     if downscale != 1.0:
@@ -219,9 +285,10 @@ def process_one_video(tracker, video_path, mask_path, mask_is_video, depth_path,
 
     tracker.reset()
     initialized = False
-    # Pre-allocate: NaN for frames without pose
-    all_poses = np.full((n_frames, 4, 4), np.nan, dtype=np.float32)
+    # Pre-allocate: NaN for frames without pose (world frame)
+    all_poses_world = np.full((n_frames, 4, 4), np.nan, dtype=np.float32)
     n_saved = 0
+    debug_saved = False
 
     for idx in tqdm(range(n_frames), desc="  pose", unit="f"):
         ret_rgb, bgr = cap_rgb.read()
@@ -237,14 +304,30 @@ def process_one_video(tracker, video_path, mask_path, mask_is_video, depth_path,
             rgb = cv2.resize(rgb, (nW, nH))
             depth = cv2.resize(depth, (nW, nH), interpolation=cv2.INTER_NEAREST)
 
+        # Save debug visualizations on first frame
+        if not debug_saved:
+            debug_saved = True
+            pose_dir = os.path.join(cache_dir, "pose")
+            os.makedirs(pose_dir, exist_ok=True)
+            _save_debug_images(rgb, depth, init_mask_scaled, pose_dir)
+
         try:
             if not initialized:
-                pose = tracker.init(rgb, depth, init_mask_scaled, K, iteration=est_refine_iter)
+                pose_cam = tracker.init(rgb, depth, init_mask_scaled, K, iteration=est_refine_iter)
                 initialized = True
+                # Save mesh overlay debug
+                if mesh_tensors is not None and glctx is not None:
+                    try:
+                        _save_pose_overlay(rgb, pose_cam.reshape(4, 4), K,
+                                           mesh_tensors, glctx, device, pose_dir)
+                    except Exception as e:
+                        print(f"  Overlay debug failed: {e}", flush=True)
             else:
-                pose = tracker.track(rgb, depth, K, iteration=2)
+                pose_cam = tracker.track(rgb, depth, K, iteration=2)
 
-            all_poses[idx] = pose.reshape(4, 4)
+            # Convert to world frame: pose_world = inv(extrinsic) @ pose_cam
+            pose_world = T_cam_inv @ pose_cam.reshape(4, 4)
+            all_poses_world[idx] = pose_world
             n_saved += 1
 
         except Exception as e:
@@ -254,11 +337,11 @@ def process_one_video(tracker, video_path, mask_path, mask_is_video, depth_path,
     cap_rgb.release()
     cap_depth.release()
 
-    # Save single file: poses (N,4,4) — NaN for missing frames
+    # Save world-frame poses (N,4,4)
     pose_dir = os.path.join(cache_dir, "pose")
     os.makedirs(pose_dir, exist_ok=True)
-    out_path = os.path.join(pose_dir, f"{serial}.npy")
-    np.save(out_path, all_poses)
+    out_path = os.path.join(pose_dir, "pose_world.npy")
+    np.save(out_path, all_poses_world)
     print(f"  Saved {n_saved}/{n_frames} poses -> {out_path}", flush=True)
 
 
@@ -293,6 +376,18 @@ def main():
         mesh_path = t[8]  # mesh_path
         tasks_by_mesh[mesh_path].append(t)
 
+    device = f"cuda:{args.gpu}"
+
+    # Set up rendering for debug overlay
+    fp_path = str(_FP_ROOT)
+    if fp_path not in sys.path:
+        sys.path.insert(0, fp_path)
+    import trimesh
+    import nvdiffrast.torch as dr
+    from Utils import make_mesh_tensors
+
+    glctx = dr.RasterizeCudaContext()
+
     done = 0
     total = len(tasks)
     for mesh_path, mesh_tasks in tasks_by_mesh.items():
@@ -301,7 +396,16 @@ def main():
         tracker = PoseTracker(mesh_path, device_id=args.gpu)
         # Suppress FoundationPose logging (Utils.py reloads logging module on import)
         logging.getLogger().setLevel(logging.WARNING)
-        print("PoseTracker ready.", flush=True)
+
+        # Load mesh for debug overlay
+        mesh = trimesh.load(mesh_path, force="mesh")
+        vertex_colors = np.tile(
+            np.append(MESH_COLOR, 255).reshape(1, 4),
+            (len(mesh.vertices), 1)
+        )
+        mesh.visual = trimesh.visual.ColorVisuals(vertex_colors=vertex_colors)
+        mesh_tensors = make_mesh_tensors(mesh, device=device)
+        print("PoseTracker + mesh ready.", flush=True)
 
         for (video_path, mask_path, mask_is_video, depth_path, cache_dir,
              net_dir, serial, obj_name, _, idx_name) in mesh_tasks:
@@ -312,6 +416,7 @@ def main():
                     tracker, video_path, mask_path, mask_is_video, depth_path,
                     cache_dir, net_dir, serial, obj_name,
                     args.downscale, args.est_refine_iter,
+                    mesh_tensors=mesh_tensors, glctx=glctx, device=device,
                 )
             except Exception as e:
                 import traceback

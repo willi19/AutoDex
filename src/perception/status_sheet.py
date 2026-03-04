@@ -75,7 +75,7 @@ def scan_hand(base_dir, serials):
 
             has_seg = any((idx_dir / "obj_mask" / f"{s}.avi").exists() for s in serials)
             has_depth = any((idx_dir / "depth" / f"{s}.avi").exists() for s in serials)
-            has_pose = any((idx_dir / "pose" / f"{s}.npy").exists() for s in serials)
+            has_pose = (idx_dir / "pose" / "pose_world.npy").exists()
 
             rows.append({
                 "hand": hand_name,
@@ -135,6 +135,8 @@ def main():
                         help="Serial numbers for the preceding --base (can repeat)")
     parser.add_argument("--output", default=None,
                         help="Output CSV path (default: {hand_name}_status.csv)")
+    parser.add_argument("--tsv", action="store_true",
+                        help="Also print TSV to stdout (paste into Google Sheets)")
     args = parser.parse_args()
 
     if len(args.base) != len(args.serials):
@@ -170,6 +172,24 @@ def main():
         writer.writerows(sorted_rows)
 
     print(f"Saved {len(sorted_rows)} rows to {out_path} ({n_new} new, {n_updated} updated)")
+
+    if args.tsv:
+        # Print TSV to stdout — pipe to clipboard or paste directly
+        tsv_lines = ["\t".join(HEADER)]
+        for row in sorted_rows:
+            tsv_lines.append("\t".join(row[col] for col in HEADER))
+        tsv_text = "\n".join(tsv_lines)
+        print("\n--- TSV (copy below, Ctrl+V into Google Sheets) ---")
+        print(tsv_text)
+        # Try to copy to clipboard
+        try:
+            import subprocess
+            proc = subprocess.Popen(["xclip", "-selection", "clipboard"],
+                                    stdin=subprocess.PIPE)
+            proc.communicate(tsv_text.encode())
+            print("--- Copied to clipboard! ---")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

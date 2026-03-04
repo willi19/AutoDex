@@ -64,7 +64,7 @@ def upload_results(base_dir):
                         continue
                     rel = f.relative_to(src_dir)
                     dst = dst_dir / rel
-                    if dst.exists():
+                    if dst.exists() and dst.stat().st_size == f.stat().st_size:
                         continue
                     os.makedirs(str(dst.parent), exist_ok=True)
                     t1 = time.time()
