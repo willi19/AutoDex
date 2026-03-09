@@ -33,7 +33,7 @@ import torch
 _SAM3_ROOT = Path(__file__).resolve().parents[2] / "autodex/perception/thirdparty/sam3"
 
 PROBE_FRAMES = 5
-MAX_FRAMES = 1200
+MAX_FRAMES = 550
 CACHE_ROOT = os.path.expanduser("~/video_cache")
 NETWORK_PREFIX = "/home/mingi/paradex1/capture"
 FALLBACK_PROMPT = "object"
@@ -121,9 +121,6 @@ def _cleanup_gpu(predictor, sid):
         predictor.handle_request(dict(type="close_session", session_id=sid))
     except Exception:
         pass
-    # Force clear any leftover sessions
-    if hasattr(predictor, '_ALL_INFERENCE_STATES'):
-        predictor._ALL_INFERENCE_STATES.clear()
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -151,6 +148,7 @@ def run_sam3_video(predictor, video_path, prompts, n_probe=5):
 
             # Reset state before each prompt (clears previous prompt/masks, keeps frames loaded)
             predictor.handle_request(dict(type="reset_session", session_id=sid))
+            torch.cuda.empty_cache()  # release feature_cache/cached_frame_outputs from allocator
 
             predictor.handle_request(
                 dict(type="add_prompt", session_id=sid, frame_index=0, text=p)
@@ -200,6 +198,10 @@ def main():
     parser.add_argument("--serials", nargs="+", default=None)
     args = parser.parse_args()
     print("Starting SAM3 fallback mask generation...", flush=True)
+
+    # Must be set before the CUDA allocator initializes.
+    # Prevents OOM from fragmented reserved-but-unallocated cache across videos.
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     torch.cuda.set_device(args.gpu)
     torch.backends.cuda.matmul.allow_tf32 = True
