@@ -16,9 +16,9 @@ from curobo.geom.types import WorldConfig
 from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig, MotionGenPlanConfig
 from curobo.wrap.model.robot_world import RobotWorld, RobotWorldConfig
 
-from rsslib.path import robot_configs_path, load_candidate
-from rsslib.conversion import se32action
-from rsslib.robot_config import INIT_STATE
+from autodex.utils.path import robot_configs_path, load_candidate
+from autodex.utils.conversion import se32action, cart2se3
+from autodex.utils.robot_config import INIT_STATE
 
 
 # ── Result ────────────────────────────────────────────────────────────────────
@@ -43,17 +43,17 @@ def _se3_to_7vec(mat: np.ndarray) -> list:
 
 
 def _to_curobo_world(scene_cfg: dict) -> dict:
-    """scene_cfg (SE3 poses) -> cuRobo WorldConfig dict."""
+    """scene_cfg -> cuRobo WorldConfig dict. Poses are already 7D [x,y,z,qw,qx,qy,qz]."""
     cfg = {"cuboid": {}, "mesh": {}}
     for name, info in scene_cfg.get("cuboid", {}).items():
         cfg["cuboid"][name] = {
             "dims": info["dims"],
-            "pose": _se3_to_7vec(info["pose"]),
+            "pose": info["pose"],
             "color": info.get("color", [0.5, 0.5, 0.5, 1.0]),
         }
     for name, info in scene_cfg.get("mesh", {}).items():
         cfg["mesh"][name] = {
-            "pose": _se3_to_7vec(info["pose"]),
+            "pose": info["pose"],
             "file_path": info["file_path"],
         }
     return cfg
@@ -80,7 +80,7 @@ class GraspPlanner:
             execute(result.traj)
     """
 
-    BATCH_SIZE = 150
+    BATCH_SIZE = 50
     N_CUBOIDS = 30
     N_MESHES = 100
 
@@ -165,16 +165,27 @@ class GraspPlanner:
 
     def _plan_batch(self, init_states: np.ndarray, goal_poses_se3: np.ndarray):
         """(B, dof), (B, 4, 4) -> success (B,), trajs (B, T, dof)."""
+        B = len(init_states)
+        # Pad to BATCH_SIZE so cuRobo gets a consistent batch size
+        if B < self.BATCH_SIZE:
+            pad = self.BATCH_SIZE - B
+            init_states = np.concatenate([init_states, np.tile(init_states[:1], (pad, 1))], axis=0)
+            goal_poses_se3 = np.concatenate([goal_poses_se3, np.tile(goal_poses_se3[:1], (pad, 1, 1))], axis=0)
+
         init_js = JointState.from_position(
             torch.tensor(init_states, dtype=torch.float32, device=self._tensor_args.device)
         )
-        result = self._motion_gen.plan_batch(
-            start_state=init_js,
-            goal_pose=_to_curobo_pose(goal_poses_se3, self._tensor_args.device),
-            plan_config=self._plan_cfg,
-        )
-        success = result.success.cpu().numpy()
-        trajs = result.optimized_plan.position.cpu().numpy() if success.any() else None
+        try:
+            result = self._motion_gen.plan_batch(
+                start_state=init_js,
+                goal_pose=_to_curobo_pose(goal_poses_se3, self._tensor_args.device),
+                plan_config=self._plan_cfg,
+            )
+        except RuntimeError:
+            # cuRobo crashes when IK finds 0 solutions (internal shape mismatch)
+            return np.zeros(B, dtype=bool), None
+        success = result.success.cpu().numpy()[:B]
+        trajs = result.optimized_plan.position.cpu().numpy()[:B] if success.any() else None
         if trajs is not None and trajs.ndim == 2:
             trajs = trajs[np.newaxis]
         return success, trajs
@@ -242,7 +253,7 @@ class GraspPlanner:
             grasp_pose (N, 16)
             collision  (N,) bool  — True if filtered out (collision OR backward)
         """
-        obj_pose = scene_cfg["mesh"]["target"]["pose"]
+        obj_pose = cart2se3(scene_cfg["mesh"]["target"]["pose"])
         wrist_se3, pregrasp, grasp, _ = load_candidate(obj_name, obj_pose, grasp_version)
 
         world_cfg = _to_curobo_world(scene_cfg)
@@ -257,8 +268,96 @@ class GraspPlanner:
         print(f"[planner] total={len(wrist_se3)}  collision={collision.sum()}  backward={backward.sum()}  valid={(~filtered).sum()}")
         return wrist_se3, grasp, filtered
 
+    def plan_all(self, scene_cfg: dict, obj_name: str, grasp_version: str):
+        """
+        Plan trajectories for all candidates (for visualization / debugging).
+
+        Returns:
+            wrist_se3    (N, 4, 4)
+            grasp_pose   (N, 16)
+            succ_mask    (N,) bool — trajectory planning success
+            collision    (N,) bool — collision or backward filtered
+            traj_list    list[N] of (T, dof) arrays or None
+        """
+        import time as _time
+        t_total = _time.time()
+
+        t0 = _time.time()
+        obj_pose = cart2se3(scene_cfg["mesh"]["target"]["pose"])
+        wrist_se3, pregrasp, grasp, scene_info = load_candidate(obj_name, obj_pose, grasp_version)
+        print(f"[planner] load candidates: {_time.time() - t0:.2f}s ({len(wrist_se3)} candidates)")
+
+        t0 = _time.time()
+        world_cfg = _to_curobo_world(scene_cfg)
+        if self._motion_gen is None:
+            self._init_motion_gen(world_cfg)
+        else:
+            self._update_world(world_cfg)
+        print(f"[planner] init/update motion gen: {_time.time() - t0:.2f}s")
+
+        t0 = _time.time()
+        N = len(wrist_se3)
+        collision = self._check_collision(world_cfg, wrist_se3, pregrasp)
+        backward = wrist_se3[:, 0, 2] < 0.3
+        filtered = collision | backward
+        valid = np.where(~filtered)[0]
+        print(f"[planner] collision check: {_time.time() - t0:.2f}s")
+
+        print(f"[planner] total={N}  collision={collision.sum()}  backward={backward.sum()}  valid={len(valid)}")
+
+        succ_mask = np.zeros(N, dtype=bool)
+        traj_list = [None] * N
+
+        if len(valid) == 0:
+            return wrist_se3, pregrasp, grasp, succ_mask, filtered, traj_list
+
+        inits = np.tile(INIT_STATE, (len(valid), 1))
+        has_succ = False
+        t_batch_total = 0.0
+        t_refine_total = 0.0
+        n_batches = 0
+        n_refines = 0
+
+        for start in range(0, len(valid), self.BATCH_SIZE):
+            batch = valid[start : start + self.BATCH_SIZE]
+            if has_succ:
+                break
+
+            t0 = _time.time()
+            success, trajs = self._plan_batch(
+                inits[start : start + len(batch)], wrist_se3[batch]
+            )
+            t_batch_total += _time.time() - t0
+            n_batches += 1
+            print(f"[planner] batch {n_batches}: {success.sum()}/{len(batch)} arm plan success ({_time.time() - t0:.2f}s)")
+
+            if trajs is not None and trajs.ndim == 2:
+                trajs = trajs[np.newaxis]
+
+            for i, idx in enumerate(batch):
+                if has_succ:
+                    break
+                if not success[i]:
+                    continue
+                goal = trajs[i, -1].copy()
+                goal[6:] = pregrasp[idx]
+                t1 = _time.time()
+                ok, traj = self._refine_fingers(INIT_STATE, goal)
+                t_refine_total += _time.time() - t1
+                n_refines += 1
+                print(f"[planner] plan_single #{n_refines} (idx={idx}): {'ok' if ok else 'fail'} ({_time.time() - t1:.2f}s)")
+                if ok:
+                    succ_mask[idx] = True
+                    traj_list[idx] = traj
+                    has_succ = True
+
+        print(f"[planner] timing: plan_batch={t_batch_total:.2f}s ({n_batches} calls)  plan_single={t_refine_total:.2f}s ({n_refines} calls)")
+        print(f"[planner] total plan_all: {_time.time() - t_total:.2f}s")
+
+        return wrist_se3, pregrasp, grasp, succ_mask, filtered, traj_list
+
     def plan(self, scene_cfg: dict, obj_name: str, grasp_version: str, mode: str = "batch") -> PlanResult:
-        obj_pose = scene_cfg["mesh"]["target"]["pose"]
+        obj_pose = cart2se3(scene_cfg["mesh"]["target"]["pose"])
         wrist_se3, pregrasp, grasp, scene_info = load_candidate(obj_name, obj_pose, grasp_version)
 
         world_cfg = _to_curobo_world(scene_cfg)

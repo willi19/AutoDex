@@ -17,7 +17,7 @@ class SimExecutor:
         """Show planned trajectory in viser viewer."""
         import trimesh
         from paradex.visualization.visualizer.viser import ViserViewer
-        from rsslib.path import urdf_path, obj_path
+        from autodex.utils.path import urdf_path, obj_path
 
         if not plan_result.success:
             print("Planning failed — nothing to visualize.")
