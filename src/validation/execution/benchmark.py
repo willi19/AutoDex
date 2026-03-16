@@ -27,7 +27,7 @@ import numpy as np
 AUTODEX_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(AUTODEX_ROOT))
 
-ALL_MODELS = ["yoloe", "sam3", "da3", "stereo_pytorch", "stereo_trt", "fpose", "silhouette"]
+ALL_MODELS = ["yoloe", "sam3", "sam3_image", "da3", "stereo_pytorch", "stereo_trt", "fpose", "silhouette"]
 
 
 # ── Data loading (shared by all benchmarks) ──────────────────────────────────
@@ -195,6 +195,61 @@ def bench_sam3(rgb):
 
     print(f"  {'Load:':<10} {load_time:>7.2f}s")
     print(f"  {'Infer:':<10} {infer_time:>7.3f}s")
+    print(f"  {'GPU mem:':<10} {mem_before:>7.0f}MB -> {mem_after_load:.0f}MB "
+          f"(+{mem_after_load - mem_before:.0f}MB, peak={mem_peak:.0f}MB)")
+    print(f"  Mask: {'found' if mask is not None else 'NOT FOUND'}")
+    print()
+
+    del seg
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def bench_sam3_image(rgb):
+    import torch
+    print("=" * 60)
+    print("SAM3 Image Model (single-frame)")
+    print("-" * 60)
+
+    torch.cuda.reset_peak_memory_stats()
+    mem_before = gpu_mem_mb()
+
+    t0 = time.perf_counter()
+    from autodex.perception import Sam3ImageSegmentor
+    seg = Sam3ImageSegmentor(gpu=0)
+    load_time = time.perf_counter() - t0
+    mem_after_load = gpu_mem_mb()
+
+    # Warmup
+    _ = seg.segment(rgb, "object")
+    torch.cuda.synchronize()
+
+    # Single image
+    t0 = time.perf_counter()
+    mask = seg.segment(rgb, "object on the checkerboard")
+    torch.cuda.synchronize()
+    infer_time = time.perf_counter() - t0
+
+    # Batch of 4
+    t0 = time.perf_counter()
+    for _ in range(4):
+        seg.segment(rgb, "object on the checkerboard")
+    torch.cuda.synchronize()
+    seq4_time = time.perf_counter() - t0
+
+    # Batch of 23
+    t0 = time.perf_counter()
+    for _ in range(23):
+        seg.segment(rgb, "object on the checkerboard")
+    torch.cuda.synchronize()
+    seq23_time = time.perf_counter() - t0
+
+    mem_peak = torch.cuda.max_memory_allocated() / 1024 / 1024
+
+    print(f"  {'Load:':<10} {load_time:>7.2f}s")
+    print(f"  {'Infer x1:':<10} {infer_time:>7.3f}s")
+    print(f"  {'Infer x4:':<10} {seq4_time:>7.3f}s  ({seq4_time/4:.3f}s/img)")
+    print(f"  {'Infer x23:':<10} {seq23_time:>7.3f}s  ({seq23_time/23:.3f}s/img)")
     print(f"  {'GPU mem:':<10} {mem_before:>7.0f}MB -> {mem_after_load:.0f}MB "
           f"(+{mem_after_load - mem_before:.0f}MB, peak={mem_peak:.0f}MB)")
     print(f"  Mask: {'found' if mask is not None else 'NOT FOUND'}")
@@ -555,6 +610,8 @@ def run_single(model, capture_dir, mesh, serial):
         bench_yoloe(rgb)
     elif model == "sam3":
         bench_sam3(rgb)
+    elif model == "sam3_image":
+        bench_sam3_image(rgb)
     elif model == "da3":
         bench_da3(rgb, K)
     elif model == "stereo_pytorch":

@@ -372,3 +372,57 @@ class Sam3Segmentor:
         if masks and 0 in masks:
             return _to_mask_u8(best_mask(masks[0]))
         return None
+
+
+class Sam3ImageSegmentor:
+    """SAM3 image model for single-frame segmentation. Much faster than video predictor."""
+
+    def __init__(self, gpu: int = 0, confidence_threshold: float = 0.5):
+        import os
+        import torch
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        torch.cuda.set_device(gpu)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
+        torch.inference_mode().__enter__()
+
+        sam3_path = str(_SAM3_ROOT)
+        if sam3_path not in sys.path:
+            sys.path.insert(0, sam3_path)
+        from sam3.model_builder import build_sam3_image_model
+        from sam3.model.sam3_image_processor import Sam3Processor
+
+        model = build_sam3_image_model(device="cuda")
+        self.processor = Sam3Processor(model, confidence_threshold=confidence_threshold)
+        self.gpu = gpu
+
+    def segment(self, rgb: np.ndarray, prompt: str) -> Optional[np.ndarray]:
+        """Single image segmentation. Returns uint8 mask (H, W) 0/255 or None."""
+        from PIL import Image
+        pil_image = Image.fromarray(rgb)
+        state = self.processor.set_image(pil_image)
+        state = self.processor.set_text_prompt(state=state, prompt=prompt)
+
+        if "masks" not in state or len(state["masks"]) == 0:
+            return None
+
+        # Pick highest-confidence mask
+        scores = state["scores"]
+        best_idx = scores.argmax().item()
+        mask_bool = state["masks"][best_idx].squeeze().cpu().numpy()
+        return (mask_bool * 255).astype(np.uint8)
+
+    def segment_batch(self, rgbs: List[np.ndarray], prompt: str) -> List[Optional[np.ndarray]]:
+        """Batch segmentation — backbone runs once for all images, then per-image text grounding."""
+        from PIL import Image
+        pil_images = [Image.fromarray(rgb) for rgb in rgbs]
+        state = self.processor.set_image_batch(pil_images)
+
+        # set_image_batch shares the backbone pass, but grounding is per-image
+        # Run text prompt to get detections
+        state = self.processor.set_text_prompt(state=state, prompt=prompt)
+
+        # TODO: verify batch mask output format and map detections to images
+        # For now, fall back to sequential per-image segmentation
+        return [self.segment(rgb, prompt) for rgb in rgbs]
