@@ -1,0 +1,114 @@
+{
+  "obj_name": "attached_container",
+  "grasp_version": "selected_100",
+  "pose_idx": "000",
+  "n_trials": 10,
+  "total_success": 10,
+  "success_rate": 1.0,
+  "mean_time_s": 39.84,
+  "grasp_success_counts": {
+    "('shelf', '117', '7')": 10
+  },
+  "trials": [
+    {
+      "trial": 0,
+      "success": true,
+      "time_s": 44.81,
+      "scene_info": [
+        "shelf",
+        "117",
+        "7"
+      ]
+    },
+    {
+      "trial": 1,
+      "success": true,
+      "time_s": 65.92,
+      "scene_info": [
+        "shelf",
+        "117",
+        "7"
+      ]
+    },
+    {
+      "trial": 2,
+      "success": true,
+      "time_s": 56.99,
+      "scene_info": [
+        "shelf",
+        "117",
+        "7"
+      ]
+    },
+    {
+      "trial": 3,
+      "success": true,
+      "time_s": 10.38,
+      "scene_info": [
+        "shelf",
+        "117",
+        "7"
+      ]
+    },
+    {
+      "trial": 4,
+      "success": true,
+      "time_s": 9.83,
+      "scene_info": [
+        "shelf",
+        "117",
+        "7"
+      ]
+    },
+    {
+      "trial": 5,
+      "success": true,
+      "time_s": 10.08,
+      "scene_info": [
+        "shelf",
+        "117",
+        "7"
+      ]
+    },
+    {
+      "trial": 6,
+      "success": true,
+      "time_s": 61.51,
+      "scene_info": [
+        "shelf",
+        "117",
+        "7"
+      ]
+    },
+    {
+      "trial": 7,
+      "success": true,
+      "time_s": 38.24,
+      "scene_info": [
+        "shelf",
+        "117",
+        "7"
+      ]
+    },
+    {
+      "trial": 8,
+      "success": true,
+      "time_s": 63.07,
+      "scene_info": [
+        "shelf",
+        "117",
+        "7"
+      ]
+    },
+    {
+      "trial": 9,
+      "success": true,
+      "time_s": 37.57,
+      "scene_info": [
+        "shelf",
+        "117",
+        "7"
+      ]
+    }
+  ]
+}

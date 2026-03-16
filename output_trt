@@ -1,0 +1,16 @@
+
+GPU: NVIDIA GeForce RTX 3090
+VRAM: 23.5GB
+
+Test data: serial=24080331, image=(1536, 2048, 3), depth=ok, mask=ok
+
+============================================================
+FoundationStereo (TensorRT)
+------------------------------------------------------------
+Stereo pair: 24080331 + 24122734, baseline=2.0825m, image=(1536, 2048, 3)
+  Load engine:              0.88s
+  Infer x1:                0.176s
+  Infer avg (x10):         0.139s
+  GPU mem:                     0MB -> 4246MB (+4246MB)
+  TRT resolution: 672x448
+

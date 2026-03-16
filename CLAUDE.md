@@ -1,0 +1,208 @@
+# AutoDex
+
+Dexterous manipulation pipeline: perception → planning → execution.
+
+## Repository Structure
+
+```
+autodex/                    # Core library (importable package)
+├── perception/             # Mask, depth, pose (has its own CLAUDE.md)
+│   ├── mask.py             # YOLOE + SAM3 segmentation
+│   ├── depth.py            # FoundationStereo + Depth-Anything-3
+│   ├── pose.py             # FoundationPose tracking
+│   ├── stereo_video_depth.py  # CLI batch stereo depth (TRT)
+│   └── thirdparty/         # External model repos + weights
+│       └── weights/        # yoloe-26x-seg.pt, mobileclip2_b.ts
+├── executor/               # Robot execution
+│   └── real.py             # Real robot executor
+└── utils/
+    └── file_io.py          # (WIP) Cache management, download/upload utilities
+
+src/                        # Scripts & CLI wrappers
+├── process/                # Batch processing pipelines
+│   ├── batch_mask.py       # SAM3 video segmentation
+│   ├── batch_mask_yoloe.py # YOLOE single-frame segmentation
+│   ├── batch_mask_all.py   # Run mask on all cameras
+│   ├── batch_depth.py      # Stereo depth (fixed camera pair, TRT)
+│   ├── batch_depth_auto.py # Stereo depth (auto pair selection, all cameras, TRT)
+│   ├── batch_pose.py       # FoundationPose batch tracking
+│   ├── batch_pose_overlay.py # Per-camera pose tracking + mesh overlay video
+│   ├── download_videos.py  # Network FS → local cache
+│   └── upload_results.py   # Local cache → network FS
+├── demo/                   # Demo scripts
+│   ├── real.py             # Real robot demo
+│   ├── perception_exp.py   # Perception experiment runner
+│   └── run_perception.py   # Perception pipeline demo
+├── visualization/
+│   ├── mesh_process/       # Mesh viewers (object, scene, table_top)
+│   └── turntable_grasp.py  # Turntable video renderer for grasp candidates
+└── validation/             # Validation & comparison scripts
+    └── perception/         # Perception pipeline validation (has its own CLAUDE.md)
+        ├── scene.py        # Single-scene overlay validation
+        ├── stereo_rectify.py  # Stereo rectification visualization
+        ├── viz_stereo_pairs.py # Visualize auto-selected stereo pairs
+        └── multiobject/    # Multi-object combinatorial validation pipeline
+
+Visualization/              # Scene visualization & evaluation
+├── scene.py                # Viser-based scene viewer
+└── ...                     # Evaluation, paper figures
+```
+
+## Key Conventions
+
+- **Local cache**: `~/video_cache/` mirrors network FS structure. Mapping: strip `/home/mingi/paradex1/capture/` prefix.
+- **Video format**: `.avi` throughout. Masks use MJPG codec. Depth uses FFV1 (lossless, uint16 mm encoded as BGR).
+- **Camera params**: `cam_param/intrinsics.json` + `extrinsics.json` per capture dir. Keyed by serial string.
+  - `intrinsics.json` values are dicts with `intrinsics_undistort`, `original_intrinsics`, `dist_params`, `width`, `height`.
+- **Capture dir layout**: `{base}/{obj_name}/{idx}/` with `videos/`, `cam_param/`, `depth/`, `obj_mask/`, etc.
+- **Model weights**: All in `autodex/perception/thirdparty/weights/`. Use `YOLOE_WEIGHTS` from `autodex.perception.mask` to reference.
+
+## Stereo Depth Pipeline
+
+Two depth scripts exist:
+
+- **`batch_depth.py`**: Fixed camera pair (manual `--left_serial` / `--right_serial`). Proven, simple.
+- **`batch_depth_auto.py`**: Auto pair selection for all cameras. Uses rig-based adjacency grouping (focal_group × z_level, angle-sorted, MAX_ANGLE_GAP=40°).
+
+### Stereo Rectification
+
+Both use `cv2.stereoRectify` to get R1/R2 rotation matrices.
+`src/process/depth.py` uses the **validation approach** (same as `stereo_rectify.py`):
+- Uses `f_orig = max(K_left[0,0], K_right[0,0])` instead of stereoRectify's `f_rect` (which can be degenerate for wide-baseline pairs).
+- Oversized canvas → valid region → workspace crop → final P matrix.
+- Both left/right use the same P matrix (same f, cx, cy), preserving epipolar alignment.
+
+### Stereo Rectification Cropping Rules (IMPORTANT)
+
+1. **Valid region**: Use UNION (`valid_l | valid_r`) — NEVER intersection, it cuts off the right camera's content.
+2. **Workspace crop**: Crop TO the fixed robot-frame bounding box, baked into the P matrix via `initUndistortRectifyMap` (one remap step, no intermediate full-size image).
+   - Fixed bounds in robot frame: `ws_min=[0.35, -0.30, 0.0]`, `ws_max=[0.80, 0.21, 0.4]`
+   - Same constants for every capture — determined once from charuco triangulation, NOT recomputed.
+   - Project 8 bbox corners via `C2R.npy` + extrinsics + R1/R2 into rectified space.
+   - Take UNION of both cameras' projections so the full bbox is visible in both views.
+3. **Same cx** for both cameras — no per-camera cx offset, no disparity correction needed.
+4. **Aspect ratio filter**: Skip pairs with ratio > 2.5:1 (degenerate wide-baseline pairs).
+5. **Objects must NEVER be cut off** — the bbox must fully contain the workspace.
+
+### Disparity-to-Depth: Rectified Z vs Original Z
+
+**Critical**: The stereo formula `depth = f * B / disparity` gives Z in the **rectified** camera frame, not the original camera frame. When un-rectifying depth back to original pixel coordinates, you must divide by `rz` — the Z component of `R1 @ K_inv @ [u, v, 1]` for each original pixel `(u, v)`:
+
+```
+Z_orig = Z_rect / rz
+```
+
+Without this, cameras with large R1 rotation (e.g. 65° for wide-baseline pairs) get ~30-50% depth error, causing massive cross-view reprojection misalignment. Cameras with small R1 rotation (~20°) appear fine because `rz ≈ 1`.
+
+This bug was subtle because:
+- Per-camera depth colormaps look visually correct (relative depth ordering is preserved)
+- Self-reprojection (pixel → 3D → same pixel) is trivially perfect for any depth value
+- Only cross-view reprojection reveals the error, and the magnitude depends on R1 rotation angle
+
+### Depth Debugging Checklist
+
+When stereo depth looks wrong, use **cross-view reprojection** to validate — NOT per-camera colormaps or self-reprojection (both hide errors). Steps:
+1. Pick a source camera with depth, backproject to 3D world using `K_src`, `T_src`
+2. Reproject 3D points to a different camera using `K_tgt`, `T_tgt`
+3. Overlay reprojected points on the target camera's image — features (checkerboard, objects) should align
+4. If misaligned: check `rz` correction, stereo pair quality (R1 rotation angle), baseline/focal length
+
+`batch_depth_auto.py --overlay_only` generates cross-view reprojection grids in `depth_overlay/`.
+
+### Depth Encoding
+
+FFV1 codec, uint16 millimeters as BGR: `B = low_byte, G = high_byte, R = 0`.
+Use `encode_depth_uint16()` / `decode_depth_uint16()` from `autodex.perception.depth`.
+
+## Conda Environments
+
+- `foundation_stereo`: FoundationStereo TRT depth (`tensorrt` + `pycuda` installed here)
+- `foundationpose`: FoundationPose, YOLOE
+- `sam3`: SAM3 segmentation, Depth-Anything-3
+
+## Grasp Candidate Visualization
+
+`src/visualization/turntable_grasp.py` renders turntable videos of grasp candidates (object + Allegro hand) using Open3D offscreen renderer (EGL headless).
+
+### Data Sources
+
+- **Candidates**: `{candidate_path}/{version}/{obj_name}/{scene_type}/{scene_id}/{grasp_name}/` — contains `wrist_se3.npy`, `grasp_pose.npy`, `pregrasp_pose.npy`
+- **Setcover order**: `{code_path}/order/{version}/{obj_name}/setcover_order.json` — ranked grasp list (greedy set cover)
+- **Object meshes**: `{obj_path}/{obj_name}/raw_mesh/{obj_name}.obj`
+- **Object pose**: `{obj_path}/{obj_name}/scene/table/4.json`
+- **Robot URDF**: `{urdf_path}/allegro_hand_description_right.urdf`
+
+Paths from `rsslib.path`: `candidate_path=/home/mingi/RSS_2026/candidates`, `code_path=/home/mingi/RSS_2026`, `obj_path=/home/mingi/shared_data/RSS2026_Mingi/object/paradex`.
+
+### Setcover Versions (no duplicates except attached_container → use revalidate)
+
+- `revalidate`: 33 objects
+- `v2`: 21 objects (20 unique after dedup)
+- `v3`: 45 objects
+- Total: 98 unique objects
+
+### Output Layout (episode-wise for HuggingFace/GitHub Pages)
+
+```
+data/{obj_name}/{rank:03d}/turntable.mp4
+```
+
+### Commands
+
+```bash
+# Single grasp
+python src/visualization/turntable_grasp.py --version revalidate --obj soap_dispenser --scene shelf/1/11
+
+# Top N from setcover
+python src/visualization/turntable_grasp.py --version revalidate --obj soap_dispenser --top 100
+
+# All 98 objects × top 100
+python src/visualization/turntable_grasp.py --batch-all --top 100
+```
+
+### Camera Auto-framing
+
+Uses bounding sphere of combined object+robot mesh. Camera distance = `sphere_radius * padding / sin(effective_half_fov)`. Guarantees no clipping at any turntable angle.
+
+## Planning Validation
+
+### Reachability Grid Search (`src/validation/planning/reachability_set.py`)
+
+Runs IK-only checks over a grid of (x_offset, z_rotation, tabletop_pose) per object.
+- Grid: x_offset [0.2–0.5, step 0.05] × z_rotation [0°–330°, step 30°] × all tabletop poses × 10 trials/point
+- Output: `outputs/reachability/{obj_name}/reachability_selected_100.json` (grid results) + `*_viz.json` (IK solutions for visualization)
+- 14 objects processed. IK is ~97% deterministic (all-or-nothing), ~3% partial at boundary configs.
+
+### Reachability Viewer (`src/validation/planning/reachability_viewer.py`)
+
+Interactive viser viewer for reachability results. Two modes:
+- **Single**: Robot at IK qpos + object mesh + 5 grasp candidate hands (green=forward, red=backward). Sliders for pose, x_offset, z_rotation, IK solution #.
+- **Heatmap**: 1D row of color-coded spheres along x_offset (green=reachable, red=unreachable, yellow=partial). Z_rotation controlled by slider. Robot shown at INIT_STATE default pose. Object mesh shown offset in y for reference.
+- **Filter/Navigate**: Jump between Reachable/Unreachable/Partial points.
+
+```bash
+python src/validation/planning/reachability_viewer.py --port 8080
+```
+
+### Planning Success Rate (`src/validation/planning/success_rate.py`)
+
+Compares IK reachability vs full planning success. Loads IK-reachable points from `outputs/reachability/`, runs `planner.plan()` only on those. Breaks early on success (only retries on failure). Saves per-stage timing breakdown (all/success/fail) to JSON.
+
+```bash
+python src/validation/planning/success_rate.py --obj attached_container --version selected_100 --n_trials 1
+```
+
+Output: `outputs/planning_success_rate/{obj_name}/plan_vs_ik_{version}.json`
+
+### Key Constants
+
+- `TABLE_POSE_XYZ = [1.1, 0, -0.1]`, `TABLE_DIMS = [2, 3, 0.2]`
+- `INIT_STATE`: from `autodex.utils.robot_config` — xarm6 + allegro default joint config
+- Grasp candidates: `selected_100` version, 100 per object via `load_candidate()`
+- Backward filter: `wrist_se3[:, 0, 2] < 0.3`
+
+## Ongoing Refactoring
+
+`src/process/` scripts have heavy code duplication with `autodex/perception/`.
+Plan: consolidate core logic into `autodex/`, make `src/process/` thin CLI wrappers.
+See `autodex/perception/CLAUDE.md` for detailed plan.

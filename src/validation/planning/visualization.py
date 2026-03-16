@@ -14,46 +14,68 @@ import numpy as np
 import trimesh
 
 sys.path.insert(0, os.path.join(os.path.expanduser("~"), "paradex"))
-sys.path.insert(0, os.path.join(os.path.expanduser("~"), "RSS_2026"))
 
 from paradex.visualization.visualizer.viser import ViserViewer
-from rsslib.visualizer import GraspPlanningVisualizer
-from rsslib.path import urdf_path, obj_path
-from rsslib.robot_config import INIT_STATE
+from autodex.visualizer import GraspPlanningVisualizer
+from autodex.utils.path import urdf_path, obj_path
+from autodex.utils.conversion import se32cart
+from autodex.utils.robot_config import INIT_STATE
 from autodex.planner import GraspPlanner
 
 
-def load_tabletop_scene(obj_name):
-    """Load object pose and build scene_cfg (SE3 format)."""
+def load_tabletop_scene(obj_name, pose_idx="000"):
+    """Load object pose and build scene_cfg with 7D poses [x,y,z,qw,qx,qy,qz].
+
+    Returns:
+        scene_cfg: dict with 7D poses (compatible with planner + SceneViewer)
+        obj_pose:  (4, 4) SE3 matrix of the object
+    """
     pose_dir = os.path.join(obj_path, obj_name, "processed_data", "info", "tabletop")
-    pose_file = sorted(os.listdir(pose_dir))[0]
-    obj_pose = np.load(os.path.join(pose_dir, pose_file))
-    obj_pose[0, 3] += 0.4
+    pose_file = os.path.join(pose_dir, f"{pose_idx}.npy")
+    if not os.path.exists(pose_file):
+        available = sorted(os.listdir(pose_dir))
+        raise FileNotFoundError(f"Pose {pose_idx} not found. Available: {available}")
+
+    obj_pose = np.load(pose_file)
+    obj_pose[0, 3] += 0.4  # shift forward
 
     mesh_path = os.path.join(obj_path, obj_name, "processed_data", "mesh", "simplified.obj")
 
-    table_pose = np.eye(4)
-    table_pose[2, 3] = -0.01
-
     scene_cfg = {
         "mesh": {
-            "target": {"pose": obj_pose, "file_path": mesh_path},
+            "target": {
+                "pose": se32cart(obj_pose).tolist(),
+                "file_path": mesh_path,
+            },
         },
         "cuboid": {
-            "table": {"dims": [10.0, 20.0, 0.02], "pose": table_pose},
+            "table": {
+                "dims": [2, 3, 0.2],
+                "pose": [1.1, 0, -0.1 + 0.037, 1, 0, 0, 0],
+            },
         },
     }
     return scene_cfg, obj_pose
 
 
+def _pose7_to_se3(pose_list):
+    """[x,y,z, qw,qx,qy,qz] -> 4x4 SE3."""
+    from scipy.spatial.transform import Rotation
+    se3 = np.eye(4)
+    se3[:3, 3] = pose_list[:3]
+    wxyz = pose_list[3:7]
+    se3[:3, :3] = Rotation.from_quat([wxyz[1], wxyz[2], wxyz[3], wxyz[0]]).as_matrix()
+    return se3
+
+
 class PlanningVisualizer(ViserViewer):
-    def __init__(self, obj_name, version="baseline"):
+    def __init__(self, obj_name, version="baseline", pose_idx="000"):
         super().__init__()
 
         self.obj_name = obj_name
 
         # plan
-        self.scene_cfg, self.obj_pose = load_tabletop_scene(obj_name)
+        self.scene_cfg, self.obj_pose = load_tabletop_scene(obj_name, pose_idx)
         planner = GraspPlanner()
         self.result = planner.plan(self.scene_cfg, obj_name=obj_name, grasp_version=version)
 
@@ -73,16 +95,18 @@ class PlanningVisualizer(ViserViewer):
     def _add_scene(self):
         # table
         for name, data in self.scene_cfg.get("cuboid", {}).items():
+            pose_se3 = _pose7_to_se3(data["pose"])
             box = trimesh.creation.box(extents=data["dims"])
-            self.add_object(f"cuboid_{name}", box, data["pose"])
+            self.add_object(f"cuboid_{name}", box, pose_se3)
             if name == "table":
                 self.change_color(f"cuboid_{name}", [240/255, 240/255, 245/255, 0.5])
 
-        # object mesh
+        # object mesh (use raw mesh for better visualization)
         for name, data in self.scene_cfg.get("mesh", {}).items():
+            pose_se3 = _pose7_to_se3(data["pose"])
             file_path = os.path.join(obj_path, self.obj_name, "raw_mesh", f"{self.obj_name}.obj")
             mesh = trimesh.load(file_path)
-            self.add_trimesh(f"mesh_{name}", mesh, data["pose"])
+            self.add_trimesh(f"mesh_{name}", mesh, pose_se3)
             if name == "target":
                 self.change_color(f"mesh_{name}", [0.8, 0.8, 0.8, 0.5])
 
@@ -150,22 +174,27 @@ class PlanningVisualizer(ViserViewer):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--obj",     type=str, default="attached_container")
-    parser.add_argument("--version", type=str, default="tselected_100")
-    parser.add_argument("--mode",    type=str, default="trajectory",
+    parser.add_argument("--obj",       type=str, default="attached_container")
+    parser.add_argument("--version",   type=str, default="selected_100")
+    parser.add_argument("--pose_idx",  type=str, default="000")
+    parser.add_argument("--mode",      type=str, default="trajectory",
                         choices=["trajectory", "candidates"])
     args = parser.parse_args()
 
     if args.mode == "candidates":
-        scene_cfg, obj_pose = load_tabletop_scene(args.obj)
+        scene_cfg, obj_pose = load_tabletop_scene(args.obj, args.pose_idx)
         planner = GraspPlanner()
-        wrist_se3, grasp_pose, filtered = planner.get_candidates(
+        wrist_se3, pregrasp, grasp_pose, filtered = planner.get_candidates(
             scene_cfg, obj_name=args.obj, grasp_version=args.version
         )
-        succ     = np.zeros(len(wrist_se3), dtype=bool)
+        succ = np.zeros(len(wrist_se3), dtype=bool)
         traj_list = [None] * len(wrist_se3)
-        vis = GraspPlanningVisualizer(scene_cfg, wrist_se3, grasp_pose, filtered, succ, traj_list)
+        vis = GraspPlanningVisualizer(
+            scene_cfg, wrist_se3, pregrasp, grasp_pose, filtered, succ, traj_list
+        )
     else:
-        vis = PlanningVisualizer(obj_name=args.obj, version=args.version)
+        vis = PlanningVisualizer(
+            obj_name=args.obj, version=args.version, pose_idx=args.pose_idx
+        )
 
     vis.start_viewer()

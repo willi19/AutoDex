@@ -1,0 +1,122 @@
+============================================================
+Perception Benchmark
+  Capture: /home/mingi/shared_data/RSS2026_Mingi/experiment/selected_100/attached_container/20260121_163623
+  Mesh:    /home/mingi/shared_data/object_6d/data/mesh/attached_container/attached_container.obj
+============================================================
+
+>>> [1/5] YOLOE (foundationpose env)
+
+GPU: NVIDIA GeForce RTX 3090
+VRAM: 23.5GB
+
+Test data: serial=24080331, image=(1536, 2048, 3), depth=ok, mask=ok
+
+============================================================
+YOLOE (single-frame mask)
+------------------------------------------------------------
+  Load:         0.18s
+  Infer:       0.410s
+  GPU mem:         0MB -> 0MB (+0MB, peak=615MB)
+  Mask: found
+
+
+>>> [2/5] SAM3 (sam3 env)
+
+GPU: NVIDIA GeForce RTX 3090
+VRAM: 23.5GB
+
+Test data: serial=24080331, image=(1536, 2048, 3), depth=ok, mask=ok
+
+============================================================
+SAM3 (single-frame mask)
+------------------------------------------------------------
+  Load:         6.32s
+  Infer:       1.708s
+  GPU mem:         0MB -> 3840MB (+3840MB, peak=5672MB)
+  Mask: found
+
+
+>>> [3/5] Depth-Anything-3 (sam3 env)
+
+GPU: NVIDIA GeForce RTX 3090
+VRAM: 23.5GB
+
+Test data: serial=24080331, image=(1536, 2048, 3), depth=ok, mask=ok
+
+============================================================
+Depth-Anything-3 (monocular depth)
+------------------------------------------------------------
+[97m[INFO ] using MLP layer as FFN[0m
+[97m[INFO ] Processed Images Done taking 0.021795988082885742 seconds. Shape:  torch.Size([1, 3, 378, 504])[0m
+[97m[INFO ] Model Forward Pass Done. Time: 3.423381805419922 seconds[0m
+[97m[INFO ] Conversion to Prediction Done. Time: 5.602836608886719e-05 seconds[0m
+[97m[INFO ] using MLP layer as FFN[0m
+[97m[INFO ] Processed Images Done taking 0.02458930015563965 seconds. Shape:  torch.Size([1, 3, 378, 504])[0m
+[97m[INFO ] Model Forward Pass Done. Time: 3.4211671352386475 seconds[0m
+[97m[INFO ] Conversion to Prediction Done. Time: 6.556510925292969e-05 seconds[0m
+[97m[INFO ] using MLP layer as FFN[0m
+[97m[INFO ] Processed Images Done taking 0.026475191116333008 seconds. Shape:  torch.Size([4, 3, 378, 504])[0m
+[97m[INFO ] Selecting reference view using strategy: saddle_balanced[0m
+[97m[INFO ] Model Forward Pass Done. Time: 14.119519233703613 seconds[0m
+[97m[INFO ] Conversion to Prediction Done. Time: 4.839897155761719e-05 seconds[0m
+  Load+1st:     5.77s
+  Infer x1:    4.275s
+  Infer x4:   14.860s  (3.715s/img)
+  GPU mem:         0MB -> 254MB (+254MB, peak=0MB)
+  Depth range: 0.86 - 0.90m
+
+
+>>> [4/5] FoundationPose (foundationpose env)
+
+GPU: NVIDIA GeForce RTX 3090
+VRAM: 23.5GB
+
+Test data: serial=24080331, image=(1536, 2048, 3), depth=ok, mask=ok
+
+============================================================
+FoundationPose (6D pose)
+------------------------------------------------------------
+Warp 1.0.2 initialized:
+   CUDA Toolkit 11.5, Driver 12.8
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 3090" (24 GiB, sm_86, mempool enabled)
+   Kernel cache:
+     /home/mingi/.cache/warp/1.0.2
+num original candidates = 252
+num of pose after clustering: 252
+Module Utils load on device 'cuda:0' took 3.09 ms
+  Load:                     3.26s
+  Register (5 iter):       0.970s  (240 candidates)
+  Register (2 iter):       0.551s  (240 candidates)
+  Track (2 iter):          0.065s  (1 candidate)
+  GPU mem (idle):            582MB  (+582MB)
+  GPU mem (register):    peak 9431MB
+  GPU mem (track):       peak 199MB
+
+
+>>> [5/5] Silhouette rendering (foundationpose env)
+
+GPU: NVIDIA GeForce RTX 3090
+VRAM: 23.5GB
+
+Test data: serial=24080331, image=(1536, 2048, 3), depth=ok, mask=ok
+
+============================================================
+Silhouette rendering (nvdiffrast mesh overlay)
+------------------------------------------------------------
+Warp 1.0.2 initialized:
+   CUDA Toolkit 11.5, Driver 12.8
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 3090" (24 GiB, sm_86, mempool enabled)
+   Kernel cache:
+     /home/mingi/.cache/warp/1.0.2
+  Load mesh+ctx:           0.133s
+  Render x1:               0.001s
+  Render x10:              0.013s  (0.001s/pose)
+  GPU mem:                     0MB -> 318MB (+318MB, peak=1973MB)
+
+
+============================================================
+All benchmarks complete.

@@ -14,6 +14,7 @@ from curobo.types.math import Pose
 from curobo.types.robot import JointState
 from curobo.geom.types import WorldConfig
 from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig, MotionGenPlanConfig
+from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
 from curobo.wrap.model.robot_world import RobotWorld, RobotWorldConfig
 
 from autodex.utils.path import robot_configs_path, load_candidate
@@ -31,6 +32,7 @@ class PlanResult:
     pregrasp_pose: np.ndarray         # (16,) hand joints
     grasp_pose: np.ndarray            # (16,) hand joints
     scene_info: list
+    timing: Optional[dict] = None     # per-stage timing breakdown
 
 
 # ── cuRobo format conversion (private) ───────────────────────────────────────
@@ -95,6 +97,7 @@ class GraspPlanner:
         self._tensor_args = TensorDeviceType()
         self._motion_gen: Optional[MotionGen] = None
         self._plan_cfg: Optional[MotionGenPlanConfig] = None
+        self._ik_solver: Optional[IKSolver] = None
 
     # ── world setup ───────────────────────────────────────────────────────────
 
@@ -147,6 +150,113 @@ class GraspPlanner:
         rw = RobotWorld(rw_config)
         d_world, d_self = rw.get_world_self_collision_distance_from_joints(q_t)
         return torch.logical_or(d_world > 0, d_self > 0).cpu().numpy()
+
+    # ── IK solver ─────────────────────────────────────────────────────────────
+
+    def _init_ik_solver(self, world_cfg: dict):
+        config = IKSolverConfig.load_from_robot_config(
+            self._robot_cfg,
+            WorldConfig.from_dict(world_cfg),
+            self._tensor_args,
+            num_seeds=32,
+            collision_cache={"obb": self.N_CUBOIDS, "mesh": self.N_MESHES},
+            collision_activation_distance=0.01,
+        )
+        self._ik_solver = IKSolver(config)
+
+    def solve_ik(self, scene_cfg: dict, obj_name: str, grasp_version: str,
+                 seed: Optional[int] = None):
+        """
+        IK-only reachability check for all grasp candidates.
+
+        Skips hand-object collision check (hand is supposed to be near the object).
+        Only applies backward filter. IK solver handles arm-scene collision internally.
+
+        Returns:
+            dict with per-candidate success, qpos, and timing.
+        """
+        import time as _time
+
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+
+        t0 = _time.time()
+        obj_pose = cart2se3(scene_cfg["mesh"]["target"]["pose"])
+        wrist_se3, pregrasp, grasp, scene_info = load_candidate(obj_name, obj_pose, grasp_version)
+        t_load = _time.time() - t0
+
+        t0 = _time.time()
+        # IK solver uses table-only world (no target mesh — arm shouldn't collide with table)
+        world_cfg_no_target = _to_curobo_world(scene_cfg)
+        world_cfg_no_target["mesh"] = {}
+        if self._ik_solver is None:
+            self._init_ik_solver(world_cfg_no_target)
+        else:
+            self._ik_solver.update_world(WorldConfig.from_dict(world_cfg_no_target))
+        t_world = _time.time() - t0
+
+        # Filter: backward + hand-table collision (no object mesh — hand should be near object)
+        t0 = _time.time()
+        backward = wrist_se3[:, 0, 2] < 0.3
+        collision = self._check_collision(world_cfg_no_target, wrist_se3, pregrasp)
+        filtered = backward | collision
+        valid = np.where(~filtered)[0]
+        t_filter = _time.time() - t0
+
+        N = len(wrist_se3)
+        ik_success = np.zeros(N, dtype=bool)
+        ik_qpos = np.full((N, 22), np.nan)  # 6 arm + 16 fingers
+
+        t0 = _time.time()
+        if len(valid) > 0:
+            # Process in fixed-size chunks for consistent CUDA graph shape
+            for chunk_start in range(0, len(valid), self.BATCH_SIZE):
+                chunk_idx = valid[chunk_start : chunk_start + self.BATCH_SIZE]
+                chunk_poses = wrist_se3[chunk_idx]
+                B = len(chunk_poses)
+
+                if B < self.BATCH_SIZE:
+                    pad = self.BATCH_SIZE - B
+                    chunk_poses = np.concatenate(
+                        [chunk_poses, np.tile(chunk_poses[:1], (pad, 1, 1))], axis=0)
+
+                goal = _to_curobo_pose(chunk_poses, self._tensor_args.device)
+                result = self._ik_solver.solve_batch(goal)
+                succ = result.success.cpu().numpy()[:B]
+                q_sol = result.solution.cpu().numpy()[:B]
+
+                if q_sol.ndim == 3:
+                    q_sol = q_sol[:, 0, :]
+
+                for i, idx in enumerate(chunk_idx):
+                    if succ[i]:
+                        ik_success[idx] = True
+                        ik_qpos[idx, :6] = q_sol[i, :6]
+                        ik_qpos[idx, 6:] = pregrasp[idx]
+        t_ik = _time.time() - t0
+
+        timing = {
+            "load_candidates_s": round(t_load, 3),
+            "world_setup_s": round(t_world, 3),
+            "filter_s": round(t_filter, 3),
+            "ik_solve_s": round(t_ik, 3),
+        }
+
+        return {
+            "n_total": N,
+            "n_backward": int(backward.sum()),
+            "n_table_collision": int(collision.sum()),
+            "n_valid": int(len(valid)),
+            "n_ik_success": int(ik_success.sum()),
+            "ik_success": ik_success,
+            "ik_qpos": ik_qpos,
+            "wrist_se3": wrist_se3,
+            "pregrasp": pregrasp,
+            "grasp": grasp,
+            "scene_info": scene_info,
+            "timing": timing,
+        }
 
     # ── motion planning ───────────────────────────────────────────────────────
 
@@ -206,41 +316,66 @@ class GraspPlanner:
     # ── internal pipeline ─────────────────────────────────────────────────────
 
     def _find_trajectory(self, world_cfg: dict, wrist_se3: np.ndarray, pregrasp: np.ndarray, mode: str):
-        """Filter candidates -> motion plan -> finger refinement. Returns (idx, traj)."""
+        """Filter candidates -> motion plan -> finger refinement. Returns (idx, traj, timing)."""
+        import time as _time
+        timing = {}
+
+        t0 = _time.time()
         collision = self._check_collision(world_cfg, wrist_se3, pregrasp)
         backward = wrist_se3[:, 0, 2] < 0.3
         valid = np.where(~(collision | backward))[0]
+        timing["collision_check_s"] = round(_time.time() - t0, 3)
 
         print(f"[planner] total={len(wrist_se3)}  collision={collision.sum()}  backward={backward.sum()}  valid={len(valid)}")
 
         if len(valid) == 0:
-            return None, None
+            return None, None, timing
 
         if mode == "goalset":
+            t0 = _time.time()
             local_idx, traj = self._plan_goalset(wrist_se3[valid])
+            timing["arm_plan_s"] = round(_time.time() - t0, 3)
             if local_idx is None:
-                return None, None
+                return None, None, timing
             idx = valid[local_idx]
             goal = traj[-1].copy()
             goal[6:] = pregrasp[idx]
+            t0 = _time.time()
             ok, traj = self._refine_fingers(INIT_STATE, goal)
-            return (idx, traj) if ok else (None, None)
+            timing["finger_refine_s"] = round(_time.time() - t0, 3)
+            return (idx, traj, timing) if ok else (None, None, timing)
 
         # batch mode
+        timing["arm_plan_s"] = 0.0
+        timing["finger_refine_s"] = 0.0
+        timing["n_batches"] = 0
+        timing["n_refine_attempts"] = 0
         inits = np.tile(INIT_STATE, (len(valid), 1))
         for start in range(0, len(valid), self.BATCH_SIZE):
             batch = valid[start : start + self.BATCH_SIZE]
+
+            t0 = _time.time()
             success, trajs = self._plan_batch(inits[start : start + len(batch)], wrist_se3[batch])
+            timing["arm_plan_s"] += _time.time() - t0
+            timing["n_batches"] += 1
+
             for i, idx in enumerate(batch):
                 if not success[i]:
                     continue
                 goal = trajs[i, -1].copy()
                 goal[6:] = pregrasp[idx]
+                t0 = _time.time()
                 ok, traj = self._refine_fingers(inits[start + i], goal)
+                timing["finger_refine_s"] += _time.time() - t0
+                timing["n_refine_attempts"] += 1
                 if ok:
-                    return idx, traj
+                    timing["arm_plan_s"] = round(timing["arm_plan_s"], 3)
+                    timing["finger_refine_s"] = round(timing["finger_refine_s"], 3)
+                    return idx, traj, timing
 
-        return None, None
+        timing["arm_plan_s"] = round(timing["arm_plan_s"], 3)
+        timing["finger_refine_s"] = round(timing["finger_refine_s"], 3)
+        return None, None, timing
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -250,6 +385,7 @@ class GraspPlanner:
 
         Returns:
             wrist_se3  (N, 4, 4)
+            pregrasp   (N, 16)
             grasp_pose (N, 16)
             collision  (N,) bool  — True if filtered out (collision OR backward)
         """
@@ -266,11 +402,16 @@ class GraspPlanner:
         backward  = wrist_se3[:, 0, 2] < 0.3
         filtered  = collision | backward
         print(f"[planner] total={len(wrist_se3)}  collision={collision.sum()}  backward={backward.sum()}  valid={(~filtered).sum()}")
-        return wrist_se3, grasp, filtered
+        return wrist_se3, pregrasp, grasp, filtered
 
-    def plan_all(self, scene_cfg: dict, obj_name: str, grasp_version: str):
+    def plan_all(self, scene_cfg: dict, obj_name: str, grasp_version: str,
+                 stop_on_first: bool = True):
         """
         Plan trajectories for all candidates (for visualization / debugging).
+
+        Args:
+            stop_on_first: If True (default), stop after first successful grasp.
+                           If False, attempt planning for ALL valid candidates.
 
         Returns:
             wrist_se3    (N, 4, 4)
@@ -356,24 +497,43 @@ class GraspPlanner:
 
         return wrist_se3, pregrasp, grasp, succ_mask, filtered, traj_list
 
-    def plan(self, scene_cfg: dict, obj_name: str, grasp_version: str, mode: str = "batch") -> PlanResult:
+    def plan(self, scene_cfg: dict, obj_name: str, grasp_version: str,
+             mode: str = "batch", seed: Optional[int] = None) -> PlanResult:
+        import time as _time
+
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+
+        t0 = _time.time()
         obj_pose = cart2se3(scene_cfg["mesh"]["target"]["pose"])
         wrist_se3, pregrasp, grasp, scene_info = load_candidate(obj_name, obj_pose, grasp_version)
+        t_load = _time.time() - t0
 
+        t0 = _time.time()
         world_cfg = _to_curobo_world(scene_cfg)
         if self._motion_gen is None:
             self._init_motion_gen(world_cfg)
         else:
             self._update_world(world_cfg)
+        t_world = _time.time() - t0
 
-        idx, traj = self._find_trajectory(world_cfg, wrist_se3.copy(), pregrasp, mode)
+        idx, traj, stage_timing = self._find_trajectory(world_cfg, wrist_se3.copy(), pregrasp, mode)
+
+        timing = {
+            "load_candidates_s": round(t_load, 3),
+            "world_setup_s": round(t_world, 3),
+            **stage_timing,
+        }
 
         if idx is None:
             return PlanResult(
                 success=False, traj=None, wrist_se3=None,
                 pregrasp_pose=pregrasp[0], grasp_pose=grasp[0], scene_info=[],
+                timing=timing,
             )
         return PlanResult(
             success=True, traj=traj, wrist_se3=wrist_se3[idx],
             pregrasp_pose=pregrasp[idx], grasp_pose=grasp[idx], scene_info=scene_info[idx],
+            timing=timing,
         )

@@ -51,10 +51,17 @@ class PoseTracker:
 
         self.device_id = device_id
         self.mesh = trimesh.load(mesh_path, force="mesh")
+        # Cast to float32 — FoundationPose internally computes mesh_diameter
+        # from vertices, and numpy.float64 propagates into torch tensors causing
+        # dtype mismatches (float64 @ float32) in crop window computation.
+        self.mesh.vertices = self.mesh.vertices.astype(np.float32)
 
         with torch.cuda.device(device_id):
             scorer = ScorePredictor()
             refiner = PoseRefinePredictor()
+            # Reduce internal render resolution to prevent OOM
+            # (matches ~/shared_data/_object_6d_tracking/run/run_object_6d_pipeline.py)
+            refiner.cfg['input_resize'] = (80, 80)
             glctx = dr.RasterizeCudaContext()
             self.estimator = FoundationPose(
                 model_pts=self.mesh.vertices,
@@ -89,9 +96,11 @@ class PoseTracker:
         """
         import torch
 
+        K_f32 = K.astype(np.float32) if K.dtype != np.float32 else K
+        depth_f32 = depth.astype(np.float32) if depth.dtype != np.float32 else depth
         with torch.cuda.device(self.device_id):
             pose = self.estimator.register(
-                K=K, rgb=rgb, depth=depth, ob_mask=mask.astype(bool), iteration=iteration
+                K=K_f32, rgb=rgb, depth=depth_f32, ob_mask=mask.astype(bool), iteration=iteration
             )
         return pose
 
@@ -115,8 +124,10 @@ class PoseTracker:
         """
         import torch
 
+        K_f32 = K.astype(np.float32) if K.dtype != np.float32 else K
+        depth_f32 = depth.astype(np.float32) if depth.dtype != np.float32 else depth
         with torch.cuda.device(self.device_id):
-            pose = self.estimator.track_one(rgb=rgb, depth=depth, K=K, iteration=iteration)
+            pose = self.estimator.track_one(rgb=rgb, depth=depth_f32, K=K_f32, iteration=iteration)
         return pose
 
     def reset(self):
