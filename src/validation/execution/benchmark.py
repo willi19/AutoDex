@@ -272,25 +272,37 @@ def bench_sam3_image(rgb):
     torch.cuda.synchronize()
     grounding23_time = time.perf_counter() - t0
 
-    # Batch backbone x23: one forward pass for all images
-    pil_images_23 = [Image.fromarray(rgb)] * 23
-    t0 = time.perf_counter()
-    batch_state = seg.processor.set_image_batch(pil_images_23)
-    torch.cuda.synchronize()
-    batch_backbone23_time = time.perf_counter() - t0
+    # Batch backbone: try increasing batch sizes until OOM
+    batch_results = {}
+    for bs in [4, 8, 12, 16, 23]:
+        try:
+            gc.collect()
+            torch.cuda.empty_cache()
+            pil_batch = [Image.fromarray(rgb)] * bs
+            t0 = time.perf_counter()
+            batch_state = seg.processor.set_image_batch(pil_batch)
+            torch.cuda.synchronize()
+            bb_time = time.perf_counter() - t0
 
-    # Split batch state into per-image states for grounding
-    t0 = time.perf_counter()
-    backbone_out = batch_state["backbone_out"]
-    for i in range(23):
-        per_img_state = {
-            "original_height": batch_state["original_heights"][i],
-            "original_width": batch_state["original_widths"][i],
-            "backbone_out": {k: v[i:i+1] if isinstance(v, torch.Tensor) else v for k, v in backbone_out.items()},
-        }
-        seg.processor.set_text_prompt(state=per_img_state, prompt="object on the checkerboard")
-    torch.cuda.synchronize()
-    batch_grounding23_time = time.perf_counter() - t0
+            # Per-image grounding
+            backbone_out = batch_state["backbone_out"]
+            t0 = time.perf_counter()
+            for i in range(bs):
+                per_img_state = {
+                    "original_height": batch_state["original_heights"][i],
+                    "original_width": batch_state["original_widths"][i],
+                    "backbone_out": {k: v[i:i+1] if isinstance(v, torch.Tensor) else v for k, v in backbone_out.items()},
+                }
+                seg.processor.set_text_prompt(state=per_img_state, prompt="object on the checkerboard")
+            torch.cuda.synchronize()
+            gr_time = time.perf_counter() - t0
+
+            batch_results[bs] = (bb_time, gr_time)
+        except torch.cuda.OutOfMemoryError:
+            gc.collect()
+            torch.cuda.empty_cache()
+            batch_results[bs] = None
+            break
 
     mem_peak = torch.cuda.max_memory_allocated() / 1024 / 1024
 
@@ -302,9 +314,12 @@ def bench_sam3_image(rgb):
     print(f"  {'Sequential x23:':<22} {seq23_time:>7.3f}s  ({seq23_time/23:.3f}s/img)")
     print(f"  {'Backbone x23 seq:':<22} {backbone23_time:>7.3f}s  ({backbone23_time/23:.3f}s/img)")
     print(f"  {'Grounding x23:':<22} {grounding23_time:>7.3f}s  ({grounding23_time/23:.3f}s/img)")
-    print(f"  {'Batch backbone x23:':<22} {batch_backbone23_time:>7.3f}s")
-    print(f"  {'Batch grounding x23:':<22} {batch_grounding23_time:>7.3f}s")
-    print(f"  {'Batch total x23:':<22} {batch_backbone23_time+batch_grounding23_time:>7.3f}s")
+    for bs, result in batch_results.items():
+        if result is None:
+            print(f"  {'Batch x' + str(bs) + ':':<22} OOM")
+        else:
+            bb, gr = result
+            print(f"  {'Batch x' + str(bs) + ':':<22} bb={bb:.3f}s + gr={gr:.3f}s = {bb+gr:.3f}s  ({(bb+gr)/bs:.3f}s/img)")
     print(f"  {'GPU mem:':<22} {mem_before:>7.0f}MB -> {mem_after_load:.0f}MB "
           f"(+{mem_after_load - mem_before:.0f}MB, peak={mem_peak:.0f}MB)")
     print(f"  Mask: {'found' if mask is not None else 'NOT FOUND'}")
