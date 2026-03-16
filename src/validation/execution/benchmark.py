@@ -244,31 +244,31 @@ def bench_sam3_image(rgb):
     torch.cuda.synchronize()
     seq23_time = time.perf_counter() - t0
 
-    # Batch backbone x4, then per-image grounding
+    # Measure backbone vs grounding split (single image)
     from PIL import Image
-    pil_images_4 = [Image.fromarray(rgb)] * 4
+    pil_img = Image.fromarray(rgb)
     t0 = time.perf_counter()
-    state = seg.processor.set_image_batch(pil_images_4)
+    state = seg.processor.set_image(pil_img)
     torch.cuda.synchronize()
-    backbone4_time = time.perf_counter() - t0
+    backbone_time = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    for i in range(4):
-        # Per-image grounding after shared backbone
-        seg.processor.set_text_prompt(state=state, prompt="object on the checkerboard")
+    seg.processor.set_text_prompt(state=state, prompt="object on the checkerboard")
     torch.cuda.synchronize()
-    grounding4_time = time.perf_counter() - t0
+    grounding_time = time.perf_counter() - t0
 
-    # Batch backbone x23
-    pil_images_23 = [Image.fromarray(rgb)] * 23
+    # Backbone x23 sequential, measure total
     t0 = time.perf_counter()
-    state = seg.processor.set_image_batch(pil_images_23)
+    states = []
+    for _ in range(23):
+        states.append(seg.processor.set_image(pil_img))
     torch.cuda.synchronize()
     backbone23_time = time.perf_counter() - t0
 
+    # Grounding x23 sequential (reuse cached backbone states)
     t0 = time.perf_counter()
-    for i in range(23):
-        seg.processor.set_text_prompt(state=state, prompt="object on the checkerboard")
+    for s in states:
+        seg.processor.set_text_prompt(state=s, prompt="object on the checkerboard")
     torch.cuda.synchronize()
     grounding23_time = time.perf_counter() - t0
 
@@ -276,12 +276,12 @@ def bench_sam3_image(rgb):
 
     print(f"  {'Load:':<22} {load_time:>7.2f}s")
     print(f"  {'Infer x1:':<22} {infer_time:>7.3f}s")
+    print(f"  {'  backbone:':<22} {backbone_time:>7.3f}s")
+    print(f"  {'  grounding:':<22} {grounding_time:>7.3f}s")
     print(f"  {'Sequential x4:':<22} {seq4_time:>7.3f}s  ({seq4_time/4:.3f}s/img)")
     print(f"  {'Sequential x23:':<22} {seq23_time:>7.3f}s  ({seq23_time/23:.3f}s/img)")
-    print(f"  {'Batch backbone x4:':<22} {backbone4_time:>7.3f}s")
-    print(f"  {'  + grounding x4:':<22} {grounding4_time:>7.3f}s  (total {backbone4_time+grounding4_time:.3f}s)")
-    print(f"  {'Batch backbone x23:':<22} {backbone23_time:>7.3f}s")
-    print(f"  {'  + grounding x23:':<22} {grounding23_time:>7.3f}s  (total {backbone23_time+grounding23_time:.3f}s)")
+    print(f"  {'Backbone x23:':<22} {backbone23_time:>7.3f}s  ({backbone23_time/23:.3f}s/img)")
+    print(f"  {'Grounding x23:':<22} {grounding23_time:>7.3f}s  ({grounding23_time/23:.3f}s/img)")
     print(f"  {'GPU mem:':<22} {mem_before:>7.0f}MB -> {mem_after_load:.0f}MB "
           f"(+{mem_after_load - mem_before:.0f}MB, peak={mem_peak:.0f}MB)")
     print(f"  Mask: {'found' if mask is not None else 'NOT FOUND'}")
