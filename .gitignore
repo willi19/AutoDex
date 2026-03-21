@@ -37,7 +37,8 @@ output/
 *.bin
 
 # Third-party dependencies
-autodex/perception/thirdparty/
+autodex/perception/thirdparty/*
+!autodex/perception/thirdparty/sam3
 bodex_outputs/*
 candidates/*
 outputs/*
