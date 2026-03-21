@@ -1025,7 +1025,7 @@ def get_depth_da3(
     Returns:
         depth_maps: list of depth maps (H, W) in meters
     """
-    da3_src = str(_GUNHEE / "Depth-Anything-3/src")
+    da3_src = str(Path(__file__).parent / "thirdparty/Depth-Anything-3/src")
     if da3_src not in sys.path:
         sys.path.insert(0, da3_src)
 

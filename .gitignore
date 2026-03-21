@@ -40,6 +40,7 @@ output/
 autodex/perception/thirdparty/*
 !autodex/perception/thirdparty/sam3
 !autodex/perception/thirdparty/FoundationPose
+!autodex/perception/thirdparty/Depth-Anything-3
 autodex/perception/thirdparty/FoundationPose/weights
 autodex/perception/thirdparty/weights
 bodex_outputs/*

@@ -90,7 +90,7 @@ class PerceptionPipeline:
             return
         logger.info("Loading DA3 model...")
         t0 = time.perf_counter()
-        _da3_src = str(Path(__file__).parent / "thirdparty/_object_6d_tracking/Depth-Anything-3/src")
+        _da3_src = str(Path(__file__).resolve().parents[3] / "autodex/perception/thirdparty/Depth-Anything-3/src")
         if _da3_src not in sys.path:
             sys.path.insert(0, _da3_src)
         from depth_anything_3.api import DepthAnything3
