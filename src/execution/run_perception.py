@@ -18,7 +18,7 @@ from src.execution.daemon.perception_pipeline import PerceptionPipeline
 
 logging.basicConfig(level=logging.INFO, format='[%(name)s] %(message)s')
 
-MESH_ROOT = Path("/home/mingi/shared_data/object_6d/data/mesh")
+MESH_ROOT = Path.home() / "shared_data/object_6d/data/mesh"
 
 # Default daemon hosts
 SAM3_HOSTS = [
