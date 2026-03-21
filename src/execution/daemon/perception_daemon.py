@@ -28,6 +28,13 @@ import zmq
 logging.basicConfig(level=logging.INFO, format='[%(name)s] %(message)s')
 logger = logging.getLogger("daemon")
 
+import re
+_HOME = str(Path.home())
+
+def _localize_path(path: str) -> str:
+    """Replace /home/*/shared_data/ with local home's shared_data/."""
+    return re.sub(r'/home/[^/]+/shared_data/', f'{_HOME}/shared_data/', path)
+
 
 def run_sam3_daemon(port: int, gpu: int = 0):
     """SAM3 image model daemon. Receives image path, returns mask path."""
@@ -50,9 +57,9 @@ def run_sam3_daemon(port: int, gpu: int = 0):
                 sock.send_string(json.dumps({"status": "ok"}))
                 continue
 
-            image_path = req["image_path"]
+            image_path = _localize_path(req["image_path"])
             prompt = req.get("prompt", "object on the checkerboard")
-            output_path = req.get("output_path")  # where to save mask
+            output_path = _localize_path(req["output_path"]) if req.get("output_path") else None
 
             rgb = cv2.cvtColor(cv2.imread(image_path), cv2.COLOR_BGR2RGB)
             mask = seg.segment(rgb, prompt)
@@ -106,15 +113,15 @@ def run_fpose_daemon(port: int, mesh_path: str, gpu: int = 0):
                 continue
 
             if req.get("command") == "reset_mesh":
-                new_mesh = req["mesh_path"]
+                new_mesh = _localize_path(req["mesh_path"])
                 tracker = PoseTracker(new_mesh, device_id=gpu)
                 logger.info(f"Mesh reset to {new_mesh}")
                 sock.send_string(json.dumps({"status": "ok"}))
                 continue
 
-            image_path = req["image_path"]
-            depth_path = req["depth_path"]
-            mask_path = req["mask_path"]
+            image_path = _localize_path(req["image_path"])
+            depth_path = _localize_path(req["depth_path"])
+            mask_path = _localize_path(req["mask_path"])
             K = np.array(req["K"], dtype=np.float32)
             mode = req.get("mode", "register")
             iteration = req.get("iteration", 5)
@@ -145,7 +152,7 @@ def run_fpose_daemon(port: int, mesh_path: str, gpu: int = 0):
             dt = time.perf_counter() - t0
 
             # Save pose if output_path given
-            output_path = req.get("output_path")
+            output_path = _localize_path(req["output_path"]) if req.get("output_path") else None
             if output_path:
                 Path(output_path).parent.mkdir(parents=True, exist_ok=True)
                 np.save(output_path, pose)
