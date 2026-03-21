@@ -13,6 +13,8 @@ autodex/                    # Core library (importable package)
 │   ├── stereo_video_depth.py  # CLI batch stereo depth (TRT)
 │   └── thirdparty/         # External model repos + weights
 │       └── weights/        # yoloe-26x-seg.pt, mobileclip2_b.ts
+├── planner/                # Motion planning (has its own CLAUDE.md)
+│   └── planner.py          # GraspPlanner: IK → plan_single_js
 ├── executor/               # Robot execution
 │   └── real.py             # Real robot executor
 └── utils/
@@ -36,12 +38,21 @@ src/                        # Scripts & CLI wrappers
 ├── visualization/
 │   ├── mesh_process/       # Mesh viewers (object, scene, table_top)
 │   └── turntable_grasp.py  # Turntable video renderer for grasp candidates
+├── grasp_generation/
+│   ├── BODex/              # Dexterous grasp generation (has its own CLAUDE.md)
+│   │   ├── generate.py     # Main entry point
+│   │   ├── run.sh          # Batch runner — edit object list here
+│   │   └── src/curobo/     # Forked cuRobo library
+│   └── sim_filter/         # MuJoCo validation + set cover selection (has its own CLAUDE.md)
 └── validation/             # Validation & comparison scripts
     └── perception/         # Perception pipeline validation (has its own CLAUDE.md)
         ├── scene.py        # Single-scene overlay validation
         ├── stereo_rectify.py  # Stereo rectification visualization
         ├── viz_stereo_pairs.py # Visualize auto-selected stereo pairs
         └── multiobject/    # Multi-object combinatorial validation pipeline
+
+bodex_outputs/              # BODex grasp generation results (gitignored)
+logging/                    # Run logs (grasp_generation/generate.log)
 
 Visualization/              # Scene visualization & evaluation
 ├── scene.py                # Viser-based scene viewer
@@ -200,6 +211,64 @@ Output: `outputs/planning_success_rate/{obj_name}/plan_vs_ik_{version}.json`
 - `INIT_STATE`: from `autodex.utils.robot_config` — xarm6 + allegro default joint config
 - Grasp candidates: `selected_100` version, 100 per object via `load_candidate()`
 - Backward filter: `wrist_se3[:, 0, 2] < 0.3`
+
+## External Dependency: `rsslib` (legacy, being replaced)
+
+Old shared library at `~/RSS_2026/rsslib/`. Still imported by `src/`, `Visualization/`, and BODex scripts. **All core functionality already ported to `autodex/`:**
+
+- `rsslib.path` → `autodex.utils.path` (identical functions, `project_dir` changed to `~/shared_data/AutoDex`)
+- `rsslib.conversion` → `autodex.utils.conversion` (identical: `cart2se3`, `se32cart`, `se32action`)
+- `rsslib.robot_config` → `autodex.utils.robot_config` (identical: `INIT_STATE`, `LINK6_TO_WRIST`)
+- `rsslib.scene` → `autodex.utils.scene` (partial: `overlay_scene`, `get_scene_image_dict_template`)
+- `rsslib.curobo_util` → `autodex.planner.planner.GraspPlanner` (fully superseded — `CuroboPlanner`/`CuroboIkSolver`/`filter_collision`/`get_traj` are all methods on `GraspPlanner`)
+- `rsslib.planner` → `autodex.planner.planner` (superseded)
+- `rsslib.visualizer`, `rsslib.gui_player` — not yet ported (Viser GUI helpers)
+
+Migration: mechanically replace `from rsslib.xxx import` → `from autodex.utils.xxx import` in `src/` scripts. BODex internal imports need separate handling (it's a forked cuRobo with its own `rsslib` refs).
+
+## Grasp Generation: BODex (`src/grasp_generation/BODex/`)
+
+GPU-accelerated dexterous grasp generation built on a **forked NVIDIA cuRobo**. Optimizes Allegro hand joint angles + wrist pose for force-closure grasps with collision avoidance. See `src/grasp_generation/BODex/CLAUDE.md` for architecture details.
+
+## Grasp Pipeline: BODex → Sim Filter → Candidate → Selection
+
+BODex raw outputs go through sim validation and selection before planning. See `src/grasp_generation/sim_filter/CLAUDE.md` for details.
+
+```
+bodex_outputs/ → MuJoCo sim eval → candidates/ → set cover selection → selected_100/
+```
+
+Key data (currently at `~/RSS_2026/`): `candidates/{version}/`, `order/{version}/`, `candidates/selected_100/`.
+
+## Perception Evaluation Pipeline (`src/validation/execution/eval_perception/`)
+
+Evaluates per-view 6D pose quality to select the best camera views.
+See `src/validation/execution/eval_perception/CLAUDE.md` for details.
+
+### CRITICAL: Reference Implementation
+
+**`/home/mingi/shared_data/_object_6d_tracking/`** is the reference (ground truth) pipeline. When writing perception code, ALWAYS read and follow the reference implementation first. Do NOT improvise or write from scratch.
+
+Key reference files:
+- `run/models/depth_server.py` — DA3 depth: `DepthAnything3.from_pretrained()`, intrinsics + extrinsics, fallback on exception
+- `run/models/foundationpose_server.py` — FPose: `trimesh.load(process=False)`, downscale=0.5, `mask.astype(bool)`
+- `run/models/silhouette_server.py` — Differentiable silhouette optimization (200 iters, MSE + IoU loss, rotation 6d parameterization)
+- `run/run_object_6d_pipeline_distributed.py` — Full pipeline orchestration, NMS, visualization with `nvdiffrast_render`
+
+### HARD RULES (learned from mistakes)
+
+1. **NEVER use `DepthAnything3(model_name=...)` — ALWAYS use `DepthAnything3.from_pretrained("depth-anything/DA3-LARGE")`**. The constructor creates random-init weights. `from_pretrained` loads actual trained weights.
+2. **NEVER omit extrinsics from DA3** — multi-view alignment with extrinsics gives correct metric depth. Without extrinsics, depth scale is wrong.
+3. **NEVER use `trimesh.load(force="mesh")`** for FoundationPose — use `process=False`. `force="mesh"` merges/deduplicates vertices (7944 vs 22743), changing the mesh geometry.
+4. **NEVER rewrite rendering code** — use `Utils.py`'s `nvdiffrast_render` and `make_mesh_tensors` directly. Import requires pytorch3d in the env.
+5. **When something doesn't work, read the reference code first** — don't blame external factors (DA3, extrinsics, calibration, xformers).
+
+## Conda Environments (Updated)
+
+- `foundation_stereo`: FoundationStereo TRT (`tensorrt` + `pycuda`)
+- `foundationpose`: FoundationPose, YOLOE, pytorch3d, nvdiffrast
+- `sam3`: SAM3 segmentation
+- `dav3`: Depth-Anything-3 (separate env with all DA3 dependencies)
 
 ## Ongoing Refactoring
 

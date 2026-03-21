@@ -38,3 +38,7 @@ output/
 
 # Third-party dependencies
 autodex/perception/thirdparty/
+bodex_outputs/*
+candidates/*
+outputs/*
+logging/*

@@ -66,91 +66,303 @@ def load_cam_param(capture_dir: Path) -> Tuple[Dict[str, np.ndarray], Dict[str, 
     return intrinsics, extrinsics
 
 
-def build_rectify_maps(K_left, K_right, T_left, T_right, image_size):
-    """Compute stereo rectification maps that preserve original scale.
-
-    Uses stereoRectify for rotation matrices R1/R2, then constructs custom
-    projection matrices with the original focal length. Output is cropped to
-    the intersection region (where both images have content) so every pixel
-    carries useful information — no black borders, no wasted TRT resolution.
-
-    Returns: (map_left, map_right, R1, R2, P1, P2, f_rect, cx, cy, baseline, out_size)
-        out_size: (W_out, H_out) — the overlap region size
-    """
+def _compute_rectify_params(K_left, K_right, T_left, T_right, image_size):
+    """Compute stereo rectification geometry (no maps, no allocation)."""
     W, H = image_size
     T_l = _to_4x4(T_left)
     T_r = _to_4x4(T_right)
     T_rel = T_r @ np.linalg.inv(T_l)
 
-    # Get rectification rotations and baseline from stereoRectify
     R1, R2, P1_cv, P2_cv, _, _, _ = cv2.stereoRectify(
         K_left, None, K_right, None, (W, H),
         T_rel[:3, :3], T_rel[:3, 3],
         flags=cv2.CALIB_ZERO_DISPARITY, alpha=0,
     )
+    f_rect_cv = float(P1_cv[0, 0])
+    Tx_phys = float(P2_cv[0, 3]) / (f_rect_cv + 1e-9)
+    baseline = abs(Tx_phys)
+    f_orig = max(float(K_left[0, 0]), float(K_right[0, 0]))
 
-    # Use original focal length — no zoom
-    f_rect = float(max(K_left[0, 0], K_right[0, 0]))
+    return {
+        "R1": R1, "R2": R2,
+        "f_rect": f_orig, "Tx_phys": Tx_phys, "baseline": baseline,
+        "P1_cv": P1_cv, "P2_cv": P2_cv, "f_rect_cv": f_rect_cv,
+    }
 
-    # Find valid output region via remap inverse maps (robust to large rotations
-    # where undistortPoints fails due to z→0 projection singularities).
-    f_cv = float(P1_cv[0, 0])
-    Tx_phys = float(P2_cv[0, 3]) / f_cv if f_cv != 0 else 0.0
 
-    W_big, H_big = W * 3, H * 3
-    P1_big = np.array([
+def _find_valid_region(K_left, K_right, R1, R2, f_rect, Tx_phys, image_size):
+    """Find the union of both cameras' valid regions on an oversized canvas."""
+    W, H = image_size
+    corners = np.array([[0, 0], [W, 0], [W, H], [0, H]], dtype=np.float64)
+    all_projected = []
+    for K, R in [(K_left, R1), (K_right, R2)]:
+        pts = corners.reshape(-1, 1, 2)
+        P_id = np.array([[f_rect, 0, 0], [0, f_rect, 0], [0, 0, 1]], dtype=np.float64)
+        projected = cv2.undistortPoints(pts, K, None, R=R, P=P_id)
+        all_projected.append(projected.reshape(-1, 2))
+    all_projected = np.vstack(all_projected)
+    margin = 100
+    x_range = all_projected[:, 0].max() - all_projected[:, 0].min() + 2 * margin
+    y_range = all_projected[:, 1].max() - all_projected[:, 1].min() + 2 * margin
+    W_big = max(int(np.ceil(x_range)), W * 3)
+    H_big = max(int(np.ceil(y_range)), H * 3)
+
+    P_big = np.array([
         [f_rect, 0, W_big / 2.0, 0],
         [0, f_rect, H_big / 2.0, 0],
         [0, 0, 1, 0],
     ], dtype=np.float64)
-    P2_big = P1_big.copy()
-    P2_big[0, 3] = f_rect * Tx_phys
+    P_big_r = P_big.copy()
+    P_big_r[0, 3] = f_rect * Tx_phys
 
-    map_l_big = cv2.initUndistortRectifyMap(K_left, None, R1, P1_big, (W_big, H_big), cv2.CV_32FC1)
-    map_r_big = cv2.initUndistortRectifyMap(K_right, None, R2, P2_big, (W_big, H_big), cv2.CV_32FC1)
+    map_l_big = cv2.initUndistortRectifyMap(K_left, None, R1, P_big, (W_big, H_big), cv2.CV_32FC1)
+    map_r_big = cv2.initUndistortRectifyMap(K_right, None, R2, P_big_r, (W_big, H_big), cv2.CV_32FC1)
 
     valid_l = ((map_l_big[0] >= 0) & (map_l_big[0] < W) &
                (map_l_big[1] >= 0) & (map_l_big[1] < H))
     valid_r = ((map_r_big[0] >= 0) & (map_r_big[0] < W) &
                (map_r_big[1] >= 0) & (map_r_big[1] < H))
 
-    # Intersection: where BOTH images have content (for depth estimation)
-    valid_inter = (valid_l & valid_r).astype(np.uint8)
-    ys, xs = np.where(valid_inter)
-
+    valid_both = valid_l | valid_r  # Union
+    ys, xs = np.where(valid_both)
     if len(xs) == 0:
-        raise ValueError(
-            "No overlapping region after rectification. "
-            "Cameras likely face opposite directions or need too much rotation."
-        )
-
+        return None
     x0, x1 = int(xs.min()), int(xs.max()) + 1
     y0, y1 = int(ys.min()), int(ys.max()) + 1
+    return (x0, y0, x1, y1, W_big, H_big)
 
-    # Output size and principal point (shift so intersection starts at (0,0))
-    cx = W_big / 2.0 - x0
-    cy = H_big / 2.0 - y0
-    W_out = x1 - x0
-    H_out = y1 - y0
 
-    # Build projection matrices
-    P1 = np.zeros((3, 4), dtype=np.float64)
-    P1[0, 0] = f_rect
-    P1[1, 1] = f_rect
-    P1[0, 2] = cx
-    P1[1, 2] = cy
-    P1[2, 2] = 1.0
+def _workspace_crop(K_left, T_left, R1, K_right, T_right, R2,
+                    f_rect, cx_big, cy_big,
+                    vx0, vy0, vx1, vy1,
+                    capture_dir):
+    """Compute workspace crop in big-canvas coordinates.
 
-    # P2 has baseline offset: P2[0,3] = f_rect * Tx (from stereoRectify)
-    P2 = P1.copy()
-    P2[0, 3] = f_rect * Tx_phys
+    Same crop for both cameras. Union of both cameras' workspace projections.
+    Returns (cx0, cy0, cx1, cy1) in big-canvas coords, or None.
+    """
+    from pathlib import Path
+    if capture_dir is None:
+        return None
+    c2r_path = Path(capture_dir) / "C2R.npy"
+    if not c2r_path.exists():
+        return None
 
-    baseline = abs(Tx_phys)
+    ws_min = np.array([0.35, -0.30, 0.0])
+    ws_max = np.array([0.80, 0.21, 0.4])
+    corners_robot = np.array([[x, y, z]
+                              for x in [ws_min[0], ws_max[0]]
+                              for y in [ws_min[1], ws_max[1]]
+                              for z in [ws_min[2], ws_max[2]]])
 
-    map_left = cv2.initUndistortRectifyMap(K_left, None, R1, P1, (W_out, H_out), cv2.CV_32FC1)
-    map_right = cv2.initUndistortRectifyMap(K_right, None, R2, P2, (W_out, H_out), cv2.CV_32FC1)
+    C2R = np.load(str(c2r_path))
+    C2R_4x4 = _to_4x4(C2R)
 
-    return map_left, map_right, R1, R2, P1, P2, f_rect, cx, cy, baseline, (W_out, H_out)
+    margin = 50
+    per_cam_px = []
+    per_cam_py = []
+    for T_cam, R_rect in [(T_left, R1), (T_right, R2)]:
+        T_c = _to_4x4(T_cam)
+        robot_to_cam = T_c @ C2R_4x4
+        corners_cam = (robot_to_cam[:3, :3] @ corners_robot.T).T + robot_to_cam[:3, 3]
+        in_front = corners_cam[:, 2] > 0.01
+        if not in_front.any():
+            return None
+        corners_cam = corners_cam[in_front]
+        R_64 = R_rect.astype(np.float64)
+        corners_rect = (R_64 @ corners_cam.T).T
+        in_front_rect = corners_rect[:, 2] > 0.01
+        if not in_front_rect.any():
+            return None
+        corners_rect = corners_rect[in_front_rect]
+        px = f_rect * corners_rect[:, 0] / corners_rect[:, 2] + cx_big
+        py = f_rect * corners_rect[:, 1] / corners_rect[:, 2] + cy_big
+        per_cam_px.append(px)
+        per_cam_py.append(py)
+
+    if len(per_cam_px) != 2:
+        return None
+    all_px = np.concatenate(per_cam_px)
+    all_py = np.concatenate(per_cam_py)
+    cx0 = max(vx0, int(all_px.min()) - margin)
+    cx1 = min(vx1, int(all_px.max()) + margin)
+    cy0 = max(vy0, int(all_py.min()) - margin)
+    cy1 = min(vy1, int(all_py.max()) + margin)
+    if cx1 <= cx0 or cy1 <= cy0:
+        return None
+    return (cx0, cy0, cx1, cy1)
+
+
+def build_rectify_maps(K_left, K_right, T_left, T_right, image_size,
+                       capture_dir=None):
+    """Compute stereo rectification maps cropped to valid region + workspace.
+
+    Output maps remap raw images directly to the intersection of both cameras'
+    valid regions, optionally cropped to robot workspace.
+
+    Returns: (map_left, map_right, R1, R2, f_rect, cx, cy, baseline,
+              rect_size, disp_offset)
+        rect_size = (W_out, H_out) — final output size.
+        disp_offset = always 0.0 (same cx for both cameras).
+    """
+    W, H = image_size
+    params = _compute_rectify_params(K_left, K_right, T_left, T_right, (W, H))
+    R1, R2 = params["R1"], params["R2"]
+    f_rect = params["f_rect"]
+    Tx_phys = params["Tx_phys"]
+    baseline = params["baseline"]
+
+    valid = _find_valid_region(K_left, K_right, R1, R2, f_rect, Tx_phys, (W, H))
+    if valid is None:
+        P1_cv, P2_cv = params["P1_cv"], params["P2_cv"]
+        f_cv = params["f_rect_cv"]
+        map_left = cv2.initUndistortRectifyMap(K_left, None, R1, P1_cv, (W, H), cv2.CV_32FC1)
+        map_right = cv2.initUndistortRectifyMap(K_right, None, R2, P2_cv, (W, H), cv2.CV_32FC1)
+        return (map_left, map_right, R1, R2, f_cv,
+                float(P1_cv[0, 2]), float(P1_cv[1, 2]),
+                baseline, (W, H), 0.0)
+
+    vx0, vy0, vx1, vy1, W_big, H_big = valid
+    cx_big = W_big / 2.0
+    cy_big = H_big / 2.0
+
+    ws_crop = _workspace_crop(
+        K_left, T_left, R1, K_right, T_right, R2,
+        f_rect, cx_big, cy_big, vx0, vy0, vx1, vy1,
+        capture_dir)
+
+    if ws_crop is not None:
+        cx0, cy0, cx1, cy1 = ws_crop
+    else:
+        cx0, cy0, cx1, cy1 = vx0, vy0, vx1, vy1
+    W_out = cx1 - cx0
+    H_out = cy1 - cy0
+
+    cx_out = cx_big - cx0
+    cy_out = cy_big - cy0
+
+    P_out = np.array([
+        [f_rect, 0, cx_out, 0],
+        [0, f_rect, cy_out, 0],
+        [0, 0, 1, 0],
+    ], dtype=np.float64)
+    P_out_r = P_out.copy()
+    P_out_r[0, 3] = f_rect * Tx_phys
+
+    map_left = cv2.initUndistortRectifyMap(K_left, None, R1, P_out, (W_out, H_out), cv2.CV_32FC1)
+    map_right = cv2.initUndistortRectifyMap(K_right, None, R2, P_out_r, (W_out, H_out), cv2.CV_32FC1)
+
+    logger.info(f"    Rectify+crop: valid {vx1-vx0}x{vy1-vy0} -> out {W_out}x{H_out}")
+
+    return (map_left, map_right, R1, R2, f_rect,
+            cx_out, cy_out, baseline, (W_out, H_out), 0.0)
+
+
+def disp_to_depth_left(disp_trt, f_rect, baseline,
+                       K_left, R1, cx_rect, cy_rect,
+                       W_orig, H_orig, W_rect, H_rect, H_trt, W_trt):
+    """Convert left disparity to depth map aligned to the original left camera.
+
+    Uses inverse mapping (cv2.remap) to avoid moire/aliasing artifacts.
+    Applies Z_orig = Z_rect / rz correction for rectification rotation.
+    """
+    f_trt = f_rect * W_trt / W_rect
+
+    valid = disp_trt >= 0.5
+    depth_trt = np.zeros_like(disp_trt)
+    depth_trt[valid] = f_trt * baseline / np.maximum(disp_trt[valid], 0.1)
+
+    depth_rect = cv2.resize(depth_trt, (W_rect, H_rect),
+                            interpolation=cv2.INTER_NEAREST)
+
+    u_grid, v_grid = np.meshgrid(
+        np.arange(W_orig, dtype=np.float64),
+        np.arange(H_orig, dtype=np.float64),
+    )
+    K_inv = np.linalg.inv(K_left.astype(np.float64))
+    x_norm = K_inv[0, 0] * u_grid + K_inv[0, 1] * v_grid + K_inv[0, 2]
+    y_norm = K_inv[1, 0] * u_grid + K_inv[1, 1] * v_grid + K_inv[1, 2]
+    z_norm = np.ones_like(u_grid)
+    R1_64 = R1.astype(np.float64)
+    rx = R1_64[0, 0] * x_norm + R1_64[0, 1] * y_norm + R1_64[0, 2] * z_norm
+    ry = R1_64[1, 0] * x_norm + R1_64[1, 1] * y_norm + R1_64[1, 2] * z_norm
+    rz = R1_64[2, 0] * x_norm + R1_64[2, 1] * y_norm + R1_64[2, 2] * z_norm
+    inv_map_x = (f_rect * rx / rz + cx_rect).astype(np.float32)
+    inv_map_y = (f_rect * ry / rz + cy_rect).astype(np.float32)
+
+    depth_rect_sampled = cv2.remap(depth_rect, inv_map_x, inv_map_y,
+                                    cv2.INTER_NEAREST)
+    rz_safe = np.where(np.abs(rz) > 1e-6, rz, 1.0)
+    depth_map = depth_rect_sampled / rz_safe.astype(np.float32)
+    depth_map[depth_rect_sampled < 0.001] = 0
+    return depth_map
+
+
+def find_all_stereo_pairs(capture_dir, serials, intrinsics, extrinsics):
+    """Find stereo pairs using rig-based adjacency grouping.
+
+    Groups by (focal_group, z_level), sorts by angle, pairs adjacent cameras.
+    Returns: [(left_serial, right_serial, baseline_m), ...]
+    """
+    from collections import defaultdict
+    from pathlib import Path
+
+    MAX_ANGLE_GAP = 40.0
+
+    def focal_group(serial):
+        f = float(intrinsics[serial][0, 0])
+        if f < 2500:
+            return "wide"
+        elif f < 4000:
+            return "mid"
+        return "tele"
+
+    c2r_path = Path(capture_dir) / "C2R.npy"
+    if c2r_path.exists():
+        C2R_inv = np.linalg.inv(np.load(str(c2r_path)))
+    else:
+        C2R_inv = np.eye(4)
+
+    rig_data = {}
+    positions = {}
+    for s in serials:
+        T = _to_4x4(extrinsics[s])
+        pos_world = -T[:3, :3].T @ T[:3, 3]
+        pos_rig = C2R_inv[:3, :3] @ pos_world + C2R_inv[:3, 3]
+        angle = float(np.degrees(np.arctan2(pos_rig[1], pos_rig[0])))
+        z = float(pos_rig[2])
+        z_level = "low" if z < 0.7 else ("mid" if z < 1.1 else "high")
+        rig_data[s] = {"angle": angle, "z_level": z_level}
+        positions[s] = pos_world
+
+    buckets = defaultdict(list)
+    for s in serials:
+        buckets[(focal_group(s), rig_data[s]["z_level"])].append(s)
+    for key in buckets:
+        buckets[key].sort(key=lambda s: rig_data[s]["angle"])
+
+    raw_pairs = []
+    for (grp, zlev), ss in sorted(buckets.items()):
+        logger.info(f"  {grp}/{zlev}: {len(ss)} cameras — {ss}")
+        for i in range(len(ss) - 1):
+            s1, s2 = ss[i], ss[i + 1]
+            gap = abs(rig_data[s1]["angle"] - rig_data[s2]["angle"])
+            if gap <= MAX_ANGLE_GAP:
+                raw_pairs.append((s1, s2))
+
+    pairs = []
+    for s1, s2 in raw_pairs:
+        baseline_m = float(np.linalg.norm(positions[s1] - positions[s2]))
+        swapped = _auto_order_stereo(
+            intrinsics[s1], intrinsics[s2],
+            extrinsics[s1], extrinsics[s2],
+        )
+        if swapped:
+            pairs.append((s2, s1, baseline_m))
+        else:
+            pairs.append((s1, s2, baseline_m))
+
+    return pairs
 
 
 def find_best_stereo_partner(
@@ -457,8 +669,8 @@ class StereoDepthTRT:
             K_left, K_right = K_right, K_left
             T_left, T_right = T_right, T_left
 
-        # Rectify (output may be larger than input — no crop, no zoom)
-        map_left, map_right, R1, R2, P1, P2, f_rect, cx_rect, cy_rect, baseline, out_size = \
+        # Rectify
+        map_left, map_right, R1, R2, f_rect, cx_rect, cy_rect, baseline, out_size, disp_offset = \
             build_rectify_maps(K_left, K_right, T_left, T_right, (W, H))
         W_rect, H_rect = out_size
 
@@ -797,6 +1009,7 @@ def get_depth_stereo(
 def get_depth_da3(
     images: List[np.ndarray],
     intrinsics: Optional[np.ndarray] = None,
+    extrinsics: Optional[np.ndarray] = None,
     model=None,
     process_res: int = 504,
 ) -> List[np.ndarray]:
@@ -805,6 +1018,7 @@ def get_depth_da3(
     Args:
         images: list of RGB images (H, W, 3)
         intrinsics: camera intrinsics (N, 3, 3) or None
+        extrinsics: camera extrinsics (N, 4, 4) or None — needed for multi-view metric scale alignment
         model: pre-loaded DepthAnything3 model (loads da3-large if None)
         process_res: processing resolution
 
@@ -817,14 +1031,26 @@ def get_depth_da3(
 
     if model is None:
         from depth_anything_3.api import DepthAnything3
-        model = DepthAnything3(model_name="da3-large")
+        model = DepthAnything3.from_pretrained("depth-anything/DA3-LARGE")
         model = model.to("cuda")
         model.eval()
 
-    prediction = model.inference(
-        image=images,
-        intrinsics=intrinsics,
-        process_res=process_res,
-    )
+    try:
+        prediction = model.inference(
+            image=images,
+            intrinsics=intrinsics,
+            extrinsics=extrinsics,
+            process_res=process_res,
+        )
+    except Exception:
+        if extrinsics is not None:
+            logger.warning("DA3 alignment failed with extrinsics, retrying without")
+            prediction = model.inference(
+                image=images,
+                intrinsics=intrinsics,
+                process_res=process_res,
+            )
+        else:
+            raise
 
     return [d.cpu().numpy() if hasattr(d, 'cpu') else np.asarray(d) for d in prediction.depth]

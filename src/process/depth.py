@@ -46,10 +46,19 @@ from autodex.perception.depth import (
     _to_4x4,
     encode_depth_uint16,
     decode_depth_uint16,
+    build_rectify_maps,
+    disp_to_depth_left,
+    find_all_stereo_pairs,
 )
 
 
-# ── Stereo rectification ─────────────────────────────────────────────────────
+# ── Functions moved to autodex.perception.depth ──────────────────────────────
+# _compute_rectify_params, _find_valid_region, build_rectify_maps,
+# _workspace_crop, disp_to_depth_left, find_all_stereo_pairs
+# are now imported from autodex.perception.depth (see imports above).
+# Local copies below are kept for backward compatibility but should not be modified.
+# TODO: Remove these once all callers use autodex imports.
+
 
 def _compute_rectify_params(K_left, K_right, T_left, T_right, image_size):
     """Compute stereo rectification geometry (no maps, no allocation).

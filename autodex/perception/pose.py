@@ -50,18 +50,16 @@ class PoseTracker:
                 pass
 
         self.device_id = device_id
-        self.mesh = trimesh.load(mesh_path, force="mesh")
-        # Cast to float32 — FoundationPose internally computes mesh_diameter
-        # from vertices, and numpy.float64 propagates into torch tensors causing
-        # dtype mismatches (float64 @ float32) in crop window computation.
-        self.mesh.vertices = self.mesh.vertices.astype(np.float32)
+        loaded = trimesh.load(mesh_path, process=False)
+        if isinstance(loaded, trimesh.Scene):
+            meshes = [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
+            self.mesh = trimesh.util.concatenate(meshes)
+        else:
+            self.mesh = loaded
 
         with torch.cuda.device(device_id):
             scorer = ScorePredictor()
             refiner = PoseRefinePredictor()
-            # Reduce internal render resolution to prevent OOM
-            # (matches ~/shared_data/_object_6d_tracking/run/run_object_6d_pipeline.py)
-            refiner.cfg['input_resize'] = (80, 80)
             glctx = dr.RasterizeCudaContext()
             self.estimator = FoundationPose(
                 model_pts=self.mesh.vertices,

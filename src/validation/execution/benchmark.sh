@@ -34,49 +34,56 @@ echo "============================================================"
 echo ""
 
 # YOLOE — foundationpose env
-echo ">>> [1/7] YOLOE (foundationpose env)"
+echo ">>> [1/8] YOLOE (foundationpose env)"
 conda run --no-capture-output --cwd "$PROJECT_ROOT" -n foundationpose \
     python -u "$BENCH" --model yoloe --capture_dir "$CAPTURE_DIR" --mesh "$MESH" $SERIAL_ARG || \
     echo "  YOLOE FAILED"
 echo ""
 
-# SAM3 — sam3 env
-echo ">>> [2/7] SAM3 (sam3 env)"
+# SAM3 video — sam3 env
+echo ">>> [2/8] SAM3 video predictor (sam3 env)"
 conda run --no-capture-output --cwd "$PROJECT_ROOT" -n sam3 \
     python -u "$BENCH" --model sam3 --capture_dir "$CAPTURE_DIR" --mesh "$MESH" $SERIAL_ARG || \
-    echo "  SAM3 FAILED"
+    echo "  SAM3 video FAILED"
 echo ""
 
-# DA3 — sam3 env
-echo ">>> [3/7] Depth-Anything-3 (sam3 env)"
+# SAM3 image — sam3 env
+echo ">>> [3/8] SAM3 image model (sam3 env)"
 conda run --no-capture-output --cwd "$PROJECT_ROOT" -n sam3 \
+    python -u "$BENCH" --model sam3_image --capture_dir "$CAPTURE_DIR" --mesh "$MESH" $SERIAL_ARG || \
+    echo "  SAM3 image FAILED"
+echo ""
+
+# DA3 — dav3 env
+echo ">>> [4/8] Depth-Anything-3 (dav3 env)"
+conda run --no-capture-output --cwd "$PROJECT_ROOT" -n dav3 \
     python -u "$BENCH" --model da3 --capture_dir "$CAPTURE_DIR" --mesh "$MESH" $SERIAL_ARG || \
     echo "  DA3 FAILED"
 echo ""
 
 # Stereo PyTorch — sam3 env (has omegaconf)
-echo ">>> [4/7] FoundationStereo PyTorch (sam3 env)"
+echo ">>> [5/8] FoundationStereo PyTorch (sam3 env)"
 conda run --no-capture-output --cwd "$PROJECT_ROOT" -n sam3 \
     python -u "$BENCH" --model stereo_pytorch --capture_dir "$CAPTURE_DIR" --mesh "$MESH" $SERIAL_ARG || \
     echo "  Stereo PyTorch FAILED"
 echo ""
 
 # Stereo TRT — foundation_stereo env
-echo ">>> [5/7] FoundationStereo TRT (foundation_stereo env)"
+echo ">>> [6/8] FoundationStereo TRT (foundation_stereo env)"
 conda run --no-capture-output --cwd "$PROJECT_ROOT" -n foundation_stereo \
     python -u "$BENCH" --model stereo_trt --capture_dir "$CAPTURE_DIR" --mesh "$MESH" $SERIAL_ARG || \
     echo "  Stereo TRT FAILED"
 echo ""
 
 # FoundationPose — foundationpose env
-echo ">>> [6/7] FoundationPose (foundationpose env)"
+echo ">>> [7/8] FoundationPose (foundationpose env)"
 conda run --no-capture-output --cwd "$PROJECT_ROOT" -n foundationpose \
     python -u "$BENCH" --model fpose --capture_dir "$CAPTURE_DIR" --mesh "$MESH" $SERIAL_ARG || \
     echo "  FoundationPose FAILED"
 echo ""
 
 # Silhouette — foundationpose env
-echo ">>> [7/7] Silhouette rendering (foundationpose env)"
+echo ">>> [8/8] Silhouette rendering (foundationpose env)"
 conda run --no-capture-output --cwd "$PROJECT_ROOT" -n foundationpose \
     python -u "$BENCH" --model silhouette --capture_dir "$CAPTURE_DIR" --mesh "$MESH" $SERIAL_ARG || \
     echo "  Silhouette FAILED"
