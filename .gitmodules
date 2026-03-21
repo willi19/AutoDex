@@ -5,6 +5,3 @@
 	path = autodex/perception/thirdparty/_object_6d_tracking
 	url = https://github.com/snuvclab/_object_6d_tracking.git
 	branch = gunhee_v0
-[submodule "autodex/perception/thirdparty/sam3"]
-	path = autodex/perception/thirdparty/sam3
-	url = https://github.com/facebookresearch/sam3.git
