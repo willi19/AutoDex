@@ -242,28 +242,37 @@ class PerceptionPipeline:
     # ── Private methods ──
 
     def _run_sam3_parallel(self, serials, img_dir, mask_dir, prompt):
-        """Distribute SAM3 across remote daemons via NAS paths."""
+        """Distribute SAM3 across remote daemons via NAS paths.
+
+        Each client processes its chunk sequentially (ZMQ REQ/REP),
+        but different clients run in parallel.
+        """
         n = len(self.sam3_clients)
+        chunks = [[] for _ in range(n)]
+        for i, s in enumerate(serials):
+            chunks[i % n].append(s)
+
         masks = {}
 
-        with ThreadPoolExecutor(max_workers=n) as pool:
-            futures = {}
-            for i, s in enumerate(serials):
-                client = self.sam3_clients[i % n]
-                futures[pool.submit(client.request, {
-                    "image_path": str(img_dir / f"{s}.png"),
-                    "prompt": prompt,
-                    "output_path": str(mask_dir / f"{s}.png"),
-                })] = s
-
-            for f in as_completed(futures):
-                s = futures[f]
+        def process_chunk(client_idx):
+            results = {}
+            for s in chunks[client_idx]:
                 try:
-                    r = f.result()
-                    masks[s] = r.get("found", False)
+                    r = self.sam3_clients[client_idx].request({
+                        "image_path": str(img_dir / f"{s}.png"),
+                        "prompt": prompt,
+                        "output_path": str(mask_dir / f"{s}.png"),
+                    })
+                    results[s] = r.get("found", False)
                 except Exception as e:
                     logger.warning(f"SAM3 {s}: {e}")
-                    masks[s] = False
+                    results[s] = False
+            return results
+
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            futures = [pool.submit(process_chunk, i) for i in range(n)]
+            for f in as_completed(futures):
+                masks.update(f.result())
 
         return masks
 
@@ -349,32 +358,41 @@ class PerceptionPipeline:
         return depth_serials
 
     def _run_fpose_parallel(self, serials, img_dir, depth_dir, mask_dir, intrinsics):
-        """Distribute FPose across remote daemons via NAS paths."""
+        """Distribute FPose across remote daemons via NAS paths.
+
+        Each client processes its chunk sequentially (ZMQ REQ/REP),
+        but different clients run in parallel.
+        """
         n = len(self.fpose_clients)
+        chunks = [[] for _ in range(n)]
+        for i, s in enumerate(serials):
+            chunks[i % n].append(s)
+
         poses_cam = {}
 
-        with ThreadPoolExecutor(max_workers=n) as pool:
-            futures = {}
-            for i, s in enumerate(serials):
-                client = self.fpose_clients[i % n]
-                futures[pool.submit(client.request, {
-                    "image_path": str(img_dir / f"{s}.png"),
-                    "depth_path": str(depth_dir / f"{s}.png"),
-                    "mask_path": str(mask_dir / f"{s}.png"),
-                    "K": intrinsics[s].tolist(),
-                    "mode": "register",
-                    "iteration": 5,
-                    "downscale": 0.5,
-                })] = s
-
-            for f in as_completed(futures):
-                s = futures[f]
+        def process_chunk(client_idx):
+            results = {}
+            for s in chunks[client_idx]:
                 try:
-                    r = f.result()
+                    r = self.fpose_clients[client_idx].request({
+                        "image_path": str(img_dir / f"{s}.png"),
+                        "depth_path": str(depth_dir / f"{s}.png"),
+                        "mask_path": str(mask_dir / f"{s}.png"),
+                        "K": intrinsics[s].tolist(),
+                        "mode": "register",
+                        "iteration": 5,
+                        "downscale": 0.5,
+                    })
                     if "pose" in r:
-                        poses_cam[s] = np.array(r["pose"]).reshape(4, 4)
+                        results[s] = np.array(r["pose"]).reshape(4, 4)
                 except Exception as e:
                     logger.warning(f"FPose {s}: {e}")
+            return results
+
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            futures = [pool.submit(process_chunk, i) for i in range(n)]
+            for f in as_completed(futures):
+                poses_cam.update(f.result())
 
         return poses_cam
 
