@@ -270,6 +270,86 @@ Key reference files:
 - `sam3`: SAM3 segmentation
 - `dav3`: Depth-Anything-3 (separate env with all DA3 dependencies)
 
+## Daemon Setup (Perception Pipeline)
+
+### Architecture
+
+- **Main PC** (mingi, RTX 3090): DA3/stereo depth + silhouette matching + planning
+- **capture1, 2, 3**: SAM3 daemons (ZMQ, port 5001)
+- **capture4, 5, 6**: FPose daemons (ZMQ, port 5003)
+
+### First-time setup on each capture PC
+
+```bash
+# 1. Clone repo
+git clone https://github.com/willi19/AutoDex.git ~/AutoDex
+cd ~/AutoDex
+
+# 2. Download weights from NAS
+bash scripts/setup_weights.sh
+
+# 3. For FPose PCs: copy mycpp build (python 3.9 required)
+mkdir -p ~/AutoDex/autodex/perception/thirdparty/FoundationPose/mycpp/build
+cp ~/shared_data/AutoDex/weights/foundationpose/mycpp_build/mycpp*.so \
+   ~/AutoDex/autodex/perception/thirdparty/FoundationPose/mycpp/build/
+```
+
+### SAM3 daemon (capture1, 2, 3)
+
+```bash
+# Conda env setup (once)
+conda create -n sam3 python=3.12 -y
+conda activate sam3
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+pip install pyzmq ftfy regex psutil pycocotools einops iopath hydra-core timm tqdm pillow scipy huggingface_hub opencv-python numpy
+python -c "from huggingface_hub import login; login(token='<HF_TOKEN>')"
+
+# Run daemon
+conda activate sam3
+cd ~/AutoDex
+python src/execution/daemon/perception_daemon.py --model sam3 --port 5001
+```
+
+### FPose daemon (capture4, 5, 6)
+
+```bash
+# Conda env setup (once)
+conda create -n foundationpose python=3.9 -y
+conda activate foundationpose
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+pip install pyzmq opencv-python numpy trimesh nvdiffrast omegaconf
+pip install "git+https://github.com/facebookresearch/pytorch3d.git" --no-build-isolation
+
+# Run daemon
+conda activate foundationpose
+cd ~/AutoDex
+python src/execution/daemon/perception_daemon.py --model fpose --port 5003 \
+    --mesh ~/shared_data/object_6d/data/mesh/attached_container/attached_container.obj
+```
+
+### Update on capture PCs
+
+```bash
+cd ~/AutoDex && git fetch origin && git reset --hard origin/main
+```
+
+### NAS Weight Structure
+
+```
+~/shared_data/AutoDex/weights/
+├── foundationpose/
+│   ├── 2023-10-28-18-33-37/   # RefinePredictor
+│   ├── 2024-01-11-20-02-45/   # ScorePredictor
+│   └── mycpp_build/           # Pre-built C++ extension
+├── sam3/
+│   └── sam3.pt                # SAM3 checkpoint (3.3GB)
+├── da3/
+│   └── model.safetensors      # DA3-LARGE (1.6GB)
+└── yoloe/
+    ├── yoloe-26x-seg.pt       # YOLOE (164MB)
+    └── mobileclip2_b.ts       # MobileCLIP (243MB)
+```
+
 ## Ongoing Refactoring
 
 `src/process/` scripts have heavy code duplication with `autodex/perception/`.
