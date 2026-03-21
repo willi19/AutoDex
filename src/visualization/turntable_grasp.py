@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import json
+from tqdm import tqdm
 import os
 import sys
 import tempfile
@@ -28,48 +29,80 @@ import numpy as np
 import open3d as o3d
 import trimesh
 
-from rsslib.conversion import cart2se3
-from rsslib.path import candidate_path, obj_path, urdf_path, code_path
+from autodex.utils.conversion import cart2se3
+from autodex.utils.path import candidate_path, obj_path, urdf_path
 from paradex.visualization.robot import RobotModule
 
 
 COLOR_ROBOT = np.array([153, 128, 224]) / 255.0
 COLOR_OBJECT = np.array([180, 180, 180]) / 255.0
 
-ORDER_ROOT = os.path.join(code_path, "order")
-
-# Version priority for --batch-all (first match wins, except revalidate always wins)
+SELECTED_DIR = os.path.join(candidate_path, "selected_100")
+ORDER_ROOT = os.path.expanduser("~/RSS_2026/order")
 BATCH_VERSIONS = ["revalidate", "v2", "v3"]
 
 
 def get_all_objects() -> list:
-    """Get all (version, obj_name) pairs across versions, deduplicating with revalidate priority."""
-    obj_version = {}
+    """Get all object names from selected_100/."""
+    if not os.path.isdir(SELECTED_DIR):
+        print(f"Error: selected_100 not found: {SELECTED_DIR}")
+        sys.exit(1)
+    objects = []
+    for obj in sorted(os.listdir(SELECTED_DIR)):
+        if os.path.isdir(os.path.join(SELECTED_DIR, obj)):
+            objects.append(obj)
+    return objects
+
+
+def _find_setcover_order(obj_name: str) -> str | None:
+    """Find setcover_order.json for an object across versions."""
     for v in BATCH_VERSIONS:
-        vdir = os.path.join(ORDER_ROOT, v)
-        if not os.path.isdir(vdir):
-            continue
-        for obj in sorted(os.listdir(vdir)):
-            if os.path.exists(os.path.join(vdir, obj, "setcover_order.json")):
-                if obj not in obj_version or v == "revalidate":
-                    obj_version[obj] = v
-    return sorted(obj_version.items(), key=lambda x: x[0])
+        path = os.path.join(ORDER_ROOT, v, obj_name, "setcover_order.json")
+        if os.path.exists(path):
+            return path
+    return None
 
 
-def load_setcover_grasps(version: str, obj_name: str, top_n: int) -> list:
-    """Load top N grasps from setcover_order.json.
-    Returns list of (scene_type, scene_id, grasp_name) tuples."""
-    json_path = os.path.join(ORDER_ROOT, version, obj_name, "setcover_order.json")
-    if not os.path.exists(json_path):
-        print(f"Warning: setcover not found: {json_path}")
+def load_selected_grasps(obj_name: str, top_n: int) -> list:
+    """Load grasps in setcover order, filtered to what exists in selected_100/.
+    Returns list of (scene_type, scene_id, grasp_name) tuples, up to top_n."""
+    # Build set of available grasps in selected_100
+    root = os.path.join(SELECTED_DIR, obj_name)
+    if not os.path.exists(root):
+        print(f"Warning: object not found in selected_100: {obj_name}")
         return []
-    with open(json_path, "r") as f:
-        ordered_list = json.load(f)
-    # Each entry: [obj_name, version, scene_type, scene_id, grasp_name, orig_idx]
-    grasps = []
-    for item in ordered_list[:top_n]:
-        grasps.append((item[2], item[3], item[4]))
-    return grasps
+
+    available = set()
+    for scene_type in os.listdir(root):
+        st_path = os.path.join(root, scene_type)
+        if not os.path.isdir(st_path):
+            continue
+        for scene_id in os.listdir(st_path):
+            si_path = os.path.join(st_path, scene_id)
+            if not os.path.isdir(si_path):
+                continue
+            for grasp_name in os.listdir(si_path):
+                gp = os.path.join(si_path, grasp_name)
+                if os.path.isdir(gp) and os.path.exists(os.path.join(gp, "wrist_se3.npy")):
+                    available.add((scene_type, scene_id, grasp_name))
+
+    # Load setcover order and filter to available
+    order_path = _find_setcover_order(obj_name)
+    if order_path is not None:
+        with open(order_path) as f:
+            ordered_list = json.load(f)
+        grasps = []
+        for item in ordered_list:
+            key = (item[2], item[3], item[4])
+            if key in available:
+                grasps.append(key)
+                if len(grasps) >= top_n:
+                    return grasps
+        return grasps
+    else:
+        # Fallback: directory walk (no order info)
+        print(f"Warning: no setcover order for {obj_name}, using directory order")
+        return list(available)[:top_n]
 
 
 def list_all_grasps(version: str, obj_name: str, scene_type_filter: str = None) -> list:
@@ -132,28 +165,19 @@ def load_object_mesh(obj_name: str) -> tuple:
     return mesh, obj_pose
 
 
-def find_grasp_path(obj_name: str, version: str, scene_type: str,
+def find_grasp_path(obj_name: str, scene_type: str,
                     scene_id: str, grasp_name: str) -> str:
-    """Find grasp data path. Checks tselected_100 first (matches setcover order),
-    then falls back to candidates/{version}/."""
-    # tselected_100 has the correct top-100 from setcover for 78 objects
-    path = os.path.join(candidate_path, "tselected_100", obj_name, scene_type, scene_id, grasp_name)
+    """Find grasp data path from selected_100/."""
+    path = os.path.join(SELECTED_DIR, obj_name, scene_type, scene_id, grasp_name)
     if os.path.exists(path):
         return path
-    # Fall back to full candidates (needed for 20 v2 objects not in tselected_100)
-    path = os.path.join(candidate_path, version, obj_name, scene_type, scene_id, grasp_name)
-    if os.path.exists(path):
-        return path
-    raise FileNotFoundError(
-        f"Grasp not found in tselected_100 or candidates/{version}: "
-        f"{obj_name}/{scene_type}/{scene_id}/{grasp_name}"
-    )
+    raise FileNotFoundError(f"Grasp not found: {path}")
 
 
-def load_robot_at_grasp(obj_name: str, version: str, scene_type: str,
+def load_robot_at_grasp(obj_name: str, scene_type: str,
                         scene_id: str, grasp_name: str, obj_pose: np.ndarray) -> trimesh.Trimesh:
     """Load robot hand mesh at the grasp pose. Returns combined trimesh in world frame."""
-    grasp_path = find_grasp_path(obj_name, version, scene_type, scene_id, grasp_name)
+    grasp_path = find_grasp_path(obj_name, scene_type, scene_id, grasp_name)
 
     wrist_se3 = np.load(os.path.join(grasp_path, "wrist_se3.npy"))
     grasp_pose = np.load(os.path.join(grasp_path, "grasp_pose.npy"))
@@ -204,11 +228,28 @@ def compute_turntable_camera(center: np.ndarray, cam_dist: float,
     return eye, lookat, up
 
 
+_renderer = None
+_renderer_size = (None, None)
+
+
+def get_renderer(width, height):
+    """Get or create a persistent OffscreenRenderer (reused across grasps)."""
+    global _renderer, _renderer_size
+    if _renderer is None or _renderer_size != (width, height):
+        _renderer = o3d.visualization.rendering.OffscreenRenderer(width, height)
+        _renderer_size = (width, height)
+    return _renderer
+
+
 def render_turntable(obj_mesh_o3d, robot_mesh_o3d, center, cam_dist,
                      elevation_deg, fov_deg, n_frames, width, height_px,
                      output_dir):
     """Render turntable frames using Open3D offscreen renderer."""
-    renderer = o3d.visualization.rendering.OffscreenRenderer(width, height_px)
+    renderer = get_renderer(width, height_px)
+
+    # Clear previous geometry
+    renderer.scene.clear_geometry()
+
     mat_obj = o3d.visualization.rendering.MaterialRecord()
     mat_obj.shader = "defaultLit"
 
@@ -232,10 +273,7 @@ def render_turntable(obj_mesh_o3d, robot_mesh_o3d, center, cam_dist,
         frame_path = os.path.join(output_dir, f"frame_{i:04d}.png")
         o3d.io.write_image(frame_path, img)
 
-        if (i + 1) % 10 == 0 or i == 0:
-            print(f"  Rendered frame {i+1}/{n_frames}")
-
-    del renderer
+        pass
 
 
 def frames_to_video(frame_dir: str, output_path: str, fps: int):
@@ -255,14 +293,14 @@ def frames_to_video(frame_dir: str, output_path: str, fps: int):
         print(f"ffmpeg error: {result.stderr}")
 
 
-def render_single_grasp(obj_name, version, scene_type, scene_id, grasp_name,
+def render_single_grasp(obj_name, scene_type, scene_id, grasp_name,
                         output_path, args, obj_mesh=None, obj_pose=None):
     """Render a single grasp turntable video. Returns True on success."""
     try:
         if obj_mesh is None or obj_pose is None:
             obj_mesh, obj_pose = load_object_mesh(obj_name)
 
-        robot_mesh = load_robot_at_grasp(obj_name, version, scene_type, scene_id, grasp_name, obj_pose)
+        robot_mesh = load_robot_at_grasp(obj_name, scene_type, scene_id, grasp_name, obj_pose)
 
         obj_mesh_world = obj_mesh.copy()
         obj_mesh_world.apply_transform(obj_pose)
@@ -306,12 +344,13 @@ def main():
                         help="Output directory for batch mode (default: data)")
     parser.add_argument("--frames", type=int, default=60, help="Number of frames (default: 60)")
     parser.add_argument("--fps", type=int, default=30, help="Video FPS (default: 30)")
-    parser.add_argument("--width", type=int, default=540, help="Render width (default: 540)")
+    parser.add_argument("--width", type=int, default=960, help="Render width (default: 960)")
     parser.add_argument("--height", type=int, default=540, help="Render height (default: 540)")
     parser.add_argument("--fov", type=float, default=45.0, help="Vertical FOV in degrees (default: 45)")
     parser.add_argument("--elevation", type=float, default=25.0, help="Camera elevation angle in degrees (default: 25)")
     parser.add_argument("--padding", type=float, default=1.3, help="Camera padding multiplier (default: 1.3)")
     parser.add_argument("--output", type=str, default=None, help="Output video path (single grasp mode)")
+    parser.add_argument("--parallel", type=int, default=1, help="Number of parallel workers for batch-all (default: 1)")
     args = parser.parse_args()
 
     # ---- Batch all objects ----
@@ -321,82 +360,141 @@ def main():
             sys.exit(1)
 
         all_objects = get_all_objects()
-        print(f"Batch rendering {len(all_objects)} objects, top {args.top} grasps each")
         output_dir = os.path.abspath(args.output_dir)
         os.makedirs(output_dir, exist_ok=True)
 
-        total_success = 0
-        total_fail = 0
+        if args.parallel > 1:
+            # Parallel: spawn one subprocess per object
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            print(f"Batch rendering {len(all_objects)} objects with {args.parallel} workers")
 
-        for obj_idx, (obj_name, version) in enumerate(all_objects):
-            print(f"\n[{obj_idx+1}/{len(all_objects)}] {version}/{obj_name}")
+            cmds = {}
+            for obj_name in all_objects:
+                cmd = [
+                    sys.executable, __file__,
+                    "--obj", obj_name, "--top", str(args.top),
+                    "--output-dir", output_dir,
+                    "--frames", str(args.frames), "--fps", str(args.fps),
+                    "--width", str(args.width), "--height", str(args.height),
+                    "--fov", str(args.fov), "--elevation", str(args.elevation),
+                    "--padding", str(args.padding),
+                ]
+                cmds[obj_name] = cmd
 
-            grasps = load_setcover_grasps(version, obj_name, args.top)
-            if not grasps:
-                print(f"  Skipping (no setcover data)")
-                continue
+            procs = {}
+            results = []
+            pbar = tqdm(total=len(all_objects), desc="Objects")
+            # Use subprocess directly with limited concurrency
+            running = {}
+            obj_list = list(cmds.items())
+            idx = 0
+            while idx < len(obj_list) or running:
+                # Launch up to parallel workers
+                while idx < len(obj_list) and len(running) < args.parallel:
+                    obj_name, cmd = obj_list[idx]
+                    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    running[obj_name] = proc
+                    idx += 1
+                # Poll for completion
+                import time
+                time.sleep(0.5)
+                done = []
+                for name, proc in running.items():
+                    if proc.poll() is not None:
+                        done.append(name)
+                        results.append((name, proc.returncode))
+                        pbar.update(1)
+                        pbar.set_description(f"Done: {name}")
+                for name in done:
+                    del running[name]
+            pbar.close()
 
-            # Load object mesh once per object
-            try:
-                obj_mesh, obj_pose = load_object_mesh(obj_name)
-            except Exception as e:
-                print(f"  Error loading object mesh: {e}")
-                total_fail += len(grasps)
-                continue
+            ok = sum(1 for _, rc in results if rc == 0)
+            failed_names = [n for n, rc in results if rc != 0]
+            print(f"\nDone! {ok}/{len(all_objects)} objects succeeded")
+            if failed_names:
+                print(f"Failed: {failed_names}")
+        else:
+            print(f"Batch rendering {len(all_objects)} objects, top {args.top} grasps each")
 
-            for gi, (scene_type, scene_id, grasp_name) in enumerate(grasps):
-                episode_dir = os.path.join(output_dir, obj_name, f"{gi:03d}")
-                video_path = os.path.join(episode_dir, "turntable.mp4")
-                if os.path.exists(video_path):
-                    print(f"  [{gi+1}/{len(grasps)}] Already exists, skipping")
-                    total_success += 1
+            total_success = 0
+            total_fail = 0
+
+            # Count total videos
+            all_grasps = []
+            for obj_name in all_objects:
+                grasps = load_selected_grasps(obj_name, args.top)
+                all_grasps.append((obj_name, grasps))
+
+            total_videos = sum(len(g) for _, g in all_grasps)
+            pbar = tqdm(total=total_videos, desc="Rendering")
+
+            for obj_name, grasps in all_grasps:
+                if not grasps:
                     continue
 
-                print(f"  [{gi+1}/{len(grasps)}] {scene_type}/{scene_id}/{grasp_name}")
-                os.makedirs(episode_dir, exist_ok=True)
-                ok = render_single_grasp(
-                    obj_name, version, scene_type, scene_id, grasp_name,
-                    video_path, args, obj_mesh=obj_mesh, obj_pose=obj_pose,
-                )
-                if ok:
-                    total_success += 1
-                else:
-                    total_fail += 1
+                try:
+                    obj_mesh, obj_pose = load_object_mesh(obj_name)
+                except Exception as e:
+                    total_fail += len(grasps)
+                    pbar.update(len(grasps))
+                    continue
 
-        print(f"\nDone! {total_success} succeeded, {total_fail} failed")
-        print(f"Output: {output_dir}")
+                for gi, (scene_type, scene_id, grasp_name) in enumerate(grasps):
+                    pbar.set_description(f"{obj_name} [{gi+1}/{len(grasps)}]")
+                    episode_dir = os.path.join(output_dir, obj_name, f"{gi:03d}")
+                    video_path = os.path.join(episode_dir, "turntable.mp4")
+                    if os.path.exists(video_path):
+                        total_success += 1
+                        pbar.update(1)
+                        continue
+
+                    os.makedirs(episode_dir, exist_ok=True)
+                    ok = render_single_grasp(
+                        obj_name, scene_type, scene_id, grasp_name,
+                        video_path, args, obj_mesh=obj_mesh, obj_pose=obj_pose,
+                    )
+                    if ok:
+                        total_success += 1
+                    else:
+                        total_fail += 1
+                    pbar.update(1)
+
+            pbar.close()
+            print(f"\nDone! {total_success} succeeded, {total_fail} failed")
+            print(f"Output: {output_dir}")
         return
 
     # ---- Single object, top N grasps ----
     if args.top is not None:
-        if args.version is None or args.obj is None:
-            print("Error: --top requires --version and --obj")
+        if args.obj is None:
+            print("Error: --top requires --obj")
             sys.exit(1)
 
-        grasps = load_setcover_grasps(args.version, args.obj, args.top)
+        grasps = load_selected_grasps(args.obj, args.top)
         if not grasps:
             print("No grasps found in setcover order")
             sys.exit(1)
 
-        print(f"Rendering top {len(grasps)} grasps for {args.version}/{args.obj}")
+        print(f"Rendering top {len(grasps)} grasps for {args.obj}")
 
         obj_mesh, obj_pose = load_object_mesh(args.obj)
         output_dir = os.path.abspath(args.output_dir)
 
         success, fail = 0, 0
-        for gi, (scene_type, scene_id, grasp_name) in enumerate(grasps):
+        for gi, (scene_type, scene_id, grasp_name) in enumerate(
+            tqdm(grasps, desc=args.obj)
+        ):
             episode_dir = os.path.join(output_dir, args.obj, f"{gi:03d}")
             video_path = os.path.join(episode_dir, "turntable.mp4")
 
             if os.path.exists(video_path):
-                print(f"[{gi+1}/{len(grasps)}] Already exists, skipping")
                 success += 1
                 continue
 
-            print(f"[{gi+1}/{len(grasps)}] {scene_type}/{scene_id}/{grasp_name}")
             os.makedirs(episode_dir, exist_ok=True)
             ok = render_single_grasp(
-                args.obj, args.version, scene_type, scene_id, grasp_name,
+                args.obj, scene_type, scene_id, grasp_name,
                 video_path, args, obj_mesh=obj_mesh, obj_pose=obj_pose,
             )
             if ok:
@@ -427,7 +525,7 @@ def main():
 
     print(f"Loading {args.obj} grasp: {scene_type}/{scene_id}/{grasp_name}")
     ok = render_single_grasp(
-        args.obj, args.version, scene_type, scene_id, grasp_name,
+        args.obj, scene_type, scene_id, grasp_name,
         output_path, args,
     )
     if ok:

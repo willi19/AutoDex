@@ -145,9 +145,22 @@ class GraspPlanner:
             collision_activation_distance=0.0,
             tensor_args=self._tensor_args,
         )
-        q = np.array([se32action(w, g) for w, g in zip(wrist_se3, pregrasp)])
-        q_t = torch.tensor(q, dtype=torch.float32, device=self._tensor_args.device)
         rw = RobotWorld(rw_config)
+        n_dof = rw.kinematics.get_dof()
+
+        # Build q vector matching robot's expected DOF
+        if n_dof == len(pregrasp[0]) + 6:
+            # Floating hand (e.g. allegro_floating): [x,y,z,roll,pitch,yaw] + joints
+            q = np.array([se32action(w, g) for w, g in zip(wrist_se3, pregrasp)])
+        else:
+            # use_root_pose hand (e.g. inspire): [x,y,z,qw,qx,qy,qz] + joints
+            from autodex.utils.conversion import se32cart
+            q = np.array([np.concatenate([se32cart(w), g]) for w, g in zip(wrist_se3, pregrasp)])
+            # If still doesn't match, just use joints
+            if q.shape[1] != n_dof:
+                q = pregrasp
+
+        q_t = torch.tensor(q, dtype=torch.float32, device=self._tensor_args.device)
         d_world, d_self = rw.get_world_self_collision_distance_from_joints(q_t)
         return torch.logical_or(d_world > 0, d_self > 0).cpu().numpy()
 
@@ -505,35 +518,111 @@ class GraspPlanner:
             torch.manual_seed(seed)
             np.random.seed(seed)
 
+        # 1. Load candidates
         t0 = _time.time()
         obj_pose = cart2se3(scene_cfg["mesh"]["target"]["pose"])
         wrist_se3, pregrasp, grasp, scene_info = load_candidate(obj_name, obj_pose, grasp_version)
         t_load = _time.time() - t0
 
+        # 2. World setup (motion_gen for trajectory, ik_solver for IK)
         t0 = _time.time()
         world_cfg = _to_curobo_world(scene_cfg)
         if self._motion_gen is None:
             self._init_motion_gen(world_cfg)
         else:
             self._update_world(world_cfg)
+        world_cfg_no_target = dict(world_cfg)
+        world_cfg_no_target["mesh"] = {}
+        if self._ik_solver is None:
+            self._init_ik_solver(world_cfg_no_target)
+        else:
+            self._ik_solver.update_world(WorldConfig.from_dict(world_cfg_no_target))
         t_world = _time.time() - t0
 
-        idx, traj, stage_timing = self._find_trajectory(world_cfg, wrist_se3.copy(), pregrasp, mode)
+        # 3. Filter: backward + hand-table collision
+        t0 = _time.time()
+        backward = wrist_se3[:, 0, 2] < 0.3
+        collision = self._check_collision(world_cfg_no_target, wrist_se3, pregrasp)
+        valid = np.where(~(backward | collision))[0]
+        t_filter = _time.time() - t0
 
-        timing = {
-            "load_candidates_s": round(t_load, 3),
-            "world_setup_s": round(t_world, 3),
-            **stage_timing,
-        }
+        N = len(wrist_se3)
+        print(f"[planner] total={N}  backward={backward.sum()}  collision={collision.sum()}  valid={len(valid)}")
 
-        if idx is None:
+        def _fail_result(timing):
             return PlanResult(
                 success=False, traj=None, wrist_se3=None,
                 pregrasp_pose=pregrasp[0], grasp_pose=grasp[0], scene_info=[],
                 timing=timing,
             )
-        return PlanResult(
-            success=True, traj=traj, wrist_se3=wrist_se3[idx],
-            pregrasp_pose=pregrasp[idx], grasp_pose=grasp[idx], scene_info=scene_info[idx],
-            timing=timing,
-        )
+
+        base_timing = {
+            "load_candidates_s": round(t_load, 3),
+            "world_setup_s": round(t_world, 3),
+            "filter_s": round(t_filter, 3),
+            "n_total": N,
+            "n_backward": int(backward.sum()),
+            "n_collision": int(collision.sum()),
+            "n_valid": int(len(valid)),
+        }
+
+        if len(valid) == 0:
+            return _fail_result({**base_timing, "ik_s": 0.0, "plan_single_js_s": 0.0})
+
+        # 4. IK solve on valid candidates
+        t0 = _time.time()
+        ik_success = np.zeros(N, dtype=bool)
+        ik_qpos = np.full((N, 22), np.nan)
+        for chunk_start in range(0, len(valid), self.BATCH_SIZE):
+            chunk_idx = valid[chunk_start : chunk_start + self.BATCH_SIZE]
+            chunk_poses = wrist_se3[chunk_idx]
+            B = len(chunk_poses)
+            if B < self.BATCH_SIZE:
+                pad = self.BATCH_SIZE - B
+                chunk_poses = np.concatenate(
+                    [chunk_poses, np.tile(chunk_poses[:1], (pad, 1, 1))], axis=0)
+            goal = _to_curobo_pose(chunk_poses, self._tensor_args.device)
+            result = self._ik_solver.solve_batch(goal)
+            succ = result.success.cpu().numpy()[:B]
+            q_sol = result.solution.cpu().numpy()[:B]
+            if q_sol.ndim == 3:
+                q_sol = q_sol[:, 0, :]
+            for i, idx in enumerate(chunk_idx):
+                if succ[i]:
+                    ik_success[idx] = True
+                    ik_qpos[idx, :6] = q_sol[i, :6]
+                    ik_qpos[idx, 6:] = pregrasp[idx]
+        t_ik = _time.time() - t0
+
+        ik_valid = np.where(ik_success)[0]
+        n_ik_success = len(ik_valid)
+        print(f"[planner] IK: {n_ik_success}/{len(valid)} success")
+        base_timing["ik_s"] = round(t_ik, 3)
+        base_timing["n_ik_success"] = n_ik_success
+        base_timing["n_valid"] = int(len(valid))
+
+        if n_ik_success == 0:
+            return _fail_result({**base_timing, "plan_single_js_s": 0.0})
+
+        # 5. plan_single_js for each IK-reachable candidate until success
+        t0 = _time.time()
+        n_attempts = 0
+        for idx in ik_valid:
+            t1 = _time.time()
+            ok, traj = self._refine_fingers(INIT_STATE, ik_qpos[idx])
+            n_attempts += 1
+            print(f"[planner] plan_single_js #{n_attempts} (idx={idx}): "
+                  f"{'ok' if ok else 'fail'} ({_time.time() - t1:.2f}s)")
+            if ok:
+                t_plan = _time.time() - t0
+                return PlanResult(
+                    success=True, traj=traj, wrist_se3=wrist_se3[idx],
+                    pregrasp_pose=pregrasp[idx], grasp_pose=grasp[idx],
+                    scene_info=scene_info[idx],
+                    timing={**base_timing, "plan_single_js_s": round(t_plan, 3),
+                            "n_plan_attempts": n_attempts},
+                )
+
+        t_plan = _time.time() - t0
+        return _fail_result({**base_timing, "plan_single_js_s": round(t_plan, 3),
+                             "n_plan_attempts": n_attempts})

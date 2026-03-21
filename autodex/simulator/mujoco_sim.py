@@ -365,6 +365,28 @@ class Simulator:
             if viewer:
                 viewer.sync()
 
+    # ---------- Force ----------
+
+    def apply_force(self, name, actor_name, force_torque):
+        """Apply external force/torque to an object's CoM.
+
+        Args:
+            name: env name
+            actor_name: object actor name
+            force_torque: (6,) array [fx, fy, fz, tx, ty, tz]
+        """
+        data  = self._data[name]
+        model = self._model[name]
+        index = self._index[name]
+        info  = index[actor_name]
+        assert info["type"] == "object"
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"obj_{actor_name}")
+        data.xfrc_applied[body_id] = np.asarray(force_torque, dtype=float)
+
+    def clear_force(self, name, actor_name):
+        """Clear external force on an object."""
+        self.apply_force(name, actor_name, np.zeros(6))
+
     # ---------- State ----------
 
     def get_state(self, name):

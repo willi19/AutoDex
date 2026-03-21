@@ -26,6 +26,13 @@ print(f"Found {len(available_objects)} objects")
 
 vis = ViserViewer()
 
+# Additional lights (handles stored for GUI control)
+ambient_handle = vis.server.scene.add_light_ambient("/lights/ambient", intensity=1.0, color=(255, 255, 255))
+point_handle = vis.server.scene.add_light_point(
+    "/lights/point_front", color=(255, 255, 255), intensity=5.0,
+    position=(0.0, 0.0, 3.0), cast_shadow=False,
+)
+
 
 def load_mesh(path):
     mesh = trimesh.load(path)
@@ -42,6 +49,10 @@ def clear_scene():
             pass
     vis.obj_dict.clear()
     vis.frame_nodes.clear()
+
+
+obb_handles = []  # Store all OBB scene node handles for toggling
+mesh_frames = {}  # label -> frame handle for mesh visibility toggling
 
 
 def add_obb(parent_frame, obb_extents, obb_transform, axis_len):
@@ -65,12 +76,13 @@ def add_obb(parent_frame, obb_extents, obb_transform, axis_len):
         (0, 4), (1, 5), (2, 6), (3, 7),
     ]
     for ei, (i, j) in enumerate(edges):
-        vis.server.scene.add_spline_catmull_rom(
+        handle = vis.server.scene.add_spline_catmull_rom(
             name=f"{parent_frame}/obb_edge_{ei}",
             positions=np.array([corners[i], corners[j]]),
             color=COLOR_OBB,
             line_width=LINE_WIDTH_OBB,
         )
+        obb_handles.append(handle)
 
     origin = np.zeros(3)
     for axis_dir, axis_color, label in [
@@ -78,16 +90,19 @@ def add_obb(parent_frame, obb_extents, obb_transform, axis_len):
         (np.array([0, 1, 0]), COLOR_AXIS_Y, "axis_y"),
         (np.array([0, 0, 1]), COLOR_AXIS_Z, "axis_z"),
     ]:
-        vis.server.scene.add_spline_catmull_rom(
+        handle = vis.server.scene.add_spline_catmull_rom(
             name=f"{parent_frame}/{label}",
             positions=np.array([origin, axis_dir * axis_len]),
             color=axis_color,
             line_width=LINE_WIDTH_AXIS,
         )
+        obb_handles.append(handle)
 
 
 def load_object(obj_name):
     clear_scene()
+    obb_handles.clear()
+    mesh_frames.clear()
 
     obj_dir = os.path.join(obj_path, obj_name)
     mesh_dir = os.path.join(obj_dir, "processed_data", "mesh")
@@ -123,6 +138,7 @@ def load_object(obj_name):
 
         name = f"{obj_name}_{label}"
         vis.add_object(name, mesh, obj_T=pose)
+        mesh_frames[label] = vis.obj_dict[name]['frame']
 
         fp = f"/objects/{name}_frame"
         add_obb(fp, obb_extents, obb_transform, axis_len)
@@ -140,9 +156,43 @@ with vis.server.gui.add_folder("Object Selection"):
     )
     load_btn = vis.server.gui.add_button("Load Object")
 
+with vis.server.gui.add_folder("Display"):
+    show_obb_checkbox = vis.server.gui.add_checkbox("Show OBB", initial_value=True)
+    show_raw_checkbox = vis.server.gui.add_checkbox("Show Raw", initial_value=True)
+    show_simplified_checkbox = vis.server.gui.add_checkbox("Show Simplified", initial_value=True)
+    show_coacd_checkbox = vis.server.gui.add_checkbox("Show CoACD", initial_value=True)
+
+with vis.server.gui.add_folder("Lighting"):
+    ambient_slider = vis.server.gui.add_slider("Ambient", min=0.0, max=3.0, step=0.1, initial_value=1.0)
+    point_slider = vis.server.gui.add_slider("Point Light", min=0.0, max=20.0, step=0.5, initial_value=5.0)
+
 @load_btn.on_click
 def _(_) -> None:
     load_object(obj_dropdown.value)
+
+@show_obb_checkbox.on_update
+def _(_) -> None:
+    visible = show_obb_checkbox.value
+    for handle in obb_handles:
+        handle.visible = visible
+
+def _make_mesh_toggle(checkbox, label):
+    @checkbox.on_update
+    def _(_) -> None:
+        if label in mesh_frames:
+            mesh_frames[label].visible = checkbox.value
+
+_make_mesh_toggle(show_raw_checkbox, "raw")
+_make_mesh_toggle(show_simplified_checkbox, "simplified")
+_make_mesh_toggle(show_coacd_checkbox, "coacd")
+
+@ambient_slider.on_update
+def _(_) -> None:
+    ambient_handle.intensity = ambient_slider.value
+
+@point_slider.on_update
+def _(_) -> None:
+    point_handle.intensity = point_slider.value
 
 if available_objects:
     load_object(available_objects[0])

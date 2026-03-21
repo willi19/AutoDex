@@ -1,24 +1,23 @@
 """
-Planning Success Rate — Only on IK-Reachable Points
+Planning Success Rate
 
-Loads reachability results, then runs full planning only on points
-where IK succeeded. Directly compares IK reachability vs planning success.
+Grid search over (pose, x_offset, z_rotation) and run full planning
+(IK + plan_single_js) on each point. Measures per-trial success rate.
 
 Usage:
-    # Single object (uses reachability data from outputs/reachability/)
-    python src/validation/planning/success_rate.py --obj attached_container --version selected_100
+    # Single object
+    python src/validation/planning/success_rate.py --obj blue_vase --version selected_100
 
-    # All objects with reachability data
+    # All objects with tabletop poses and grasp candidates
     python src/validation/planning/success_rate.py --version selected_100
 
-    # Custom trials and reachability dir
-    python src/validation/planning/success_rate.py --version selected_100 --n_trials 3 \
-        --reach_dir outputs/reachability
+    # Custom grid
+    python src/validation/planning/success_rate.py --version selected_100 \
+        --x_min 0.2 --x_max 0.5 --x_step 0.05 --z_step 30 --n_trials 5
 """
 
 import os
 import sys
-import time
 import argparse
 import json
 import logging
@@ -29,7 +28,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.expanduser("~"), "paradex"))
 
 from autodex.planner import GraspPlanner
-from autodex.utils.path import obj_path
+from autodex.utils.path import obj_path, candidate_path
 from autodex.utils.conversion import se32cart
 
 
@@ -68,63 +67,88 @@ def load_tabletop_scene(obj_name, pose_idx="000", x_offset=0.4, z_rotation=0.0):
     return scene_cfg
 
 
-def load_reachable_points(reach_dir, obj_name):
-    """Load IK-reachable grid points from reachability data."""
-    obj_dir = os.path.join(reach_dir, obj_name)
-    if not os.path.isdir(obj_dir):
+def get_tabletop_poses(obj_name):
+    """Get all available tabletop pose indices."""
+    pose_dir = os.path.join(obj_path, obj_name, "processed_data", "info", "tabletop")
+    if not os.path.isdir(pose_dir):
+        return []
+    return sorted([f.replace(".npy", "") for f in os.listdir(pose_dir) if f.endswith(".npy")])
+
+
+def get_all_objects(version):
+    """Find objects that have both tabletop poses and grasp candidates."""
+    cand_dir = os.path.join(candidate_path, version)
+    if not os.path.isdir(cand_dir):
+        return []
+    cand_objects = set(os.listdir(cand_dir))
+    objects = []
+    for obj_name in sorted(cand_objects):
+        tabletop_dir = os.path.join(obj_path, obj_name, "processed_data", "info", "tabletop")
+        if os.path.isdir(tabletop_dir) and len(os.listdir(tabletop_dir)) > 0:
+            objects.append(obj_name)
+    return objects
+
+
+def run_planning_grid(obj_name, grasp_version, n_trials,
+                      x_offsets, z_rotations_deg, save_dir=None):
+    """Run planning grid search for one object. Supports resume from partial results."""
+    pose_indices = get_tabletop_poses(obj_name)
+    if not pose_indices:
+        print(f"  No tabletop poses found for {obj_name}")
         return None
 
-    grid_files = [f for f in os.listdir(obj_dir)
-                  if f.endswith(".json") and "_viz" not in f]
-    if not grid_files:
-        return None
+    if save_dir is None:
+        save_dir = os.path.join("outputs", "planning_success_rate", obj_name)
+    os.makedirs(save_dir, exist_ok=True)
+    partial_path = os.path.join(save_dir, f"plan_vs_ik_{grasp_version}_partial.json")
 
-    with open(os.path.join(obj_dir, grid_files[0])) as f:
-        data = json.load(f)
+    # Build grid
+    grid_points = []
+    for pose_idx in pose_indices:
+        for x_off in x_offsets:
+            for z_deg in z_rotations_deg:
+                grid_points.append({
+                    "pose_idx": pose_idx,
+                    "x_offset": x_off,
+                    "z_rotation_deg": z_deg,
+                })
 
-    # Only keep points where IK succeeded in all trials
-    reachable = []
-    for r in data["grid"]:
-        if r["trials_with_ik"] == r["n_trials"]:
-            reachable.append({
-                "pose_idx": r["pose_idx"],
-                "x_offset": r["x_offset"],
-                "z_rotation_deg": r["z_rotation_deg"],
-                "ik_mean": r["ik_mean"],
-            })
+    # Resume from partial results if available
+    all_results = []
+    done_keys = set()
+    if os.path.exists(partial_path):
+        with open(partial_path) as f:
+            partial_data = json.load(f)
+        all_results = partial_data.get("results", [])
+        for r in all_results:
+            done_keys.add((r["pose_idx"], r["x_offset"], r["z_rotation_deg"]))
+        print(f"  Resuming: {len(all_results)}/{len(grid_points)} points done")
 
-    return {
-        "reachable": reachable,
-        "grasp_version": data["grasp_version"],
-        "n_reachable": data["n_reachable"],
-        "n_partial": data["n_partial"],
-        "n_unreachable": data["n_unreachable"],
-        "total": data["n_reachable"] + data["n_partial"] + data["n_unreachable"],
-    }
+    remaining = [pt for pt in grid_points
+                 if (pt["pose_idx"], pt["x_offset"], pt["z_rotation_deg"]) not in done_keys]
 
-
-def run_planning_on_reachable(obj_name, grasp_version, reachable_points,
-                               n_trials, save_dir=None):
-    """Run full planning on IK-reachable points."""
-    n_points = len(reachable_points)
+    n_points = len(grid_points)
     print(f"Object: {obj_name}")
     print(f"Grasp version: {grasp_version}")
-    print(f"IK-reachable points: {n_points}")
+    print(f"Grid: {len(pose_indices)} poses × {len(x_offsets)} x_offsets × {len(z_rotations_deg)} z_rotations = {n_points} points")
+    print(f"Remaining: {len(remaining)} points")
     print(f"Trials per point: {n_trials}")
-    print(f"Total plans: {n_points * n_trials}")
     print("=" * 60)
 
-    logging.getLogger("curobo").setLevel(logging.ERROR)
-    planner = GraspPlanner()
+    if not remaining:
+        print("  All points already done")
+    else:
+        logging.getLogger("curobo").setLevel(logging.ERROR)
+        planner = GraspPlanner()
 
-    all_results = []
-    stage_keys = ["load_candidates_s", "world_setup_s", "collision_check_s",
-                  "arm_plan_s", "finger_refine_s"]
+    stage_keys = ["load_candidates_s", "world_setup_s", "filter_s",
+                  "ik_s", "plan_single_js_s"]
 
-    n_plan_success = 0
-    n_plan_fail = 0
+    n_plan_success = sum(1 for r in all_results if r["success_rate"] == 1.0)
+    n_plan_fail = sum(1 for r in all_results if r["success_rate"] < 1.0)
 
-    pbar = tqdm(reachable_points, desc=f"{obj_name}", unit="pt")
+    pbar = tqdm(remaining, desc=f"{obj_name}", unit="pt",
+                initial=len(all_results), total=n_points)
     for pt in pbar:
         pose_idx = pt["pose_idx"]
         x_off = pt["x_offset"]
@@ -136,6 +160,9 @@ def run_planning_on_reachable(obj_name, grasp_version, reachable_points,
 
         successes = 0
         trial_timings = []
+        ik_counts = []
+        filter_counts = []  # (n_total, n_backward, n_collision, n_valid)
+        first_success_result = None
 
         for trial in range(n_trials):
             result = planner.plan(
@@ -144,9 +171,17 @@ def run_planning_on_reachable(obj_name, grasp_version, reachable_points,
                 seed=trial,
             )
             trial_timings.append(result.timing)
+            ik_counts.append(result.timing.get("n_ik_success", 0))
+            filter_counts.append({
+                "n_total": result.timing.get("n_total", 0),
+                "n_backward": result.timing.get("n_backward", 0),
+                "n_collision": result.timing.get("n_collision", 0),
+                "n_valid": result.timing.get("n_valid", 0),
+            })
             if result.success:
                 successes += 1
-                break  # no need to keep trying once we know planning can succeed
+                if first_success_result is None:
+                    first_success_result = result
 
         # Aggregate timing
         avg_timing = {}
@@ -155,19 +190,35 @@ def run_planning_on_reachable(obj_name, grasp_version, reachable_points,
             if vals:
                 avg_timing[key] = round(float(np.mean(vals)), 3)
 
-        rate = successes / max(1, len(trial_timings))
+        rate = successes / n_trials
+        fc = filter_counts[0]  # same across seeds (deterministic filter)
 
         entry = {
             "pose_idx": pose_idx,
             "x_offset": x_off,
             "z_rotation_deg": z_deg,
-            "ik_mean": pt["ik_mean"],
             "success_count": successes,
             "n_trials": n_trials,
             "success_rate": rate,
+            "n_total": fc["n_total"],
+            "n_backward": fc["n_backward"],
+            "n_collision": fc["n_collision"],
+            "n_valid": fc["n_valid"],
+            "ik_counts": ik_counts,
+            "ik_mean": round(float(np.mean(ik_counts)), 1),
             "avg_timing": avg_timing,
         }
         all_results.append(entry)
+
+        # Save trajectory and grasp info for first successful trial
+        if first_success_result is not None:
+            traj_dir = os.path.join(save_dir, "trajectories",
+                                    f"{pose_idx}_x{x_off:.2f}_z{z_deg:.0f}")
+            os.makedirs(traj_dir, exist_ok=True)
+            np.save(os.path.join(traj_dir, "traj.npy"), first_success_result.traj)
+            np.save(os.path.join(traj_dir, "wrist_se3.npy"), first_success_result.wrist_se3)
+            np.save(os.path.join(traj_dir, "pregrasp.npy"), first_success_result.pregrasp_pose)
+            np.save(os.path.join(traj_dir, "grasp.npy"), first_success_result.grasp_pose)
 
         if rate == 1.0:
             n_plan_success += 1
@@ -177,9 +228,14 @@ def run_planning_on_reachable(obj_name, grasp_version, reachable_points,
         pbar.set_postfix(ok=n_plan_success, fail=n_plan_fail,
                          rate=f"{rate*100:.0f}%")
 
+        # Save partial results periodically
+        if len(all_results) % 10 == 0:
+            with open(partial_path, "w") as f:
+                json.dump({"results": all_results}, f, indent=2, default=str)
+
     # Summary
     print(f"\n{'=' * 60}")
-    print("PLANNING ON IK-REACHABLE POINTS")
+    print("PLANNING SUCCESS RATE")
     print(f"{'=' * 60}")
 
     rates = [r["success_rate"] for r in all_results]
@@ -187,19 +243,18 @@ def run_planning_on_reachable(obj_name, grasp_version, reachable_points,
     never_ok = sum(1 for r in rates if r == 0.0)
     partial = len(rates) - always_ok - never_ok
 
-    print(f"IK-reachable points tested: {len(all_results)}")
-    print(f"  Planning always succeeds: {always_ok}")
-    print(f"  Planning sometimes fails: {partial}")
-    print(f"  Planning always fails:    {never_ok}")
+    print(f"Grid points tested: {len(all_results)}")
+    print(f"  Always succeeds:  {always_ok}")
+    print(f"  Sometimes fails:  {partial}")
+    print(f"  Always fails:     {never_ok}")
     print(f"Overall mean rate: {np.mean(rates)*100:.1f}%")
 
     if never_ok + partial > 0:
-        print(f"\nIK-reachable but planning fails ({never_ok + partial} points):")
+        print(f"\nPlanning failures ({never_ok + partial} points):")
         failures = [r for r in all_results if r["success_rate"] < 1.0]
         for r in sorted(failures, key=lambda x: x["success_rate"]):
             print(f"  pose={r['pose_idx']} x={r['x_offset']:.2f} z={r['z_rotation_deg']:3.0f}°  "
-                  f"plan={r['success_count']}/{r['n_trials']} ({r['success_rate']*100:.0f}%)  "
-                  f"ik_mean={r['ik_mean']:.1f}")
+                  f"plan={r['success_count']}/{r['n_trials']} ({r['success_rate']*100:.0f}%)")
 
     # Per-stage timing breakdown
     success_results = [r for r in all_results if r["success_rate"] > 0]
@@ -216,7 +271,6 @@ def run_planning_on_reachable(obj_name, grasp_version, reachable_points,
                     "min": round(float(np.min(vals)), 3),
                     "max": round(float(np.max(vals)), 3),
                 }
-        # Total wall time per point
         totals = []
         for r in results:
             if r["avg_timing"]:
@@ -235,15 +289,11 @@ def run_planning_on_reachable(obj_name, grasp_version, reachable_points,
     timing_fail = compute_timing_stats(fail_results, stage_keys) if fail_results else {}
 
     # Save
-    if save_dir is None:
-        save_dir = os.path.join("outputs", "planning_success_rate", obj_name)
-    os.makedirs(save_dir, exist_ok=True)
-
     summary = {
         "obj_name": obj_name,
         "grasp_version": grasp_version,
         "n_trials": n_trials,
-        "n_ik_reachable": len(all_results),
+        "n_grid_points": len(all_results),
         "n_plan_always_ok": always_ok,
         "n_plan_partial": partial,
         "n_plan_always_fail": never_ok,
@@ -259,28 +309,34 @@ def run_planning_on_reachable(obj_name, grasp_version, reachable_points,
     out_path = os.path.join(save_dir, f"plan_vs_ik_{grasp_version}.json")
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2, default=str)
+    # Clean up partial file
+    if os.path.exists(partial_path):
+        os.remove(partial_path)
     print(f"\nResults saved to: {out_path}")
 
     return summary
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Planning success on IK-reachable points")
+    parser = argparse.ArgumentParser(description="Planning success rate grid search")
     parser.add_argument("--obj", type=str, default=None, help="Object name (omit for all)")
     parser.add_argument("--version", type=str, required=True, help="Grasp candidate version")
-    parser.add_argument("--n_trials", type=int, default=3, help="Trials per point")
-    parser.add_argument("--reach_dir", type=str, default="outputs/reachability",
-                        help="Reachability results directory")
+    parser.add_argument("--n_trials", type=int, default=5, help="Trials per point")
+    parser.add_argument("--x_min", type=float, default=0.2, help="Min x offset")
+    parser.add_argument("--x_max", type=float, default=0.5, help="Max x offset")
+    parser.add_argument("--x_step", type=float, default=0.05, help="X offset step")
+    parser.add_argument("--z_step", type=float, default=30, help="Z rotation step (degrees)")
     parser.add_argument("--save_dir", type=str, default=None, help="Output directory")
     args = parser.parse_args()
 
-    # Find objects with reachability data
+    x_offsets = np.arange(args.x_min, args.x_max + 1e-6, args.x_step).round(3).tolist()
+    z_rotations_deg = np.arange(0, 360, args.z_step).tolist()
+
     if args.obj is not None:
         objects = [args.obj]
     else:
-        objects = sorted([d for d in os.listdir(args.reach_dir)
-                          if os.path.isdir(os.path.join(args.reach_dir, d))])
-        print(f"Found {len(objects)} objects with reachability data\n")
+        objects = get_all_objects(args.version)
+        print(f"Found {len(objects)} objects with tabletop poses + candidates\n")
 
     all_summaries = {}
     for obj_name in objects:
@@ -288,27 +344,26 @@ if __name__ == "__main__":
         print(f"# {obj_name}")
         print(f"{'#' * 60}")
 
-        reach = load_reachable_points(args.reach_dir, obj_name)
-        if reach is None:
-            print(f"  No reachability data found, skipping")
+        # Skip if result already exists
+        save_dir = args.save_dir or os.path.join("outputs", "planning_success_rate", obj_name)
+        out_path = os.path.join(save_dir, f"plan_vs_ik_{args.version}.json")
+        if os.path.exists(out_path):
+            print(f"  Result exists, skipping: {out_path}")
+            with open(out_path) as f:
+                all_summaries[obj_name] = json.load(f)
             continue
-
-        if not reach["reachable"]:
-            print(f"  No IK-reachable points (0/{reach['total']}), skipping")
-            continue
-
-        print(f"  IK: {reach['n_reachable']}/{reach['total']} reachable, "
-              f"{reach['n_partial']} partial, {reach['n_unreachable']} unreachable")
 
         try:
-            summary = run_planning_on_reachable(
+            summary = run_planning_grid(
                 obj_name=obj_name,
                 grasp_version=args.version,
-                reachable_points=reach["reachable"],
                 n_trials=args.n_trials,
+                x_offsets=x_offsets,
+                z_rotations_deg=z_rotations_deg,
                 save_dir=args.save_dir,
             )
-            all_summaries[obj_name] = summary
+            if summary:
+                all_summaries[obj_name] = summary
         except Exception as e:
             print(f"  SKIPPED: {e}")
             import traceback
@@ -317,14 +372,14 @@ if __name__ == "__main__":
 
     if len(all_summaries) > 1:
         print(f"\n{'=' * 60}")
-        print("ALL OBJECTS: IK REACHABLE vs PLANNING SUCCESS")
+        print("ALL OBJECTS: PLANNING SUCCESS RATE")
         print(f"{'=' * 60}")
         for obj_name, s in all_summaries.items():
             if "error" in s:
                 print(f"  {obj_name}: ERROR - {s['error']}")
             else:
-                print(f"  {obj_name}: ik_reachable={s['n_ik_reachable']}  "
-                      f"plan_ok={s['n_plan_always_ok']}  "
-                      f"plan_fail={s['n_plan_always_fail']}  "
+                print(f"  {obj_name}: grid={s['n_grid_points']}  "
+                      f"ok={s['n_plan_always_ok']}  "
+                      f"fail={s['n_plan_always_fail']}  "
                       f"partial={s['n_plan_partial']}  "
                       f"rate={s['overall_mean_rate']*100:.1f}%")

@@ -260,18 +260,67 @@ def save_combined_viz(img_dict, serials, object_info, output_dir):
                 + color.astype(np.float32) * 0.5
             ).astype(np.uint8)
 
-        for i, obj_name in enumerate(obj_names):
-            color = OBJECT_COLORS[i % len(OBJECT_COLORS)]
-            y = 30 + i * 35
-            cv2.rectangle(image_bgr, (10, y - 18), (30, y + 2), color, -1)
-            text = f"{obj_name}: {object_info[obj_name]['text']}"
-            cv2.putText(image_bgr, text, (38, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
-            cv2.putText(image_bgr, text, (38, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-
         cv2.imwrite(str(combined_dir / f"{serial}.png"), image_bgr)
         grid_images[serial] = image_bgr
 
     grid = _make_grid(grid_images, ncols=6, label=True)
+
+    # Draw legend bar at the top of the grid
+    font_scale = 1.2
+    thickness = 2
+    pad_x, pad_y = 20, 10
+    entries = []
+    for i, obj_name in enumerate(obj_names):
+        text = f"{obj_name}: {object_info[obj_name]['text']}"
+        color = OBJECT_COLORS[i % len(OBJECT_COLORS)]
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        entries.append((text, color, tw, th))
+
+    swatch_size = 24
+    gap = 12  # gap between swatch and text
+    item_spacing = 40  # horizontal spacing between legend items
+    max_w = grid.shape[1] - 2 * pad_x
+
+    # Layout legend items into rows
+    rows = []
+    cur_row = []
+    cur_x = 0
+    row_h = 0
+    for text, color, tw, th in entries:
+        item_w = swatch_size + gap + tw + item_spacing
+        if cur_row and cur_x + item_w > max_w:
+            rows.append((cur_row, row_h))
+            cur_row = []
+            cur_x = 0
+            row_h = 0
+        cur_row.append((text, color, tw, th))
+        cur_x += item_w
+        row_h = max(row_h, max(th, swatch_size))
+    if cur_row:
+        rows.append((cur_row, row_h))
+
+    row_spacing = 10
+    legend_h = pad_y * 2 + sum(rh for _, rh in rows) + row_spacing * (len(rows) - 1)
+    legend_bar = np.full((legend_h, grid.shape[1], 3), 40, dtype=np.uint8)
+
+    y_cursor = pad_y
+    for row_items, rh in rows:
+        x_cursor = pad_x
+        for text, color, tw, th in row_items:
+            cy = y_cursor + rh // 2
+            cv2.rectangle(legend_bar,
+                          (x_cursor, cy - swatch_size // 2),
+                          (x_cursor + swatch_size, cy + swatch_size // 2),
+                          color, -1)
+            text_y = cy + th // 2
+            cv2.putText(legend_bar, text, (x_cursor + swatch_size + gap, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 2)
+            cv2.putText(legend_bar, text, (x_cursor + swatch_size + gap, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
+            x_cursor += swatch_size + gap + tw + item_spacing
+        y_cursor += rh + row_spacing
+
+    grid = np.vstack([legend_bar, grid])
     cv2.imwrite(str(combined_dir / "grid.png"), grid)
     logging.info(f"Combined grid saved to {combined_dir / 'grid.png'}")
 

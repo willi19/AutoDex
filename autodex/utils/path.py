@@ -6,9 +6,9 @@ import trimesh
 home_path = os.path.expanduser("~")
 code_path = os.path.join(home_path, "RSS_2026")
 shared_dir = os.path.join(home_path, "shared_data")
-project_dir = os.path.join(shared_dir, "RSS2026_Mingi")
+project_dir = os.path.join(shared_dir, "AutoDex")
 bodex_path = os.path.join(code_path, "BODex_outputs")
-candidate_path = os.path.join(code_path, "candidates")
+candidate_path = os.path.join(project_dir, "candidates", "allegro")
 
 robot_configs_path = os.path.join(project_dir, "content", "configs", "robot")
 obj_path = os.path.join(project_dir, "object", "paradex")

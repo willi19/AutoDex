@@ -1,0 +1,53 @@
+Planning Validation Results (2026-03-18)
+=========================================
+
+Candidate version: selected_100 (new path: shared_data/AutoDex/candidates/allegro/selected_100)
+Grid: x_offset [0.2-0.5, step 0.05] × z_rotation [0°-330°, step 30°] × all tabletop poses
+Trials per point: 5 (independent, no early break)
+Planner: IK → plan_single_js (no plan_batch)
+
+## Per-Object Results
+
+### apple (3 poses × 7 x × 12 z = 252 points)
+- Success rate: 100.0%
+- IK: deterministic (208/252), stochastic 44 (variation ±1 candidate out of ~14)
+- plan_single_js: 0 stochastic — fully deterministic
+- Timing (filtered): 1.63s/point (IK 0.11s + plan_single_js 1.36s)
+
+### baseball (1 pose × 7 x × 12 z = 84 points)
+- Success rate: 85.2%
+- IK always 0: 10 points (plan impossible, no candidate passes IK)
+- IK > 0: 74 points
+  - plan always ok:   68 (91.9%)
+  - plan stochastic:   5 (6.8%) — seed-dependent, z=180-210° boundary
+  - plan always fail:  1 (1.4%)
+- IK: mostly deterministic (80/84), 4 stochastic (variation ±1 candidate)
+- plan_single_js: 5 stochastic cases, all at boundary configs
+- Timing (filtered): 0.76s/point (IK 0.08s + plan_single_js 0.63s)
+
+## Summary
+
+- IK reachable → planning success: 95-100%
+- IK is nearly deterministic across seeds
+- plan_single_js is stochastic only at boundary configurations
+- Failures cluster at z_rotation 150-210° + small x_offset (0.2-0.35)
+- GPU contention significantly inflates timing — run planning alone for accurate measurements
+
+## Timing (no GPU contention)
+
+| Stage                | apple   | baseball |
+|----------------------|---------|----------|
+| First warmup         | ~7s (once per process)        |
+| load_candidates      | 0.051s  | 0.009s   |
+| world_setup          | 0.020s  | 0.006s   |
+| filter               | 0.093s  | 0.040s   |
+| IK (100 candidates)  | 0.109s  | 0.077s   |
+| plan_single_js (1x)  | 1.357s  | 0.627s   |
+| **total per plan()** | **1.63s** | **0.76s** |
+
+## Comparison: Old vs New Planner
+
+Old (plan_batch + refine_fingers): ~59s/plan, 97.3% success (attached_container)
+New (IK + plan_single_js):         ~1-2s/plan, 95-100% success
+Speedup: ~30-60x
+Success rate: comparable (boundary stochasticity, not systematic degradation)

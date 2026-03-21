@@ -1,0 +1,413 @@
+"""Sim filter: test BODex grasps in MuJoCo, extract passing candidates.
+
+Usage:
+    python src/grasp_generation/sim_filter/run_sim_filter.py --hand allegro --version v3 --obj attached_container
+    python src/grasp_generation/sim_filter/run_sim_filter.py --hand allegro --version v3 --obj attached_container --viewer
+"""
+
+import os
+import json
+import shutil
+import argparse
+import numpy as np
+from tqdm import tqdm
+import transforms3d.quaternions as tq
+
+import mujoco
+from autodex.simulator.hand_object import MjHO
+from autodex.simulator.rot_util import np_get_delta_qpos
+from autodex.utils.conversion import se32cart, cart2se3
+from autodex.planner.planner import GraspPlanner, _to_curobo_world
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
+FORCE_DIRECTIONS = np.array([
+    [-1,0,0, 0,0,0], [1,0,0, 0,0,0],
+    [0,-1,0, 0,0,0], [0,1,0, 0,0,0],
+    [0,0,-1, 0,0,0], [0,0,1, 0,0,0],
+], dtype=float)
+
+OBJ_MASS = 0.1
+FORCE_SCALE = 1.0
+TRANS_THRE = 0.05
+ANGLE_THRE = 15.0
+MAX_PENE = 0.01
+
+HAND_PATHS = {
+    "allegro": {
+        "path": os.path.join(REPO_ROOT, "src", "grasp_generation", "sim_filter", "assets", "hand", "allegro", "right_hand.xml"),
+        "weld_body": "world",
+    },
+    "inspire": {
+        "path": os.path.join(REPO_ROOT, "src", "grasp_generation", "BODex", "src", "curobo", "content", "assets", "robot", "inspire_description", "inspire_hand_right.urdf"),
+        "weld_body": "wrist",
+    },
+}
+
+# R_delta (same as RSS_2026 base.py)
+_q_delta = np.array([0, 1, 0, 1], dtype=np.float64)
+_q_delta /= np.linalg.norm(_q_delta)
+R_DELTA = tq.quat2mat(_q_delta)
+
+
+def _expand_mimic_joints(joints, mimic_map):
+    """Expand actuated joints to include mimic joints.
+    mimic_map: list of (parent_idx, multiplier, offset) for each joint in order.
+    None means it's an actuated joint (use as-is from input).
+    """
+    if mimic_map is None:
+        return joints
+    expanded = []
+    act_idx = 0
+    for entry in mimic_map:
+        if entry is None:
+            expanded.append(joints[act_idx])
+            act_idx += 1
+        else:
+            parent_idx, mult, offset = entry
+            expanded.append(joints[parent_idx] * mult + offset)
+    return np.array(expanded)
+
+
+# Inspire: 6 actuated → 12 total (with mimic)
+# Joint order in URDF: thumb1, thumb2, thumb3(mimic thumb2*0.6), thumb4(mimic thumb2*0.8),
+#   index1, index2(mimic index1*1.05), middle1, middle2(mimic middle1*1.05),
+#   ring1, ring2(mimic ring1*1.05), little1, little2(mimic little1*1.18)
+INSPIRE_MIMIC_MAP = [
+    None,           # thumb1 (act 0)
+    None,           # thumb2 (act 1)
+    (1, 0.60, 0),   # thumb3 = thumb2 * 0.6
+    (1, 0.80, 0),   # thumb4 = thumb2 * 0.8
+    None,           # index1 (act 2)
+    (2, 1.05, 0),   # index2 = index1 * 1.05
+    None,           # middle1 (act 3)
+    (3, 1.05, 0),   # middle2 = middle1 * 1.05
+    None,           # ring1 (act 4)
+    (4, 1.05, 0),   # ring2 = ring1 * 1.05
+    None,           # little1 (act 5)
+    (5, 1.18, 0),   # little2 = little1 * 1.18
+]
+
+
+def eval_single_grasp(mj, wrist_se3, pregrasp_joints, grasp_joints, mimic_map=None, apply_r_delta=True):
+    """Returns (success, traj_data)."""
+    # Expand mimic joints if needed
+    pregrasp_joints = _expand_mimic_joints(pregrasp_joints, mimic_map)
+    grasp_joints = _expand_mimic_joints(grasp_joints, mimic_map)
+
+    # Coordinate transform (R_DELTA only for allegro — its XML palm has quat="0 1 0 1")
+    w = wrist_se3.copy()
+    if apply_r_delta:
+        w[:3, :3] = w[:3, :3] @ np.linalg.inv(R_DELTA)
+    wrist_cart = se32cart(w)
+
+    squeeze_joints = grasp_joints * 2 - pregrasp_joints
+    pregrasp_qpos = np.concatenate([wrist_cart, pregrasp_joints])
+    grasp_qpos = np.concatenate([wrist_cart, grasp_joints])
+    squeeze_qpos = np.concatenate([wrist_cart, squeeze_joints])
+    obj_pose = np.array([0, 0, 0, 1, 0, 0, 0], dtype=float)
+
+    traj = {"robot_qpos": [], "object_pose": [], "phase": [], "contacts": []}
+
+    def _rec(phase):
+        traj["robot_qpos"].append(mj.data.qpos[:-7].tolist())
+        traj["object_pose"].append(mj.get_obj_pose().tolist())
+        traj["phase"].append(phase)
+        traj["contacts"].append(mj.get_contact_info())
+
+    # 1. Reset + pregrasp
+    mj.reset_pose_qpos(pregrasp_qpos, obj_pose)
+    _rec("pregrasp")
+
+    # 2. Pregrasp → Grasp (record each step)
+    from autodex.simulator.rot_util import interplote_pose, interplote_qpos
+    pose_interp = interplote_pose(pregrasp_qpos[:7], grasp_qpos[:7], 10)
+    ctrl_interp = interplote_qpos(mj._qpos2ctrl(pregrasp_qpos), mj._qpos2ctrl(grasp_qpos), 10)
+    for j in range(10):
+        mj.data.mocap_pos[0] = pose_interp[j, :3]
+        mj.data.mocap_quat[0] = pose_interp[j, 3:7]
+        mj.data.ctrl[:] = ctrl_interp[j]
+        mujoco.mj_forward(mj.model, mj.data)
+        mj.control_hand_step(step_inner=10)
+        _rec("grasp")
+
+    # 3. Grasp → Squeeze (record each step)
+    pose_interp = interplote_pose(grasp_qpos[:7], squeeze_qpos[:7], 10)
+    ctrl_interp = interplote_qpos(mj._qpos2ctrl(grasp_qpos), mj._qpos2ctrl(squeeze_qpos), 10)
+    for j in range(10):
+        mj.data.mocap_pos[0] = pose_interp[j, :3]
+        mj.data.mocap_quat[0] = pose_interp[j, 3:7]
+        mj.data.ctrl[:] = ctrl_interp[j]
+        mujoco.mj_forward(mj.model, mj.data)
+        mj.control_hand_step(step_inner=10)
+        _rec("squeeze")
+
+    # 4. Force test
+    for fi, fdir in enumerate(FORCE_DIRECTIONS):
+        mj.reset_pose_qpos(pregrasp_qpos, obj_pose)
+        mj.control_hand_with_interp(pregrasp_qpos, grasp_qpos)
+        mj.control_hand_with_interp(grasp_qpos, squeeze_qpos)
+
+        mj.set_ext_force_on_obj(fdir * FORCE_SCALE * OBJ_MASS)
+
+        pre_obj = mj.get_obj_pose().copy()
+        for _ in range(50):
+            mj.control_hand_step(step_inner=10)
+            _rec(f"force_{fi}")
+
+            cur_obj = mj.get_obj_pose()
+            dp, da = np_get_delta_qpos(pre_obj, cur_obj)
+            if dp > TRANS_THRE or da > ANGLE_THRE:
+                mj.set_ext_force_on_obj(np.zeros(6))
+                return False, traj
+
+        mj.set_ext_force_on_obj(np.zeros(6))
+
+    return True, traj
+
+
+def run_sim_filter(hand, version, obj_name, bodex_root, candidate_root, viewer=False, coll_only=False, sim_only=False):
+    bodex_obj_dir = os.path.join(bodex_root, obj_name)
+    if not os.path.isdir(bodex_obj_dir):
+        print(f"  No BODex outputs for {obj_name}")
+        return 0, 0
+
+    hand_cfg = HAND_PATHS.get(hand)
+    if hand_cfg is None:
+        print(f"  No hand config for {hand}")
+        return 0, 0
+
+    from autodex.utils.path import obj_path as obj_data_path
+
+    # Group seeds by scene
+    scene_seeds = {}  # (scene_type, scene_id) -> [(seed, seed_dir), ...]
+    for scene_type in sorted(os.listdir(bodex_obj_dir)):
+        std = os.path.join(bodex_obj_dir, scene_type)
+        if not os.path.isdir(std):
+            continue
+        for scene_id in sorted(os.listdir(std)):
+            sid = os.path.join(std, scene_id)
+            if not os.path.isdir(sid):
+                continue
+            for seed in sorted(os.listdir(sid)):
+                sd = os.path.join(sid, seed)
+                if os.path.isdir(sd):
+                    scene_seeds.setdefault((scene_type, scene_id), []).append((seed, sd))
+
+    # --- Step 1: Scene collision check (cuRobo, GPU, fast) ---
+    coll_valid = {}  # seed_dir -> bool (True = collision-free)
+
+    if sim_only:
+        # Load cached coll_valid from disk, skip cuRobo
+        for (scene_type, scene_id), seeds in scene_seeds.items():
+            for seed, sd in seeds:
+                coll_file = os.path.join(sd, "coll_valid.npy")
+                if os.path.exists(coll_file):
+                    coll_valid[sd] = bool(np.load(coll_file))
+                elif os.path.exists(os.path.join(sd, "sim_eval.json")):
+                    coll_valid[sd] = True
+                else:
+                    coll_valid[sd] = False
+    else:
+        print(f"  [1/2] Collision check...")
+        from autodex.utils.path import robot_configs_path
+        if hand == "allegro":
+            hand_coll_cfg = os.path.join(robot_configs_path, "allegro_floating.yml")
+        else:
+            hand_coll_cfg = os.path.join(robot_configs_path, "inspire_floating.yml")
+        planner = GraspPlanner(hand_cfg_path=hand_coll_cfg)
+
+        n_coll_pass = 0
+        n_coll_total = 0
+
+        for (scene_type, scene_id), seeds in tqdm(scene_seeds.items(), desc=f"  coll check", leave=False):
+            scene_json = os.path.join(obj_data_path, obj_name, "scene", scene_type, f"{scene_id}.json")
+            if not os.path.exists(scene_json):
+                for seed, sd in seeds:
+                    coll_valid[sd] = False
+                    n_coll_total += 1
+                continue
+
+            scene_cfg = json.load(open(scene_json))["scene"]
+            obj_se3 = cart2se3(scene_cfg["mesh"]["target"]["pose"])
+            world_cfg = _to_curobo_world(scene_cfg)
+
+            wrist_list = []
+            pregrasp_list = []
+            seed_dirs = []
+            for seed, sd in seeds:
+                coll_file = os.path.join(sd, "coll_valid.npy")
+                if os.path.exists(coll_file):
+                    cv = bool(np.load(coll_file))
+                    coll_valid[sd] = cv
+                    n_coll_total += 1
+                    if cv:
+                        n_coll_pass += 1
+                    continue
+                if os.path.exists(os.path.join(sd, "sim_eval.json")):
+                    coll_valid[sd] = True
+                    n_coll_total += 1
+                    continue
+                wrist_se3 = np.load(os.path.join(sd, "wrist_se3.npy"))
+                pregrasp = np.load(os.path.join(sd, "pregrasp_pose.npy"))
+                if not np.isfinite(wrist_se3).all() or not np.isfinite(pregrasp).all():
+                    coll_valid[sd] = False
+                    np.save(os.path.join(sd, "coll_valid.npy"), False)
+                    n_coll_total += 1
+                    continue
+                wrist_world = obj_se3 @ wrist_se3
+                wrist_list.append(wrist_world)
+                pregrasp_list.append(pregrasp)
+                seed_dirs.append(sd)
+
+            if not wrist_list:
+                continue
+
+            wrist_arr = np.array(wrist_list)
+            pregrasp_arr = np.array(pregrasp_list)
+
+            try:
+                collided = planner._check_collision(world_cfg, wrist_arr, pregrasp_arr)
+            except Exception:
+                import traceback; traceback.print_exc()
+                collided = np.ones(len(wrist_arr), dtype=bool)
+
+            for i, sd in enumerate(seed_dirs):
+                cv = not collided[i]
+                coll_valid[sd] = cv
+                np.save(os.path.join(sd, "coll_valid.npy"), cv)
+                n_coll_total += 1
+                if cv:
+                    n_coll_pass += 1
+
+        print(f"  Collision: {n_coll_pass}/{n_coll_total} passed")
+
+    if coll_only:
+        return n_coll_total, n_coll_pass
+
+    # --- Step 2: MuJoCo sim eval (only collision-free seeds) ---
+    print(f"  [2/2] MuJoCo sim eval...")
+    mj = MjHO(obj_name, hand_cfg["path"], weld_body_name=hand_cfg["weld_body"],
+              obj_mass=OBJ_MASS, debug_viewer=viewer)
+
+    all_seeds = []
+    for (scene_type, scene_id), seeds in scene_seeds.items():
+        for seed, sd in seeds:
+            all_seeds.append((scene_type, scene_id, seed, sd))
+
+    total = 0
+    success_count = 0
+    coll_skip = 0
+    pbar = tqdm(total=len(all_seeds), desc=f"  {obj_name}")
+
+    for scene_type, scene_id, seed, seed_dir in all_seeds:
+        result_path = os.path.join(seed_dir, "sim_eval.json")
+
+        # Skip already evaluated
+        if os.path.exists(result_path):
+            total += 1
+            r = json.load(open(result_path))
+            if r["success"]:
+                success_count += 1
+            pbar.update(1)
+            pbar.set_postfix_str(f"succ={success_count} rate={success_count/total*100:.1f}%")
+            continue
+
+        # Skip collision-failed seeds (save result as fail)
+        if not coll_valid.get(seed_dir, False):
+            coll_skip += 1
+            total += 1
+            with open(result_path, "w") as f:
+                json.dump({"success": False, "hand": hand, "version": version,
+                           "reason": "scene_collision"}, f)
+            pbar.update(1)
+            pbar.set_postfix_str(f"succ={success_count} rate={success_count/total*100:.1f}%")
+            continue
+
+        wrist_se3 = np.load(os.path.join(seed_dir, "wrist_se3.npy"))
+        pregrasp = np.load(os.path.join(seed_dir, "pregrasp_pose.npy"))
+        grasp = np.load(os.path.join(seed_dir, "grasp_pose.npy"))
+
+        mimic_map = INSPIRE_MIMIC_MAP if hand == "inspire" else None
+        apply_r_delta = (hand == "allegro")  # R_DELTA is allegro-specific
+        try:
+            succ, traj_data = eval_single_grasp(mj, wrist_se3, pregrasp, grasp, mimic_map=mimic_map, apply_r_delta=apply_r_delta)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            succ, traj_data = False, None
+
+        with open(result_path, "w") as f:
+            json.dump({"success": bool(succ), "hand": hand, "version": version}, f)
+
+        if traj_data is not None:
+            with open(os.path.join(seed_dir, "sim_traj.json"), "w") as f:
+                json.dump(traj_data, f)
+
+        total += 1
+        if succ:
+            success_count += 1
+            cand_dir = os.path.join(candidate_root, obj_name, scene_type, scene_id, seed)
+            os.makedirs(cand_dir, exist_ok=True)
+            for fname in ["wrist_se3.npy", "pregrasp_pose.npy", "grasp_pose.npy", "bodex_info.npy"]:
+                src = os.path.join(seed_dir, fname)
+                if os.path.exists(src):
+                    shutil.copy2(src, cand_dir)
+
+        pbar.update(1)
+        pbar.set_postfix_str(f"succ={success_count} rate={success_count/total*100:.1f}%")
+
+    pbar.close()
+    mj.close()
+    return total, success_count
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--hand", type=str, default="allegro")
+    parser.add_argument("--version", type=str, default="v3")
+    parser.add_argument("--obj", type=str, default=None)
+    parser.add_argument("--viewer", action="store_true")
+    parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers (object-level)")
+    args = parser.parse_args()
+
+    if args.obj:
+        obj_list = [args.obj]
+    else:
+        obj_list_file = os.path.join(REPO_ROOT, "src", "grasp_generation", "obj_list.txt")
+        with open(obj_list_file) as f:
+            obj_list = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+
+    bodex_root = os.path.join(REPO_ROOT, "bodex_outputs", args.hand, args.version)
+    candidate_root = os.path.join(REPO_ROOT, "candidates", args.hand, args.version)
+
+    print(f"Hand: {args.hand}, Version: {args.version}, Workers: {args.workers}")
+
+    if args.workers > 1 and not args.viewer:
+        # Stage 1: Collision check for ALL objects (GPU, sequential)
+        print("\n=== Stage 1: Collision check (all objects) ===")
+        for obj_name in obj_list:
+            run_sim_filter(args.hand, args.version, obj_name,
+                           bodex_root, candidate_root, coll_only=True)
+
+        # Stage 2: MuJoCo sim eval (CPU, parallel)
+        print(f"\n=== Stage 2: MuJoCo sim eval ({args.workers} workers) ===")
+        from multiprocessing import Pool
+
+        def _run_mujoco(obj_name):
+            total, succ = run_sim_filter(args.hand, args.version, obj_name,
+                                          bodex_root, candidate_root, sim_only=True)
+            print(f"  {obj_name}: {succ}/{total} passed")
+            return obj_name, total, succ
+
+        with Pool(args.workers) as pool:
+            results = pool.map(_run_mujoco, obj_list)
+        total_all = sum(r[1] for r in results)
+        succ_all = sum(r[2] for r in results)
+        print(f"\nTotal: {succ_all}/{total_all} passed")
+    else:
+        for obj_name in obj_list:
+            print(f"\n{obj_name}:")
+            total, succ = run_sim_filter(args.hand, args.version, obj_name,
+                                          bodex_root, candidate_root, viewer=args.viewer)
+            print(f"  {succ}/{total} passed")
