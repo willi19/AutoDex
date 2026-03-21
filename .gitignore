@@ -39,6 +39,9 @@ output/
 # Third-party dependencies
 autodex/perception/thirdparty/*
 !autodex/perception/thirdparty/sam3
+!autodex/perception/thirdparty/FoundationPose
+autodex/perception/thirdparty/FoundationPose/weights
+autodex/perception/thirdparty/weights
 bodex_outputs/*
 candidates/*
 outputs/*

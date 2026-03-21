@@ -1,21 +1,28 @@
+import os
 import sys
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
-_GUNHEE_FP = Path(__file__).parent / "thirdparty/_object_6d_tracking/FoundationPose"
+_THIS_DIR = Path(__file__).parent
+_FP_CODE = _THIS_DIR / "thirdparty/FoundationPose"
+_WEIGHTS_DIR = _THIS_DIR / "thirdparty/weights/foundationpose"
 
 
 def _setup_foundation_pose_path():
-    path = str(_GUNHEE_FP)
+    path = str(_FP_CODE)
     if path not in sys.path:
         sys.path.insert(0, path)
-    # mycpp is a C++ extension; Utils.py uses the wrong import path so it falls back to None.
-    # Pre-add the build dir so we can patch it in after import.
-    mycpp_build = str(_GUNHEE_FP / "mycpp/build")
+    mycpp_build = str(_FP_CODE / "mycpp/build")
     if mycpp_build not in sys.path:
         sys.path.insert(0, mycpp_build)
+    # Override weight path so FoundationPose finds weights in thirdparty/weights/
+    # predict_score.py and predict_pose_refine.py use code_dir/../../weights/
+    # We symlink thirdparty/FoundationPose/weights -> thirdparty/weights/foundationpose
+    weights_link = _FP_CODE / "weights"
+    if not weights_link.exists() and _WEIGHTS_DIR.exists():
+        weights_link.symlink_to(_WEIGHTS_DIR)
 
 
 class PoseTracker:
