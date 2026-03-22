@@ -432,7 +432,10 @@ class PerceptionPipeline:
         self._load_sil_optimizer()
         mt = self._sil_optimizer.mesh_tensors
         glctx = self._sil_optimizer.glctx
-        from autodex.perception.silhouette import nvdiffrast_render
+        _fp_root = str(Path(__file__).resolve().parents[3] / "autodex/perception/thirdparty/FoundationPose")
+        if _fp_root not in sys.path:
+            sys.path.insert(0, _fp_root)
+        from Utils import nvdiffrast_render
 
         # Pre-load all masks
         sam_masks = {}
