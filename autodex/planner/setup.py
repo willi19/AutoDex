@@ -86,8 +86,6 @@ ext_modules = [
 ]
 
 setuptools.setup(
-    package_dir={"": "src"},
-    packages=setuptools.find_packages(where="src"),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
     package_data={"": ["*.so"]},
