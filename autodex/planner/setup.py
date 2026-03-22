@@ -18,7 +18,6 @@
 # * https://setuptools.pypa.io/en/latest/setuptools.html#setup-cfg-only-projects
 
 # Standard Library
-import os
 import sys
 
 # Third Party
@@ -86,16 +85,9 @@ ext_modules = [
     ),
 ]
 
-class BuildExtInplace(BuildExtension):
-    """Ensure output directories exist for editable install."""
-    def get_ext_fullpath(self, ext_name):
-        path = super().get_ext_fullpath(ext_name)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        return path
-
 setuptools.setup(
     ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExtInplace},
+    cmdclass={"build_ext": BuildExtension},
     package_data={"": ["*.so"]},
     include_package_data=True,
 )
