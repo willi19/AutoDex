@@ -48,7 +48,7 @@ def find_mesh(obj_name):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--obj", type=str, required=True)
+    parser.add_argument("--obj", type=str, default=None)
     parser.add_argument("--depth", type=str, default="da3", choices=["da3", "stereo"])
     parser.add_argument("--prompt", type=str, default="object on the checkerboard")
     parser.add_argument("--sil_iters", type=int, default=100)
@@ -56,19 +56,21 @@ def main():
     args = parser.parse_args()
 
     current_obj = args.obj
-    mesh_path = find_mesh(current_obj)
-    print(f"Object: {current_obj}")
-    print(f"Mesh: {mesh_path}")
+    pipeline = None
+
+    if current_obj:
+        mesh_path = find_mesh(current_obj)
+        print(f"Object: {current_obj}")
+        print(f"Mesh: {mesh_path}")
+        pipeline = PerceptionPipeline(
+            sam3_hosts=SAM3_HOSTS,
+            fpose_hosts=FPOSE_HOSTS,
+            mesh_path=mesh_path,
+            depth_method=args.depth,
+        )
+
     print(f"Depth: {args.depth}")
-
-    pipeline = PerceptionPipeline(
-        sam3_hosts=SAM3_HOSTS,
-        fpose_hosts=FPOSE_HOSTS,
-        mesh_path=mesh_path,
-        depth_method=args.depth,
-    )
-
-    print("\nReady. Enter capture_dir path, object name to switch, or empty to quit.")
+    print("\nEnter object name to set/switch, capture_dir path to run, or empty to quit.")
 
     while True:
         try:
@@ -83,13 +85,25 @@ def main():
         if "/" not in user_input and (MESH_ROOT / user_input).exists():
             current_obj = user_input
             mesh_path = find_mesh(current_obj)
-            pipeline.change_object(mesh_path)
-            print(f"Switched to {current_obj} ({mesh_path})")
+            if pipeline is None:
+                pipeline = PerceptionPipeline(
+                    sam3_hosts=SAM3_HOSTS,
+                    fpose_hosts=FPOSE_HOSTS,
+                    mesh_path=mesh_path,
+                    depth_method=args.depth,
+                )
+            else:
+                pipeline.change_object(mesh_path)
+            print(f"Object: {current_obj} ({mesh_path})")
             continue
 
         capture_dir = Path(user_input).expanduser()
         if not capture_dir.exists():
             print(f"Not found: {capture_dir}")
+            continue
+
+        if pipeline is None:
+            print("Set object first (enter object name)")
             continue
 
         pose_world, timing = pipeline.run(
