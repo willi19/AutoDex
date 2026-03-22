@@ -18,6 +18,7 @@
 # * https://setuptools.pypa.io/en/latest/setuptools.html#setup-cfg-only-projects
 
 # Standard Library
+import os
 import sys
 
 # Third Party
@@ -84,6 +85,9 @@ ext_modules = [
         extra_compile_args=extra_cuda_args,
     ),
 ]
+
+# Ensure inplace copy target exists (setuptools editable install bug with package_dir=src)
+os.makedirs("curobo/curobolib", exist_ok=True)
 
 setuptools.setup(
     ext_modules=ext_modules,
