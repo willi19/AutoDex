@@ -101,6 +101,10 @@ if __name__ == "__main__":
     parser.add_argument("--version", type=str, default="v3")
     parser.add_argument("--obj", type=str, default=None,
                         help="Single object. If omitted, reads obj_list.txt")
+    parser.add_argument("--candidate_root", type=str, default=None,
+                        help="Override candidate root directory")
+    parser.add_argument("--output_root", type=str, default=None,
+                        help="Override output root directory")
     args = parser.parse_args()
 
     # Object list
@@ -111,9 +115,9 @@ if __name__ == "__main__":
         with open(obj_list_file) as f:
             obj_list = [l.strip() for l in f if l.strip() and not l.startswith("#")]
 
-    from autodex.utils.path import project_dir
-    candidate_root = os.path.join(project_dir, "candidates", args.hand, args.version)
-    output_root = os.path.join(project_dir, "candidates", args.hand, args.version + "_order")
+    from autodex.utils.path import repo_dir
+    candidate_root = args.candidate_root or os.path.join(repo_dir, "candidates", args.hand, args.version)
+    output_root = args.output_root or os.path.join(repo_dir, "candidates", args.hand, args.version + "_order")
 
     planner = GraspPlanner()
 

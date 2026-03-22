@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+1!/usr/bin/env python3
 """Single-frame validation: depth overlay + pose + cross-view mesh overlay.
 
 For each camera with depth+mask, estimates pose on frame 0, then reprojects
