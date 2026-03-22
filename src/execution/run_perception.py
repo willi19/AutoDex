@@ -66,7 +66,7 @@ def main():
         depth_method=args.depth,
     )
 
-    pose_world = pipeline.run(
+    pose_world, timing = pipeline.run(
         capture_dir=args.capture_dir,
         prompt=args.prompt,
         sil_iters=args.sil_iters,
@@ -74,13 +74,16 @@ def main():
     )
 
     if pose_world is not None:
-        import numpy as np
+        import json, numpy as np
         print(f"\nObject pose (world frame):")
         print(pose_world)
-        # Save
-        out_path = Path(args.capture_dir) / "pose_world.npy"
-        np.save(str(out_path), pose_world)
-        print(f"Saved to {out_path}")
+
+        out_dir = Path(args.capture_dir)
+        np.save(str(out_dir / "pose_world.npy"), pose_world)
+        with open(out_dir / "timing.json", "w") as f:
+            json.dump(timing, f, indent=2)
+        print(f"Saved to {out_dir / 'pose_world.npy'}")
+        print(f"Timing saved to {out_dir / 'timing.json'}")
     else:
         print("FAILED: no pose estimated")
 

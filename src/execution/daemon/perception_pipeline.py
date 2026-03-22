@@ -235,9 +235,24 @@ class PerceptionPipeline:
 
         t_total = time.perf_counter() - t_start
         logger.info(f"Total: {t_total:.2f}s "
-                     f"(SAM3={t_sam3:.1f} Depth={t_depth:.1f} FPose={t_fpose:.1f} Sil={t_sil:.1f})")
+                     f"(SAM3={t_sam3:.1f} Depth={t_depth:.1f} FPose={t_fpose:.1f} Select={t_select:.1f} Sil={t_sil:.1f})")
 
-        return pose_world
+        timing = {
+            "total": t_total,
+            "sam3": t_sam3,
+            "depth": t_depth,
+            "fpose": t_fpose,
+            "select": t_select,
+            "sil": t_sil,
+            "n_masks": n_masks,
+            "n_depth": len(depth_serials),
+            "n_poses": len(poses_cam),
+            "n_views_sil": len(views),
+            "best_serial": best_serial,
+            "depth_method": self.depth_method,
+        }
+
+        return pose_world, timing
 
     # ── Private methods ──
 
