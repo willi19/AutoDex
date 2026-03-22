@@ -398,7 +398,7 @@ class PerceptionPipeline:
 
     def _select_best_pose(self, poses_cam, mask_dir, intrinsics, extrinsics, all_serials, H, W):
         """Select best pose by mean mask IoU across all views."""
-        _fp_root = Path(__file__).parent / "thirdparty/_object_6d_tracking/FoundationPose"
+        _fp_root = Path(__file__).resolve().parents[3] / "autodex/perception/thirdparty/FoundationPose"
         if str(_fp_root) not in sys.path:
             sys.path.insert(0, str(_fp_root))
         from Utils import make_mesh_tensors, nvdiffrast_render

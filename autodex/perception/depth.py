@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 _JUNC0NG = Path(__file__).parent / "thirdparty/object-6d-tracking"
-_GUNHEE = Path(__file__).parent / "thirdparty/_object_6d_tracking"
+_THIRDPARTY = Path(__file__).parent / "thirdparty"
 _FS_ROOT = Path(__file__).parent / "thirdparty/FoundationStereo"
 _DEFAULT_ENGINE = _FS_ROOT / "output/foundation_stereo_448x672.engine"
 

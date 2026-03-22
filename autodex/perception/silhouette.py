@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 import trimesh
 
-_FP_ROOT = Path(__file__).parent / "thirdparty/_object_6d_tracking/FoundationPose"
+_FP_ROOT = Path(__file__).parent / "thirdparty/FoundationPose"
 if str(_FP_ROOT) not in sys.path:
     sys.path.insert(0, str(_FP_ROOT))
 
