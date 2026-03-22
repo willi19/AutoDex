@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Run perception pipeline — real robot execution loop.
+"""Run perception + planning pipeline — real robot execution loop.
 
 Usage:
-    python src/execution/run_perception.py --obj attached_container
+    python src/execution/run_perception.py --depth da3
 
-    # Then enter capture_dir paths, or press Enter to quit.
-    # Type a new object name to switch objects.
+    # Interactive:
+    #   1. Enter object name (e.g. attached_container)
+    #   2. Press Enter to capture + run perception + planning
+    #   3. Enter new object name to switch, or 'q' to quit
 """
 import argparse
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -48,41 +51,35 @@ def find_mesh(obj_name):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--obj", type=str, default=None)
     parser.add_argument("--depth", type=str, default="da3", choices=["da3", "stereo"])
     parser.add_argument("--prompt", type=str, default="object on the checkerboard")
     parser.add_argument("--sil_iters", type=int, default=100)
     parser.add_argument("--sil_lr", type=float, default=0.002)
     args = parser.parse_args()
 
-    current_obj = args.obj
-    pipeline = None
-
-    if current_obj:
-        mesh_path = find_mesh(current_obj)
-        print(f"Object: {current_obj}")
-        print(f"Mesh: {mesh_path}")
-        pipeline = PerceptionPipeline(
-            sam3_hosts=SAM3_HOSTS,
-            fpose_hosts=FPOSE_HOSTS,
-            mesh_path=mesh_path,
-            depth_method=args.depth,
-        )
-
     print(f"Depth: {args.depth}")
-    print("\nEnter object name to set/switch, capture_dir path to run, or empty to quit.")
+    print("Enter object name to start, 'q' to quit.\n")
+
+    pipeline = None
+    current_obj = None
 
     while True:
         try:
-            user_input = input("\n> ").strip()
+            if current_obj is None:
+                user_input = input("Object name: ").strip()
+            else:
+                user_input = input(f"[{current_obj}] Enter to run, object name to switch, 'q' to quit: ").strip()
         except (EOFError, KeyboardInterrupt):
             break
 
-        if not user_input:
+        if user_input.lower() == 'q':
             break
 
-        # Check if it's an object name (no / in it)
-        if "/" not in user_input and (MESH_ROOT / user_input).exists():
+        # New object name
+        if user_input and "/" not in user_input:
+            if not (MESH_ROOT / user_input).exists():
+                print(f"Object not found: {user_input}")
+                continue
             current_obj = user_input
             mesh_path = find_mesh(current_obj)
             if pipeline is None:
@@ -97,15 +94,28 @@ def main():
             print(f"Object: {current_obj} ({mesh_path})")
             continue
 
-        capture_dir = Path(user_input).expanduser()
+        # Empty input or path — run perception
+        if current_obj is None:
+            print("Set object first")
+            continue
+
+        if user_input:
+            # User gave a capture_dir path
+            capture_dir = Path(user_input).expanduser()
+        else:
+            # TODO: capture from cameras
+            # capture_dir = capture_from_cameras(current_obj)
+            print("Camera capture not implemented yet. Enter capture_dir path:")
+            path_input = input("> ").strip()
+            if not path_input:
+                continue
+            capture_dir = Path(path_input).expanduser()
+
         if not capture_dir.exists():
             print(f"Not found: {capture_dir}")
             continue
 
-        if pipeline is None:
-            print("Set object first (enter object name)")
-            continue
-
+        # Run perception
         pose_world, timing = pipeline.run(
             capture_dir=str(capture_dir),
             prompt=args.prompt,
@@ -117,15 +127,15 @@ def main():
             np.save(str(capture_dir / "pose_world.npy"), pose_world)
             with open(capture_dir / "timing.json", "w") as f:
                 json.dump(timing, f, indent=2)
-            print(f"\nPose saved to {capture_dir / 'pose_world.npy'}")
-            print(f"Timing: total={timing['total']:.1f}s "
+            print(f"\nPose saved. Timing: total={timing['total']:.1f}s "
                   f"(SAM3={timing['sam3']:.1f} Depth={timing['depth']:.1f} "
                   f"FPose={timing['fpose']:.1f} Select={timing['select']:.1f} "
                   f"Sil={timing['sil']:.1f})")
         else:
             print("FAILED: no pose estimated")
 
-    pipeline.close()
+    if pipeline:
+        pipeline.close()
     print("Done.")
 
 
