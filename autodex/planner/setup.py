@@ -87,11 +87,10 @@ ext_modules = [
 ]
 
 class BuildExtInplace(BuildExtension):
-    """Force .so files into src/curobo/curobolib/ instead of curobo/curobolib/."""
+    """Ensure output directories exist for editable install."""
     def get_ext_fullpath(self, ext_name):
         path = super().get_ext_fullpath(ext_name)
-        if not path.startswith("src/"):
-            path = os.path.join("src", path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         return path
 
 setuptools.setup(
