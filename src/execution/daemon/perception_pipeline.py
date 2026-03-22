@@ -66,6 +66,10 @@ class PerceptionPipeline:
     Local models (direct call): DA3 depth, SilhouetteOptimizer
     """
 
+    # Best 5 camera serials (cross-object, from eval pipeline)
+    BEST_5_DA3 = ["25322638", "25322645", "24080331", "25322639", "25322643"]
+    BEST_5_STEREO = ["25305461", "25305463", "25322651", "25322639", "24122734"]
+
     def __init__(
         self,
         sam3_hosts: List[Tuple[str, int]],
@@ -175,12 +179,21 @@ class PerceptionPipeline:
         n_masks = sum(1 for v in masks.values() if v)
         logger.info(f"SAM3: {n_masks}/{len(serials)} masks in {t_sam3:.2f}s")
 
-        # ── Step 2: Depth (local) ──
+        # ── Step 1.5: Select best 5 views (pre-determined) ──
+        best5 = self.BEST_5_DA3 if self.depth_method == "da3" else self.BEST_5_STEREO
+        fpose_serials = [s for s in best5 if masks.get(s) and s in serials]
+        if not fpose_serials:
+            # Fallback: top 5 by mask size
+            mask_sizes = {s: masks[s] for s in serials if masks.get(s)}
+            fpose_serials = sorted(mask_sizes, key=mask_sizes.get, reverse=True)[:5]
+        logger.info(f"Selected {len(fpose_serials)} views for depth+FPose: {fpose_serials}")
+
+        # ── Step 2: Depth (local, best 5 only) ──
         t0 = time.perf_counter()
         if self.depth_method == "stereo":
-            depth_serials = self._run_stereo_depth(capture_dir, serials, intrinsics, extrinsics, depth_dir)
+            depth_serials = self._run_stereo_depth(capture_dir, fpose_serials, intrinsics, extrinsics, depth_dir)
         else:
-            depth_serials = self._run_da3_depth(serials, img_dir, intrinsics, extrinsics, depth_dir)
+            depth_serials = self._run_da3_depth(fpose_serials, img_dir, intrinsics, extrinsics, depth_dir)
         t_depth = time.perf_counter() - t0
         logger.info(f"Depth ({self.depth_method}): {len(depth_serials)} views in {t_depth:.2f}s")
 
@@ -188,9 +201,9 @@ class PerceptionPipeline:
         valid_serials = [s for s in depth_serials if masks.get(s)]
         if not valid_serials:
             logger.error("No views with both mask and depth")
-            return None
+            return None, None, None
 
-        # ── Step 3: FPose register (remote, parallel) ──
+        # ── Step 3: FPose register (remote, parallel, best 5 only) ──
         t0 = time.perf_counter()
         poses_cam = self._run_fpose_parallel(
             valid_serials, img_dir, depth_dir, mask_dir, intrinsics,
@@ -200,7 +213,7 @@ class PerceptionPipeline:
 
         if not poses_cam:
             logger.error("No valid poses")
-            return None
+            return None, None
 
         # ── Step 4: Select best pose by mask IoU ──
         t0 = time.perf_counter()
@@ -412,20 +425,23 @@ class PerceptionPipeline:
         return poses_cam
 
     def _select_best_pose(self, poses_cam, mask_dir, intrinsics, extrinsics, all_serials, H, W):
-        """Select best pose by mean mask IoU across all views."""
-        _fp_root = Path(__file__).resolve().parents[3] / "autodex/perception/thirdparty/FoundationPose"
-        if str(_fp_root) not in sys.path:
-            sys.path.insert(0, str(_fp_root))
-        from Utils import make_mesh_tensors, nvdiffrast_render
-        import trimesh
-        import nvdiffrast.torch as dr
+        """Select best pose by mean mask IoU across all views.
 
-        mesh = trimesh.load(self.mesh_path, process=False)
-        if isinstance(mesh, trimesh.Scene):
-            mesh = trimesh.util.concatenate([g for g in mesh.geometry.values()
-                                              if isinstance(g, trimesh.Trimesh)])
-        mt = make_mesh_tensors(mesh)
-        glctx = dr.RasterizeCudaContext()
+        Uses cached mesh tensors + glctx from silhouette optimizer if available.
+        """
+        self._load_sil_optimizer()
+        mt = self._sil_optimizer._mesh_tensors
+        glctx = self._sil_optimizer._glctx
+        from autodex.perception.silhouette import nvdiffrast_render
+
+        # Pre-load all masks
+        sam_masks = {}
+        for s in all_serials:
+            mp = mask_dir / f"{s}.png"
+            if mp.exists():
+                m = cv2.imread(str(mp), cv2.IMREAD_GRAYSCALE)
+                if m is not None:
+                    sam_masks[s] = m > 127
 
         best_serial, best_iou, best_pose = None, -1, None
 
@@ -434,18 +450,16 @@ class PerceptionPipeline:
             ious = []
 
             for tgt_s in all_serials:
-                mp = mask_dir / f"{tgt_s}.png"
-                if not mp.exists():
+                if tgt_s not in sam_masks:
                     continue
-                sam_mask = cv2.imread(str(mp), cv2.IMREAD_GRAYSCALE) > 127
                 K = intrinsics[tgt_s].astype(np.float32)
                 pc = extrinsics[tgt_s] @ pose_world
                 pt = torch.as_tensor(pc, device="cuda", dtype=torch.float32).reshape(1, 4, 4)
                 rc, _, _ = nvdiffrast_render(K=K, H=H, W=W, ob_in_cams=pt, glctx=glctx,
                                               mesh_tensors=mt, use_light=False)
                 sil = rc[0].detach().cpu().numpy().sum(axis=2) > 0
-                inter = (sil & sam_mask).sum()
-                union = (sil | sam_mask).sum()
+                inter = (sil & sam_masks[tgt_s]).sum()
+                union = (sil | sam_masks[tgt_s]).sum()
                 ious.append(float(inter / union) if union > 0 else 0.0)
 
             mean_iou = np.mean(ious) if ious else 0.0
@@ -454,7 +468,6 @@ class PerceptionPipeline:
                 best_serial = src_s
                 best_pose = pose_world
 
-        del mt, glctx
         logger.info(f"Best: {best_serial}, mean IoU={best_iou:.3f}")
         return best_serial, best_pose
 
