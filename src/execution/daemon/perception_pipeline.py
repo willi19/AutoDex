@@ -430,8 +430,8 @@ class PerceptionPipeline:
         Uses cached mesh tensors + glctx from silhouette optimizer if available.
         """
         self._load_sil_optimizer()
-        mt = self._sil_optimizer._mesh_tensors
-        glctx = self._sil_optimizer._glctx
+        mt = self._sil_optimizer.mesh_tensors
+        glctx = self._sil_optimizer.glctx
         from autodex.perception.silhouette import nvdiffrast_render
 
         # Pre-load all masks
