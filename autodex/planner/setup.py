@@ -85,17 +85,9 @@ ext_modules = [
     ),
 ]
 
-class BuildExtInplace(BuildExtension):
-    """Force .so files into src/curobo/curobolib/ instead of curobo/curobolib/."""
-    def get_ext_fullpath(self, ext_name):
-        path = super().get_ext_fullpath(ext_name)
-        if not path.startswith("src/"):
-            path = os.path.join("src", path)
-        return path
-
 setuptools.setup(
     ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExtInplace},
+    cmdclass={"build_ext": BuildExtension},
     package_data={"": ["*.so"]},
     include_package_data=True,
 )
