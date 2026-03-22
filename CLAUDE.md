@@ -350,6 +350,38 @@ cd ~/AutoDex && git fetch origin && git reset --hard origin/main
     └── mobileclip2_b.ts       # MobileCLIP (243MB)
 ```
 
+### Quick Start: Run Perception Pipeline
+
+```bash
+# 1. Start SAM3 daemons (capture1, 2, 3)
+ssh capture1 "cd ~/AutoDex && conda activate sam3 && python src/execution/daemon/perception_daemon.py --model sam3 --port 5001"
+ssh capture2 "cd ~/AutoDex && conda activate sam3 && python src/execution/daemon/perception_daemon.py --model sam3 --port 5001"
+ssh capture3 "cd ~/AutoDex && conda activate sam3 && python src/execution/daemon/perception_daemon.py --model sam3 --port 5001"
+
+# 2. Start FPose daemons (capture4, 5, 6)
+ssh capture4 "cd ~/AutoDex && conda activate foundationpose && python src/execution/daemon/perception_daemon.py --model fpose --port 5003 --mesh ~/shared_data/object_6d/data/mesh/attached_container/attached_container.obj"
+ssh capture5 "cd ~/AutoDex && conda activate foundationpose && python src/execution/daemon/perception_daemon.py --model fpose --port 5003 --mesh ~/shared_data/object_6d/data/mesh/attached_container/attached_container.obj"
+ssh capture6 "cd ~/AutoDex && conda activate foundationpose && python src/execution/daemon/perception_daemon.py --model fpose --port 5003 --mesh ~/shared_data/object_6d/data/mesh/attached_container/attached_container.obj"
+
+# 3. Run pipeline (robot PC)
+ssh robot
+conda activate autodex
+cd ~/AutoDex
+python src/execution/run_perception.py \
+    --capture_dir ~/shared_data/mingi_object_test/attached_container/20260317_172712 \
+    --obj attached_container --depth da3
+```
+
+### Grasp Selection (Set Cover)
+
+```bash
+conda activate mingi
+python src/grasp_generation/order/compute_order.py --hand allegro --version v3
+python src/grasp_generation/order/compute_order.py --hand inspire --version v3
+```
+
+Output: `~/AutoDex/candidates/{hand}/v3_order/{obj}/setcover_order.json`
+
 ## Ongoing Refactoring
 
 `src/process/` scripts have heavy code duplication with `autodex/perception/`.
