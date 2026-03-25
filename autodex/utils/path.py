@@ -9,7 +9,7 @@ shared_dir = os.path.join(home_path, "shared_data")
 project_dir = os.path.join(shared_dir, "AutoDex")
 bodex_path = os.path.join(code_path, "BODex_outputs")
 repo_dir = os.path.join(home_path, "AutoDex")
-candidate_path = os.path.join(repo_dir, "candidates", "allegro")
+candidate_path = os.path.join(project_dir, "candidates", "allegro")
 
 robot_configs_path = os.path.join(project_dir, "content", "configs", "robot")
 obj_path = os.path.join(project_dir, "object", "paradex")
