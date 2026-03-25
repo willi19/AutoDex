@@ -29,6 +29,7 @@ from autodex.utils.path import project_dir, obj_path
 from autodex.utils.robot_config import INIT_STATE, XARM_INIT, ALLEGRO_INIT, LINK6_TO_WRIST
 from autodex.planner import GraspPlanner
 from autodex.planner.obstacles import add_obstacles
+from autodex.planner.visualizer import ScenePlanVisualizer
 from src.execution.daemon.perception_pipeline import PerceptionPipeline
 
 logging.basicConfig(level=logging.INFO, format='[%(name)s] %(message)s')
@@ -185,8 +186,14 @@ def main():
             json.dump(result.timing, f, indent=2)
     print(f"    Scene info: {result.scene_info}")
 
-    # ── 5. GUI Controller ────────────────────────────────────────────────
-    print(f"[4/4] Launching GUI controller...")
+    # ── 5. Visualize scene + trajectory ────────────────────────────────────
+    print(f"[4/5] Launching scene visualizer (http://localhost:8080)...")
+    vis = ScenePlanVisualizer(scene_cfg, result, port=8080)
+    vis.start_viewer(use_thread=True)
+    input("    Press Enter to proceed to GUI controller (visualizer stays open)...")
+
+    # ── 6. GUI Controller ────────────────────────────────────────────────
+    print(f"[5/5] Launching GUI controller...")
     traj = result.traj
     pg_hand = _convert_hand(result.pregrasp_pose)
     g_hand = _convert_hand(result.grasp_pose)

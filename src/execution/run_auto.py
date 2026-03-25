@@ -30,6 +30,7 @@ from autodex.utils.conversion import se32cart
 from autodex.utils.path import project_dir, obj_path
 from autodex.planner import GraspPlanner
 from autodex.planner.obstacles import add_obstacles
+from autodex.planner.visualizer import ScenePlanVisualizer
 from autodex.executor.real import RealExecutor
 from src.execution.daemon.perception_pipeline import PerceptionPipeline
 
@@ -103,7 +104,7 @@ def get_label():
 
 
 def run_single_trial(
-    obj_name, exp_name, grasp_version, depth_method, scene_type,
+    obj_name, exp_name, grasp_version, depth_method, scene_type, viz,
     planner, pipeline, rcc, sync_generator, timestamp_monitor,
 ):
     """Run one capture -> perceive -> plan -> execute -> label cycle."""
@@ -165,6 +166,13 @@ def run_single_trial(
             json.dump(result.timing, f, indent=2)
     print(f"    Scene info: {result.scene_info}")
 
+    # ── 3.5 Visualize (optional) ───────────────────────────────────────
+    if viz:
+        print("    Launching visualizer (http://localhost:8080)...")
+        scene_vis = ScenePlanVisualizer(scene_cfg, result, port=8080)
+        scene_vis.start_viewer(use_thread=True)
+        input("    Press Enter to proceed to execution (visualizer stays open)...")
+
     # ── 4. Execute ───────────────────────────────────────────────────────
     print(f"[4/6] Executing on robot...")
     executor = RealExecutor(mode="auto")
@@ -220,6 +228,7 @@ def main():
     parser.add_argument("--depth", type=str, default="da3", choices=["da3", "stereo"])
     parser.add_argument("--scene", type=str, default="table",
                         choices=["table", "wall", "shelf", "cluttered"])
+    parser.add_argument("--viz", action="store_true", help="Launch scene visualizer after planning")
     parser.add_argument("--n_trials", type=int, default=1)
     args = parser.parse_args()
 
@@ -254,6 +263,7 @@ def main():
             grasp_version=args.grasp_version,
             depth_method=args.depth,
             scene_type=args.scene,
+            viz=args.viz,
             planner=planner,
             pipeline=pipeline,
             rcc=rcc,
