@@ -29,6 +29,7 @@ from paradex.calibration.utils import save_current_camparam, save_current_C2R, l
 from autodex.utils.conversion import se32cart
 from autodex.utils.path import project_dir, obj_path
 from autodex.planner import GraspPlanner
+from autodex.planner.obstacles import add_obstacles
 from autodex.executor.real import RealExecutor
 from src.execution.daemon.perception_pipeline import PerceptionPipeline
 
@@ -102,11 +103,11 @@ def get_label():
 
 
 def run_single_trial(
-    obj_name, exp_name, grasp_version, depth_method,
+    obj_name, exp_name, grasp_version, depth_method, scene_type,
     planner, pipeline, rcc, sync_generator, timestamp_monitor,
 ):
     """Run one capture -> perceive -> plan -> execute -> label cycle."""
-    dir_idx = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    dir_idx = f"{scene_type}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     img_dir = os.path.join(project_dir, "experiment", exp_name, obj_name, dir_idx)
     os.makedirs(img_dir, exist_ok=True)
 
@@ -142,10 +143,11 @@ def run_single_trial(
     np.save(os.path.join(img_dir, "pose_world.npy"), pose_world)
 
     # ── 3. Build scene_cfg & plan ────────────────────────────────────────
-    print(f"[3/6] Planning (version={grasp_version})...")
+    print(f"[3/6] Planning (version={grasp_version}, scene={scene_type})...")
     t0 = time.time()
     c2r = load_c2r(img_dir)
     scene_cfg = pose_world_to_scene_cfg(pose_world, c2r, obj_name)
+    scene_cfg = add_obstacles(scene_cfg, scene_type)
     result = planner.plan(scene_cfg, obj_name, grasp_version)
     timing["plan_s"] = round(time.time() - t0, 1)
     print(f"    Plan: {timing['plan_s']}s  success={result.success}")
@@ -197,6 +199,7 @@ def run_single_trial(
 
     trial_result = {
         "dir_idx": dir_idx,
+        "scene_type": scene_type,
         "success": succ,
         "scene_info": result.scene_info,
         "timing": timing,
@@ -215,6 +218,8 @@ def main():
     parser.add_argument("--grasp_version", type=str, default="selected_100")
     parser.add_argument("--exp_name", type=str, default="auto")
     parser.add_argument("--depth", type=str, default="da3", choices=["da3", "stereo"])
+    parser.add_argument("--scene", type=str, default="table",
+                        choices=["table", "wall", "shelf", "cluttered"])
     parser.add_argument("--n_trials", type=int, default=1)
     args = parser.parse_args()
 
@@ -248,6 +253,7 @@ def main():
             exp_name=args.exp_name,
             grasp_version=args.grasp_version,
             depth_method=args.depth,
+            scene_type=args.scene,
             planner=planner,
             pipeline=pipeline,
             rcc=rcc,

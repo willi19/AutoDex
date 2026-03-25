@@ -28,6 +28,7 @@ from autodex.utils.conversion import se32cart
 from autodex.utils.path import project_dir, obj_path
 from autodex.utils.robot_config import INIT_STATE, XARM_INIT, ALLEGRO_INIT, LINK6_TO_WRIST
 from autodex.planner import GraspPlanner
+from autodex.planner.obstacles import add_obstacles
 from src.execution.daemon.perception_pipeline import PerceptionPipeline
 
 logging.basicConfig(level=logging.INFO, format='[%(name)s] %(message)s')
@@ -105,11 +106,14 @@ def main():
     parser.add_argument("--grasp_version", type=str, default="selected_100")
     parser.add_argument("--exp_name", type=str, default="debug")
     parser.add_argument("--depth", type=str, default="da3", choices=["da3", "stereo"])
+    parser.add_argument("--scene", type=str, default="table",
+                        choices=["table", "wall", "shelf", "cluttered"])
     args = parser.parse_args()
 
     obj_name = args.obj
     exp_name = args.exp_name
     grasp_version = args.grasp_version
+    scene_type = args.scene
 
     rcc = remote_camera_controller("test_lookup_obstacle")
 
@@ -124,7 +128,7 @@ def main():
     )
 
     # ── 2. Capture images ────────────────────────────────────────────────
-    dir_idx = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    dir_idx = f"{scene_type}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     img_dir = os.path.join(project_dir, "experiment", exp_name, obj_name, dir_idx)
     os.makedirs(img_dir, exist_ok=True)
 
@@ -158,6 +162,7 @@ def main():
     t0 = time.time()
     c2r = load_c2r(img_dir)
     scene_cfg = pose_world_to_scene_cfg(pose_world, c2r, obj_name)
+    scene_cfg = add_obstacles(scene_cfg, scene_type)
     planner = GraspPlanner()
     result = planner.plan(scene_cfg, obj_name, grasp_version)
     print(f"    Planning: {time.time() - t0:.1f}s  success={result.success}")
