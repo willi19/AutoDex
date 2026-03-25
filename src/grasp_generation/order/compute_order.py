@@ -64,18 +64,22 @@ def setcover_order(valid_array):
         valid_array: (S, G) bool — valid_array[s, g] = True if grasp g is collision-free in scene s.
 
     Returns:
-        List of grasp indices in set cover order.
+        order: list of grasp indices in set cover order.
+        stats: list of dicts with per-step coverage info.
     """
     S, G = valid_array.shape
     uncovered = np.ones(S, dtype=bool)
     available = np.ones(G, dtype=bool)
     order = []
+    stats = []
+    cycle = 1
 
     for _ in tqdm(range(G), desc="  Set cover", leave=False):
         cover_counts = np.sum(valid_array[uncovered][:, available], axis=0)
 
         if np.all(cover_counts == 0):
             uncovered = np.ones(S, dtype=bool)
+            cycle += 1
             cover_counts = np.sum(valid_array[uncovered][:, available], axis=0)
 
             if np.all(cover_counts == 0):
@@ -88,11 +92,20 @@ def setcover_order(valid_array):
 
         best_idx = np.flatnonzero(available)[best_local]
 
+        newly_covered = int(np.sum(valid_array[:, best_idx] & uncovered))
         order.append(int(best_idx))
         available[best_idx] = False
         uncovered &= ~valid_array[:, best_idx]
+        coverage_pct = float((1 - np.sum(uncovered) / S) * 100)
 
-    return order
+        stats.append({
+            "grasp_idx": int(best_idx),
+            "newly_covered_count": newly_covered,
+            "current_coverage_pct": coverage_pct,
+            "cycle": cycle,
+        })
+
+    return order, stats
 
 
 if __name__ == "__main__":
@@ -117,9 +130,15 @@ if __name__ == "__main__":
 
     from autodex.utils.path import repo_dir
     candidate_root = args.candidate_root or os.path.join(repo_dir, "candidates", args.hand, args.version)
-    output_root = args.output_root or os.path.join(repo_dir, "candidates", args.hand, args.version + "_order")
+    output_root = args.output_root or os.path.join(repo_dir, "order", args.hand, args.version)
 
-    planner = GraspPlanner()
+    from autodex.utils.path import project_dir
+    hand_cfg_map = {
+        "allegro": os.path.join(project_dir, "content", "configs", "robot", "allegro_floating.yml"),
+        "inspire": os.path.join(project_dir, "content", "configs", "robot", "inspire_floating.yml"),
+    }
+    hand_cfg = hand_cfg_map.get(args.hand)
+    planner = GraspPlanner(hand_cfg_path=hand_cfg)
 
     for obj_name in tqdm(obj_list, desc="Objects"):
         print(f"\n{obj_name}:")
@@ -168,19 +187,30 @@ if __name__ == "__main__":
         print(f"  Valid array: {valid_array.shape} (scenes x grasps)")
 
         # Greedy set cover
-        cover_order = setcover_order(valid_array)
+        cover_order, cover_stats = setcover_order(valid_array)
 
-        # Save
+        # Save order
         ordered_info = []
-        for i in cover_order:
-            info = list(grasp_info_list[i])
-            info.append(i)
+        for i, idx in enumerate(cover_order):
+            info = list(grasp_info_list[idx])
+            info.append(idx)
             ordered_info.append(info)
+            cover_stats[i]["scene_info"] = info
 
         os.makedirs(os.path.join(output_root, obj_name), exist_ok=True)
         with open(order_path, "w") as f:
             json.dump(ordered_info, f, indent=2)
         np.save(os.path.join(output_root, obj_name, "valid_array.npy"), valid_array)
+
+        # Save stats
+        stats_path = os.path.join(output_root, obj_name, "stats.json")
+        with open(stats_path, "w") as f:
+            json.dump({
+                "object": obj_name,
+                "total_scenes": int(valid_array.shape[0]),
+                "total_grasps": int(valid_array.shape[1]),
+                "steps": cover_stats,
+            }, f, indent=2)
 
         print(f"  Saved to {order_path}")
 

@@ -12,7 +12,7 @@ import shutil
 import argparse
 from tqdm import tqdm
 
-from autodex.utils.path import project_dir
+from autodex.utils.path import repo_dir
 
 
 def load_ordered_grasps(order_root, obj_name):
@@ -35,7 +35,7 @@ def extract_top_n(obj_name, candidate_root, order_root, output_root, n_grasps=10
     output_dir = os.path.join(output_root, obj_name)
 
     for grasp_info in tqdm(top_n, desc=f"  Copying", leave=False):
-        _, _, scene_type, scene_id, grasp_name, _ = grasp_info
+        _, scene_type, scene_id, grasp_name, _ = grasp_info
 
         src_dir = os.path.join(candidate_root, obj_name, scene_type, scene_id, grasp_name)
         if not os.path.exists(src_dir):
@@ -62,9 +62,9 @@ if __name__ == "__main__":
     parser.add_argument("--obj", type=str, default=None)
     args = parser.parse_args()
 
-    candidate_root = os.path.join(project_dir, "candidates", args.hand, args.version)
-    order_root = os.path.join(project_dir, "candidates", args.hand, args.version + "_order")
-    output_root = os.path.join(project_dir, "candidates", args.hand, f"selected_{args.n}")
+    candidate_root = os.path.join(repo_dir, "candidates", args.hand, args.version)
+    order_root = os.path.join(repo_dir, "order", args.hand, args.version)
+    output_root = os.path.join(repo_dir, "candidates", args.hand, f"selected_{args.n}")
 
     print(f"Hand: {args.hand}, Version: {args.version}, Top N: {args.n}")
     print(f"Candidates: {candidate_root}")

@@ -30,16 +30,23 @@ import open3d as o3d
 import trimesh
 
 from autodex.utils.conversion import cart2se3
-from autodex.utils.path import candidate_path, obj_path, urdf_path
+from autodex.utils.path import obj_path, urdf_path
+from autodex.utils.path import repo_dir
 from paradex.visualization.robot import RobotModule
 
 
 COLOR_ROBOT = np.array([153, 128, 224]) / 255.0
 COLOR_OBJECT = np.array([180, 180, 180]) / 255.0
 
-SELECTED_DIR = os.path.join(candidate_path, "selected_100")
-ORDER_ROOT = os.path.expanduser("~/RSS_2026/order")
-BATCH_VERSIONS = ["revalidate", "v2", "v3"]
+HAND_URDF = {
+    "allegro": os.path.join(urdf_path, "allegro_hand_description_right.urdf"),
+    "inspire": os.path.join(urdf_path, "..", "inspire_description", "inspire_hand_right.urdf"),
+}
+
+# These globals are set in main() based on --hand
+SELECTED_DIR = None
+ORDER_ROOT = None
+CURRENT_HAND = "allegro"
 
 
 def get_all_objects() -> list:
@@ -55,11 +62,10 @@ def get_all_objects() -> list:
 
 
 def _find_setcover_order(obj_name: str) -> str | None:
-    """Find setcover_order.json for an object across versions."""
-    for v in BATCH_VERSIONS:
-        path = os.path.join(ORDER_ROOT, v, obj_name, "setcover_order.json")
-        if os.path.exists(path):
-            return path
+    """Find setcover_order.json for an object."""
+    path = os.path.join(ORDER_ROOT, obj_name, "setcover_order.json")
+    if os.path.exists(path):
+        return path
     return None
 
 
@@ -93,7 +99,8 @@ def load_selected_grasps(obj_name: str, top_n: int) -> list:
             ordered_list = json.load(f)
         grasps = []
         for item in ordered_list:
-            key = (item[2], item[3], item[4])
+            # Format: [obj_name, scene_type, scene_id, grasp_name, idx]
+            key = (item[1], item[2], item[3])
             if key in available:
                 grasps.append(key)
                 if len(grasps) >= top_n:
@@ -108,7 +115,8 @@ def load_selected_grasps(obj_name: str, top_n: int) -> list:
 def list_all_grasps(version: str, obj_name: str, scene_type_filter: str = None) -> list:
     """Walk candidates directory to find all grasps.
     Returns list of (scene_type, scene_id, grasp_name) tuples."""
-    root = os.path.join(candidate_path, version, obj_name)
+    candidate_root = os.path.join(repo_dir, "candidates", CURRENT_HAND)
+    root = os.path.join(candidate_root, version, obj_name)
     if not os.path.exists(root):
         print(f"Error: candidates path not found: {root}")
         sys.exit(1)
@@ -182,8 +190,7 @@ def load_robot_at_grasp(obj_name: str, scene_type: str,
     wrist_se3 = np.load(os.path.join(grasp_path, "wrist_se3.npy"))
     grasp_pose = np.load(os.path.join(grasp_path, "grasp_pose.npy"))
 
-    allegro_urdf = os.path.join(urdf_path, "allegro_hand_description_right.urdf")
-    robot = RobotModule(allegro_urdf)
+    robot = RobotModule(HAND_URDF[CURRENT_HAND])
 
     joint_angles = grasp_pose.flatten()[:robot.num_joints]
     cfg = {name: angle for name, angle in zip(robot.joint_names, joint_angles)}
@@ -332,7 +339,9 @@ def render_single_grasp(obj_name, scene_type, scene_id, grasp_name,
 
 def main():
     parser = argparse.ArgumentParser(description="Turntable rendering of grasp candidates")
-    parser.add_argument("--version", type=str, default=None, help="Candidate version (e.g., revalidate)")
+    parser.add_argument("--hand", type=str, default="allegro", choices=["allegro", "inspire"],
+                        help="Hand type (default: allegro)")
+    parser.add_argument("--version", type=str, default="v3", help="Candidate version (default: v3)")
     parser.add_argument("--obj", type=str, default=None, help="Object name (e.g., soap_dispenser)")
     parser.add_argument("--scene", type=str, default=None,
                         help="Single grasp: scene_type/scene_id/grasp_name (e.g., shelf/1/11)")
@@ -340,8 +349,8 @@ def main():
                         help="Render top N grasps from setcover order")
     parser.add_argument("--batch-all", action="store_true",
                         help="Batch render all 98 objects (uses setcover, requires --top)")
-    parser.add_argument("--output-dir", type=str, default="data",
-                        help="Output directory for batch mode (default: data)")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Output directory for batch mode (default: data/{hand})")
     parser.add_argument("--frames", type=int, default=60, help="Number of frames (default: 60)")
     parser.add_argument("--fps", type=int, default=30, help="Video FPS (default: 30)")
     parser.add_argument("--width", type=int, default=960, help="Render width (default: 960)")
@@ -352,6 +361,15 @@ def main():
     parser.add_argument("--output", type=str, default=None, help="Output video path (single grasp mode)")
     parser.add_argument("--parallel", type=int, default=1, help="Number of parallel workers for batch-all (default: 1)")
     args = parser.parse_args()
+
+    # Set globals based on --hand
+    global SELECTED_DIR, ORDER_ROOT, CURRENT_HAND
+    CURRENT_HAND = args.hand
+    if args.output_dir is None:
+        args.output_dir = os.path.join("data", args.hand)
+    candidate_root = os.path.join(repo_dir, "candidates", args.hand)
+    SELECTED_DIR = os.path.join(candidate_root, "selected_100")
+    ORDER_ROOT = os.path.join(repo_dir, "order", args.hand, args.version)
 
     # ---- Batch all objects ----
     if args.batch_all:
@@ -372,6 +390,7 @@ def main():
             for obj_name in all_objects:
                 cmd = [
                     sys.executable, __file__,
+                    "--hand", args.hand, "--version", args.version,
                     "--obj", obj_name, "--top", str(args.top),
                     "--output-dir", output_dir,
                     "--frames", str(args.frames), "--fps", str(args.fps),

@@ -89,9 +89,21 @@ ext_modules = [
 # Ensure inplace copy target exists (setuptools editable install bug with package_dir=src)
 os.makedirs("curobo/curobolib", exist_ok=True)
 
+
+class BuildExtAndCopy(BuildExtension):
+    """After build, copy .so from curobo/ to src/curobo/ so both locations have them."""
+    def run(self):
+        super().run()
+        import shutil, glob
+        for so in glob.glob("curobo/curobolib/*.so"):
+            dst = os.path.join("src", so)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(so, dst)
+
+
 setuptools.setup(
     ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExtension},
+    cmdclass={"build_ext": BuildExtAndCopy},
     package_data={"": ["*.so"]},
     include_package_data=True,
 )

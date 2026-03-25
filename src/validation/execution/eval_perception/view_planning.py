@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """View planning trajectory in viser.
 
-Loads planning result (traj.npy, wrist_se3.npy) from eval pipeline output
-and shows trajectory with ghost trail + object mesh + table.
+Two modes:
+  trajectory  : show planned trajectory with ghost trail + timeline slider (default)
+  candidates  : show all grasp candidates color-coded
 
 Usage:
     python src/validation/execution/eval_perception/view_planning.py \
@@ -22,7 +23,7 @@ sys.path.insert(0, str(AUTODEX_ROOT))
 sys.path.insert(0, os.path.join(os.path.expanduser("~"), "paradex"))
 
 from paradex.visualization.visualizer.viser import ViserViewer
-from autodex.utils.path import urdf_path
+from autodex.utils.path import urdf_path, obj_path
 from autodex.utils.robot_config import INIT_STATE
 from autodex.utils.conversion import se32cart
 
@@ -36,6 +37,10 @@ def find_mesh(obj_name):
         p = MESH_ROOT / obj_name / name
         if p.exists():
             return str(p)
+    # Try raw_mesh
+    raw = Path(obj_path) / obj_name / "raw_mesh" / f"{obj_name}.obj"
+    if raw.exists():
+        return str(raw)
     objs = list((MESH_ROOT / obj_name).glob("*.obj"))
     if objs:
         return str(objs[0])
@@ -51,6 +56,110 @@ def pose7_to_se3(pose_list):
     return se3
 
 
+class PlanningResultViewer(ViserViewer):
+    """Viewer for saved planning results (traj.npy, wrist_se3.npy)."""
+
+    def __init__(self, capture_dir, obj_name, port=8080):
+        super().__init__(port_number=port)
+
+        self.obj_name = obj_name
+        capture_dir = Path(capture_dir)
+
+        # Load results
+        self.traj = np.load(str(capture_dir / "traj.npy"))
+        self.wrist_se3 = np.load(str(capture_dir / "wrist_se3.npy"))
+        self.pregrasp_pose = np.load(str(capture_dir / "pregrasp_pose.npy"))
+        self.pose_world = np.load(str(capture_dir / "pose_world.npy"))
+
+        # C2R
+        c2r_path = capture_dir / "cam_param" / "C2R.npy"
+        if not c2r_path.exists():
+            c2r_path = capture_dir / "C2R.npy"
+        c2r = np.load(str(c2r_path)) if c2r_path.exists() else np.eye(4)
+        self.pose_robot = np.linalg.inv(c2r) @ self.pose_world
+
+        print(f"Trajectory: {len(self.traj)} frames")
+        print(f"Object pose (robot): {self.pose_robot[:3, 3]}")
+
+        self._add_scene()
+        self._add_trajectory_robot()
+        self._add_gui()
+
+    def _add_scene(self):
+        # Table
+        table_se3 = pose7_to_se3(TABLE_POSE)
+        table_mesh = trimesh.creation.box(extents=TABLE_DIMS)
+        self.add_object("table", table_mesh, table_se3)
+        self.change_color("table", [240/255, 240/255, 245/255, 0.5])
+
+        # Object mesh
+        mesh_path = find_mesh(self.obj_name)
+        obj_mesh = trimesh.load(mesh_path, process=False)
+        if isinstance(obj_mesh, trimesh.Scene):
+            obj_mesh = trimesh.util.concatenate([g for g in obj_mesh.geometry.values()])
+        self.add_trimesh("object", obj_mesh, self.pose_robot)
+
+        # Robot at init
+        urdf_full = os.path.join(urdf_path, "xarm_allegro.urdf")
+        self.add_robot("xarm_init", urdf_full)
+        self.robot_dict["xarm_init"].update_cfg(INIT_STATE)
+        self.change_color("xarm_init", [0.7, 0.7, 0.7, 0.3])
+
+        self.add_grid(size=12.0, cell_size=0.1, height=0.0)
+
+    def _add_trajectory_robot(self):
+        urdf_full = os.path.join(urdf_path, "xarm_allegro.urdf")
+        urdf_hand = os.path.join(urdf_path, "allegro_hand_description_right.urdf")
+
+        # Destination hand
+        self.add_robot("dest_hand", urdf_hand, pose=self.wrist_se3)
+        self.robot_dict["dest_hand"].update_cfg(self.pregrasp_pose)
+        self.change_color("dest_hand", [0.3, 0.5, 1.0, 0.7])
+
+        # Main trajectory robot
+        self.add_robot("traj_robot", urdf_full)
+        self.robot_dict["traj_robot"].update_cfg(self.traj[0])
+        self.change_color("traj_robot", [0.7, 0.7, 0.7, 0.8])
+
+        # Ghost trail (initially hidden)
+        self.ghost_spacing = max(1, len(self.traj) // 10)
+        self.ghost_positions = list(range(0, len(self.traj), self.ghost_spacing))
+
+        for i, pos in enumerate(self.ghost_positions):
+            ghost_name = f"ghost_{i}"
+            self.add_robot(ghost_name, urdf_full)
+            self.robot_dict[ghost_name].update_cfg(self.traj[pos])
+            self.change_color(ghost_name, [0.7, 0.7, 0.7, 0.4])
+            self.robot_dict[ghost_name].set_visibility(False)
+
+    def _update_frame(self, frame):
+        frame = min(frame, len(self.traj) - 1)
+        self.robot_dict["traj_robot"].update_cfg(self.traj[frame])
+
+        for i, ghost_pos in enumerate(self.ghost_positions):
+            ghost_name = f"ghost_{i}"
+            if frame >= ghost_pos:
+                self.robot_dict[ghost_name].set_visibility(True)
+            else:
+                self.robot_dict[ghost_name].set_visibility(False)
+
+    def _add_gui(self):
+        with self.server.gui.add_folder("Planning"):
+            traj_len = len(self.traj)
+            self.server.gui.add_text(
+                "Info",
+                initial_value=f"Trajectory: {traj_len} frames",
+                disabled=True,
+            )
+            self.timeline = self.server.gui.add_slider(
+                "Timeline", min=0, max=traj_len - 1, step=1, initial_value=0,
+            )
+
+            @self.timeline.on_update
+            def _(_):
+                self._update_frame(int(self.timeline.value))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", type=str, required=True)
@@ -61,97 +170,14 @@ def main():
 
     capture_dir = Path(args.data_root) / args.obj / args.episode
 
-    # Load results
-    traj_path = capture_dir / "traj.npy"
-    wrist_path = capture_dir / "wrist_se3.npy"
-    pregrasp_path = capture_dir / "pregrasp_pose.npy"
-    pose_world_path = capture_dir / "pose_world.npy"
-
-    if not traj_path.exists():
-        print(f"No trajectory at {traj_path}")
+    if not (capture_dir / "traj.npy").exists():
+        print(f"No trajectory at {capture_dir / 'traj.npy'}")
         return
-
-    traj = np.load(str(traj_path))
-    wrist_se3 = np.load(str(wrist_path))
-    pregrasp_pose = np.load(str(pregrasp_path))
-    pose_world = np.load(str(pose_world_path))
-
-    # C2R for robot frame
-    c2r_path = capture_dir / "cam_param" / "C2R.npy"
-    if not c2r_path.exists():
-        c2r_path = capture_dir / "C2R.npy"
-    c2r = np.load(str(c2r_path)) if c2r_path.exists() else np.eye(4)
-    r2c = np.linalg.inv(c2r)
-
-    # Object pose in robot frame
-    pose_robot = r2c @ pose_world
-    obj_cart = se32cart(pose_robot)
 
     mesh_path = find_mesh(args.obj)
     print(f"Mesh: {mesh_path}")
-    print(f"Trajectory: {len(traj)} frames")
-    print(f"Object pose (robot): {pose_robot[:3, 3]}")
 
-    # Build scene
-    vis = ViserViewer(port=args.port)
-
-    # Table
-    table_se3 = pose7_to_se3(TABLE_POSE)
-    table_mesh = trimesh.creation.box(extents=TABLE_DIMS)
-    vis.add_object("table", table_mesh, table_se3)
-    vis.change_color("table", [240/255, 240/255, 245/255, 0.5])
-
-    # Object mesh
-    obj_mesh = trimesh.load(mesh_path, process=False)
-    if isinstance(obj_mesh, trimesh.Scene):
-        obj_mesh = trimesh.util.concatenate([g for g in obj_mesh.geometry.values()])
-    vis.add_trimesh("object", obj_mesh, pose_robot)
-
-    # Grid
-    vis.add_grid(size=12.0, cell_size=0.1, height=0.0)
-
-    # Robot at init
-    urdf_full = os.path.join(urdf_path, "xarm_allegro.urdf")
-    vis.add_robot("xarm_init", urdf_full)
-    vis.robot_dict["xarm_init"].update_cfg(INIT_STATE)
-    vis.change_color("xarm_init", [0.7, 0.7, 0.7, 0.3])
-
-    # Destination hand
-    urdf_hand = os.path.join(urdf_path, "allegro_hand_description_right.urdf")
-    vis.add_robot("dest_hand", urdf_hand, pose=wrist_se3)
-    vis.robot_dict["dest_hand"].update_cfg(pregrasp_pose)
-    vis.change_color("dest_hand", [0.3, 0.5, 1.0, 0.7])
-
-    # Trajectory robot
-    vis.add_robot("traj_robot", urdf_full)
-    vis.robot_dict["traj_robot"].update_cfg(traj[0])
-    vis.change_color("traj_robot", [0.7, 0.7, 0.7, 0.8])
-
-    # Ghost trail
-    ghost_spacing = max(1, len(traj) // 20)
-    ghost_positions = list(range(0, len(traj), ghost_spacing))
-    for i, pos in enumerate(ghost_positions):
-        ghost_name = f"ghost_{i}"
-        vis.add_robot(ghost_name, urdf_full)
-        vis.robot_dict[ghost_name].update_cfg(traj[pos])
-        vis.robot_dict[ghost_name].set_visibility(False)
-
-    # GUI
-    with vis.server.gui.add_folder("Planning"):
-        vis.server.gui.add_text("Info", initial_value=f"Trajectory: {len(traj)} frames", disabled=True)
-        timeline = vis.server.gui.add_slider("Timeline", min=0, max=len(traj)-1, step=1, initial_value=0)
-
-        @timeline.on_update
-        def _(_):
-            frame = int(timeline.value)
-            vis.robot_dict["traj_robot"].update_cfg(traj[frame])
-            for i, ghost_pos in enumerate(ghost_positions):
-                ghost_name = f"ghost_{i}"
-                if frame >= ghost_pos:
-                    vis.robot_dict[ghost_name].set_visibility(True)
-                    vis.change_color(ghost_name, [0.7, 0.7, 0.7, 0.4])
-                else:
-                    vis.robot_dict[ghost_name].set_visibility(False)
+    vis = PlanningResultViewer(str(capture_dir), args.obj, port=args.port)
 
     print(f"Viewer running at http://localhost:{args.port}")
     while True:
