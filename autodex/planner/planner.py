@@ -582,7 +582,12 @@ class GraspPlanner:
                 chunk_poses = np.concatenate(
                     [chunk_poses, np.tile(chunk_poses[:1], (pad, 1, 1))], axis=0)
             goal = _to_curobo_pose(chunk_poses, self._tensor_args.device)
-            result = self._ik_solver.solve_batch(goal)
+            # Retract toward INIT_STATE so IK solutions stay near start config
+            B_padded = chunk_poses.shape[0]
+            retract = torch.tensor(
+                INIT_STATE, dtype=torch.float32, device=self._tensor_args.device
+            ).unsqueeze(0).repeat(B_padded, 1)
+            result = self._ik_solver.solve_batch(goal, retract_config=retract)
             succ = result.success.cpu().numpy()[:B]
             q_sol = result.solution.cpu().numpy()[:B]
             if q_sol.ndim == 3:
@@ -590,7 +595,12 @@ class GraspPlanner:
             for i, idx in enumerate(chunk_idx):
                 if succ[i]:
                     ik_success[idx] = True
-                    ik_qpos[idx, :6] = q_sol[i, :6]
+                    arm_q = q_sol[i, :6].copy()
+                    # Snap joint 6 to nearest equivalent angle to INIT_STATE
+                    # IK can return any angle in [-2π, 2π]; pick closest to start
+                    diff = arm_q[5] - INIT_STATE[5]
+                    arm_q[5] -= np.round(diff / (2 * np.pi)) * 2 * np.pi
+                    ik_qpos[idx, :6] = arm_q
                     ik_qpos[idx, 6:] = pregrasp[idx]
         t_ik = _time.time() - t0
 

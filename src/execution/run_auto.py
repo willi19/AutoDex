@@ -8,6 +8,7 @@ Usage:
     python src/execution/run_auto.py --obj attached_container --n_trials 10
 """
 import argparse
+import chime
 import datetime
 import json
 import logging
@@ -98,6 +99,7 @@ def pose_world_to_scene_cfg(pose_world, c2r, obj_name):
 
 def get_label():
     while True:
+        chime.success()
         label = input("Press 'y' if the grasp was successful, 'n' if not: ").strip().lower()
         if label in ("y", "n"):
             return label == "y"
@@ -105,21 +107,27 @@ def get_label():
 
 def run_single_trial(
     obj_name, exp_name, grasp_version, depth_method, scene_type, viz,
-    planner, pipeline, rcc, sync_generator, timestamp_monitor,
+    planner, pipeline, executor, rcc, sync_generator, timestamp_monitor,
 ):
     """Run one capture -> perceive -> plan -> execute -> label cycle."""
-    dir_idx = f"{scene_type}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    img_dir = os.path.join(project_dir, "experiment", exp_name, obj_name, dir_idx)
+    hand_type = "allegro"
+    dir_idx = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    scene_prefix = scene_type if scene_type != "table" else ""
+    img_dir = os.path.join(project_dir, "experiment", exp_name, scene_prefix, hand_type, obj_name, dir_idx) if scene_prefix else os.path.join(project_dir, "experiment", exp_name, hand_type, obj_name, dir_idx)
     os.makedirs(img_dir, exist_ok=True)
 
     timing = {}
 
+    def _ts():
+        return datetime.datetime.now().isoformat()
+
     # ── 1. Capture images ────────────────────────────────────────────────
     print(f"\n{'='*60}")
     print(f"[1/6] Capturing -> {dir_idx}")
+    timing["capture_start"] = _ts()
     t0 = time.time()
 
-    rcc.start("image", False, os.path.join("AutoDex", "experiment", exp_name, obj_name, dir_idx, "raw"))
+    rcc.start("image", False, os.path.join("shared_data", "AutoDex", "experiment", exp_name, scene_prefix, hand_type, obj_name, dir_idx, "raw"))
     rcc.stop()
     save_current_C2R(img_dir)
     save_current_camparam(img_dir)
@@ -128,6 +136,7 @@ def run_single_trial(
 
     # ── 2. Distributed perception (SAM3 x3 + DA3 + FPose x3 + Sil) ──
     print(f"[2/6] Perception (distributed, depth={depth_method})...")
+    timing["perception_start"] = _ts()
     t0 = time.time()
     pose_world, perc_timing = pipeline.run(capture_dir=img_dir)
     timing["perception_s"] = round(time.time() - t0, 1)
@@ -145,6 +154,7 @@ def run_single_trial(
 
     # ── 3. Build scene_cfg & plan ────────────────────────────────────────
     print(f"[3/6] Planning (version={grasp_version}, scene={scene_type})...")
+    timing["planning_start"] = _ts()
     t0 = time.time()
     c2r = load_c2r(img_dir)
     scene_cfg = pose_world_to_scene_cfg(pose_world, c2r, obj_name)
@@ -154,6 +164,14 @@ def run_single_trial(
     print(f"    Plan: {timing['plan_s']}s  success={result.success}")
 
     if not result.success:
+        print("    Planning FAILED — launching visualizer to inspect...")
+        # Show scene + all candidate wrist poses
+        wrist_se3, _, grasp_pose, filtered = planner.get_candidates(scene_cfg, obj_name, grasp_version)
+        fail_vis = ScenePlanVisualizer(scene_cfg, None, port=8080)
+        fail_vis.add_candidates(wrist_se3, grasp_pose, filtered)
+        fail_vis.start_viewer(use_thread=True)
+        chime.error()
+        input("    Rearrange object, then press Enter to continue...")
         return {"dir_idx": dir_idx, "success": False, "reason": "planning_failed", "timing": timing}
 
     # Save plan
@@ -171,14 +189,15 @@ def run_single_trial(
         print("    Launching visualizer (http://localhost:8080)...")
         scene_vis = ScenePlanVisualizer(scene_cfg, result, port=8080)
         scene_vis.start_viewer(use_thread=True)
+        chime.info()
         input("    Press Enter to proceed to execution (visualizer stays open)...")
 
     # ── 4. Execute ───────────────────────────────────────────────────────
     print(f"[4/6] Executing on robot...")
-    executor = RealExecutor(mode="auto")
+    timing["execution_start"] = _ts()
 
     raw_dir = os.path.join(img_dir, "raw")
-    rcc.start("video", True, os.path.join("AutoDex", "experiment", exp_name, obj_name, dir_idx, "raw"))
+    rcc.start("video", True, os.path.join("AutoDex", "experiment", exp_name, scene_prefix, hand_type, obj_name, dir_idx, "raw"))
     timestamp_monitor.start(os.path.join(raw_dir, "timestamps"))
     executor.start_recording(raw_dir)
     sync_generator.start(fps=30)
@@ -186,14 +205,16 @@ def run_single_trial(
     t0 = time.time()
     s_hand = executor.execute(result)
     timing["execute_s"] = round(time.time() - t0, 1)
+    timing["execution_states"] = executor.state_timestamps
 
     rcc.stop()
     timestamp_monitor.stop()
     sync_generator.stop()
 
     # ── 5. Label ─────────────────────────────────────────────────────────
+    timing["label_start"] = _ts()
     print(f"[5/6] Label the result")
-    rcc.start("image", False, os.path.join("AutoDex", "experiment", exp_name, obj_name, dir_idx, "label", "raw"))
+    rcc.start("image", False, os.path.join("shared_data", "AutoDex", "experiment", exp_name, scene_prefix, hand_type, obj_name, dir_idx, "label", "raw"))
     rcc.stop()
     succ = get_label()
 
@@ -215,7 +236,14 @@ def run_single_trial(
     with open(os.path.join(img_dir, "result.json"), "w") as f:
         json.dump(trial_result, f, indent=2)
 
-    executor.shutdown()
+    # Save result to candidate path (table only — other scenes are testing)
+    if result.scene_info is not None and scene_type == "table":
+        from autodex.utils.path import candidate_path
+        sei = result.scene_info
+        cand_result_path = os.path.join(candidate_path, grasp_version, obj_name, sei[0], sei[1], sei[2], "result.json")
+        with open(cand_result_path, "w") as f:
+            json.dump({"success": succ, "dir_idx": dir_idx}, f)
+
     print(f"    Result: {'SUCCESS' if succ else 'FAIL'}  saved to {img_dir}/result.json")
     return trial_result
 
@@ -224,13 +252,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--obj", type=str, required=True)
     parser.add_argument("--grasp_version", type=str, default="selected_100")
-    parser.add_argument("--exp_name", type=str, default="auto")
+    parser.add_argument("--exp_name", type=str, default=None, help="Defaults to grasp_version")
     parser.add_argument("--depth", type=str, default="da3", choices=["da3", "stereo"])
     parser.add_argument("--scene", type=str, default="table",
                         choices=["table", "wall", "shelf", "cluttered"])
     parser.add_argument("--viz", action="store_true", help="Launch scene visualizer after planning")
-    parser.add_argument("--n_trials", type=int, default=1)
     args = parser.parse_args()
+    if args.exp_name is None:
+        args.exp_name = args.grasp_version
 
     # Hardware init
     rcc = remote_camera_controller("test_lookup_obstacle")
@@ -244,6 +273,7 @@ def main():
         sam3_hosts=SAM3_HOSTS,
         fpose_hosts=FPOSE_HOSTS,
         mesh_path=mesh_path,
+        obj_name=args.obj,
         depth_method=args.depth,
     )
 
@@ -251,11 +281,22 @@ def main():
     print("Initializing planner...")
     planner = GraspPlanner()
 
+    # Executor init (reuse across trials — reference: arm/hand init once)
+    print("Initializing executor...")
+    executor = RealExecutor(mode="auto")
+
     results = []
-    for trial in range(args.n_trials):
+    trial = 0
+    while True:
+        trial += 1
         print(f"\n{'#'*60}")
-        print(f"# Trial {trial + 1}/{args.n_trials}")
+        print(f"# Trial {trial}")
         print(f"{'#'*60}")
+
+        chime.info()
+        cmd = input("Press Enter to start trial, 'q' to quit: ").strip().lower()
+        if cmd == "q":
+            break
 
         trial_result = run_single_trial(
             obj_name=args.obj,
@@ -266,6 +307,7 @@ def main():
             viz=args.viz,
             planner=planner,
             pipeline=pipeline,
+            executor=executor,
             rcc=rcc,
             sync_generator=sync_generator,
             timestamp_monitor=timestamp_monitor,
@@ -275,23 +317,25 @@ def main():
         n_succ = sum(1 for r in results if r.get("success"))
         print(f"\n    Running total: {n_succ}/{len(results)} success")
 
-        if args.n_trials > 1 and trial < args.n_trials - 1:
-            input("Press Enter for next trial (or Ctrl+C to stop)...")
-
     # Summary
     print(f"\n{'='*60}")
     print(f"SUMMARY: {args.obj} x {len(results)} trials")
     n_succ = sum(1 for r in results if r.get("success"))
-    print(f"  Success: {n_succ}/{len(results)} ({100*n_succ/len(results):.0f}%)")
+    if results:
+        print(f"  Success: {n_succ}/{len(results)} ({100*n_succ/len(results):.0f}%)")
+    else:
+        print(f"  No trials run.")
     for r in results:
         status = "OK" if r.get("success") else r.get("reason", "FAIL")
         print(f"  {r['dir_idx']}: {status}")
 
-    summary_path = os.path.join(project_dir, "experiment", args.exp_name, args.obj, "summary.json")
+    scene_pfx = args.scene if args.scene != "table" else ""
+    summary_path = os.path.join(project_dir, "experiment", args.exp_name, scene_pfx, "allegro", args.obj, "summary.json") if scene_pfx else os.path.join(project_dir, "experiment", args.exp_name, "allegro", args.obj, "summary.json")
     os.makedirs(os.path.dirname(summary_path), exist_ok=True)
     with open(summary_path, "w") as f:
         json.dump(results, f, indent=2)
 
+    executor.shutdown()
     pipeline.close()
     timestamp_monitor.end()
     sync_generator.end()

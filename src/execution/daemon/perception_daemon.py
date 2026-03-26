@@ -113,10 +113,24 @@ def run_fpose_daemon(port: int, mesh_path: str, gpu: int = 0):
                 continue
 
             if req.get("command") == "reset_mesh":
-                new_mesh = _localize_path(req["mesh_path"])
-                tracker = PoseTracker(new_mesh, device_id=gpu)
-                logger.info(f"Mesh reset to {new_mesh}")
-                sock.send_string(json.dumps({"status": "ok"}))
+                if "obj_name" in req:
+                    mesh_root = os.path.expanduser("~/shared_data/object_6d/data/mesh")
+                    obj = req["obj_name"]
+                    new_mesh = None
+                    for name in [f"{obj}.obj", "simplified.obj", "coacd.obj"]:
+                        p = os.path.join(mesh_root, obj, name)
+                        if os.path.exists(p):
+                            new_mesh = p
+                            break
+                else:
+                    new_mesh = _localize_path(req["mesh_path"])
+                if new_mesh and os.path.exists(new_mesh):
+                    tracker = PoseTracker(new_mesh, device_id=gpu)
+                    logger.info(f"Mesh reset to {new_mesh}")
+                    sock.send_string(json.dumps({"status": "ok"}))
+                else:
+                    logger.error(f"Mesh not found: {req}")
+                    sock.send_string(json.dumps({"status": "error", "msg": "mesh not found"}))
                 continue
 
             image_path = _localize_path(req["image_path"])

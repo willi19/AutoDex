@@ -53,6 +53,9 @@ def load_candidate(obj_name, obj_pose, version, shuffle=True):
 
             for grasp_idx in grasp_idxs:
                 base = os.path.join(candidate_obj_path, scene_type, scene_id, grasp_idx)
+                # Skip candidates that already have a result
+                if os.path.exists(os.path.join(base, "result.json")):
+                    continue
                 pregrasp = np.load(os.path.join(base, "pregrasp_pose.npy"))
                 pregrasp_pose_list.append(pregrasp)
                 grasp_file = os.path.join(base, "grasp_pose.npy")

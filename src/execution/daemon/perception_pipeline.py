@@ -75,12 +75,14 @@ class PerceptionPipeline:
         sam3_hosts: List[Tuple[str, int]],
         fpose_hosts: List[Tuple[str, int]],
         mesh_path: str,
+        obj_name: str = None,
         depth_method: str = "da3",  # "da3" or "stereo"
         device: str = "cuda",
     ):
         self.sam3_clients = [ZMQClient(h, p) for h, p in sam3_hosts]
         self.fpose_clients = [ZMQClient(h, p) for h, p in fpose_hosts]
         self.mesh_path = mesh_path
+        self.obj_name = obj_name
         self.depth_method = depth_method
         self.device = device
 
@@ -88,6 +90,9 @@ class PerceptionPipeline:
         self._da3_model = None
         self._stereo_trt = None
         self._sil_optimizer = None
+
+        # Send initial mesh to FPose daemons
+        self._send_mesh_to_daemons()
 
     def _load_da3(self):
         if self._da3_model is not None:
@@ -146,9 +151,27 @@ class PerceptionPipeline:
         with open(capture_dir / "cam_param" / "extrinsics.json") as f:
             extr_raw = json.load(f)
 
+        # Undistort raw images -> images/
+        raw_img_dir = capture_dir / "raw" / "images"
         img_dir = capture_dir / "images"
-        if not img_dir.exists():
-            img_dir = capture_dir / "raw" / "images"
+        if not img_dir.exists() and raw_img_dir.exists():
+            img_dir.mkdir(exist_ok=True)
+            for s, cam_data in intr_raw.items():
+                raw_path = raw_img_dir / f"{s}.png"
+                if not raw_path.exists():
+                    continue
+                img = cv2.imread(str(raw_path))
+                K_orig = np.array(cam_data["original_intrinsics"], dtype=np.float64)
+                K_undist = np.array(cam_data["intrinsics_undistort"], dtype=np.float64)
+                dist = np.array(cam_data["dist_params"], dtype=np.float64)
+                h, w = img.shape[:2]
+                map1, map2 = cv2.initUndistortRectifyMap(K_orig, dist, None, K_undist, (w, h), cv2.CV_32FC1)
+                undist = cv2.remap(img, map1, map2, cv2.INTER_LINEAR)
+                cv2.imwrite(str(img_dir / f"{s}.png"), undist)
+            logger.info(f"Undistorted {len(list(img_dir.glob('*.png')))} images -> {img_dir}")
+        elif not img_dir.exists():
+            raise FileNotFoundError(f"No images found: {img_dir} and {raw_img_dir} both missing")
+
         serials = sorted(p.stem for p in img_dir.glob("*.png"))
 
         intrinsics = {}
@@ -178,6 +201,33 @@ class PerceptionPipeline:
         t_sam3 = time.perf_counter() - t0
         n_masks = sum(1 for v in masks.values() if v)
         logger.info(f"SAM3: {n_masks}/{len(serials)} masks in {t_sam3:.2f}s")
+
+        # Save mask overlay
+        mask_vis_dir = work_dir / "mask_vis"
+        mask_vis_dir.mkdir(exist_ok=True)
+        mask_overlays = []
+        for s in serials:
+            img_path = img_dir / f"{s}.png"
+            msk_path = mask_dir / f"{s}.png"
+            if not msk_path.exists():
+                continue
+            img = cv2.imread(str(img_path))
+            msk = cv2.imread(str(msk_path), cv2.IMREAD_GRAYSCALE)
+            if img is None or msk is None:
+                continue
+            overlay = img.copy()
+            overlay[msk > 127] = (overlay[msk > 127] * 0.5 + np.array([0, 0, 255]) * 0.5).astype(np.uint8)
+            cv2.imwrite(str(mask_vis_dir / f"{s}.png"), overlay)
+            mask_overlays.append(cv2.resize(overlay, (W // 2, H // 2)))
+        if mask_overlays:
+            n_cols = 4
+            n_rows = (len(mask_overlays) + n_cols - 1) // n_cols
+            h, w = mask_overlays[0].shape[:2]
+            grid = np.zeros((n_rows * h, n_cols * w, 3), dtype=np.uint8)
+            for i, ov in enumerate(mask_overlays):
+                r, c = i // n_cols, i % n_cols
+                grid[r * h:(r + 1) * h, c * w:(c + 1) * w] = ov
+            cv2.imwrite(str(mask_vis_dir / "grid.png"), grid)
 
         # ── Step 1.5: Select best 5 views (pre-determined) ──
         best5 = self.BEST_5_DA3 if self.depth_method == "da3" else self.BEST_5_STEREO
@@ -240,11 +290,22 @@ class PerceptionPipeline:
             })
 
         self._load_sil_optimizer()
-        pose_world = self._sil_optimizer.optimize(
+        pose_world, sil_loss = self._sil_optimizer.optimize(
             best_pose_world, views, iters=sil_iters, lr=sil_lr, antialias=True,
         )
         t_sil = time.perf_counter() - t0
-        logger.info(f"Sil matching: {t_sil:.2f}s ({len(views)} views, {sil_iters} iters)")
+        logger.info(f"Sil matching: {t_sil:.2f}s ({len(views)} views, {sil_iters} iters, loss={sil_loss:.6f})")
+
+        # ── Step 6: Pose overlay visualization (always, even on reject) ──
+        overlay_dir = capture_dir / "pose_overlay"
+        overlay_dir.mkdir(exist_ok=True)
+        self._save_pose_overlay(
+            pose_world, serials, img_dir, intrinsics, extrinsics, H, W, overlay_dir,
+        )
+
+        if sil_loss > 0.003:
+            logger.warning(f"Sil loss {sil_loss:.6f} > 0.003 — pose unreliable, skipping")
+            return None, {"sil_loss": sil_loss, "sil_reject": True}
 
         t_total = time.perf_counter() - t_start
         logger.info(f"Total: {t_total:.2f}s "
@@ -321,6 +382,35 @@ class PerceptionPipeline:
                 d_np = cv2.resize(d_np, (W, H), interpolation=cv2.INTER_NEAREST)
             d_mm = (d_np * 1000).clip(0, 65535).astype(np.uint16)
             cv2.imwrite(str(depth_dir / f"{s}.png"), d_mm)
+
+        # Save depth colormap overlay
+        depth_vis_dir = depth_dir.parent / "depth_vis"
+        depth_vis_dir.mkdir(exist_ok=True)
+        overlays = []
+        for i, s in enumerate(serials):
+            img = cv2.imread(str(img_dir / f"{s}.png"))
+            d_mm = cv2.imread(str(depth_dir / f"{s}.png"), cv2.IMREAD_UNCHANGED)
+            # Normalize per-image for better contrast
+            valid = d_mm[d_mm > 0]
+            if len(valid) > 0:
+                d_min, d_max = np.percentile(valid, [2, 98])
+            else:
+                d_min, d_max = 0, 3000
+            d_norm = ((d_mm.astype(np.float32) - d_min) / max(d_max - d_min, 1) * 255).clip(0, 255).astype(np.uint8)
+            d_vis = cv2.applyColorMap(d_norm, cv2.COLORMAP_TURBO)
+            blend = cv2.addWeighted(img, 0.5, d_vis, 0.5, 0)
+            cv2.imwrite(str(depth_vis_dir / f"{s}.png"), blend)
+            overlays.append(cv2.resize(blend, (W // 2, H // 2)))
+        if overlays:
+            n_cols = 4
+            n_rows = (len(overlays) + n_cols - 1) // n_cols
+            h, w = overlays[0].shape[:2]
+            grid = np.zeros((n_rows * h, n_cols * w, 3), dtype=np.uint8)
+            for i, ov in enumerate(overlays):
+                r, c = i // n_cols, i % n_cols
+                grid[r * h:(r + 1) * h, c * w:(c + 1) * w] = ov
+            cv2.imwrite(str(depth_vis_dir / "grid.png"), grid)
+            logger.info(f"Depth vis: {len(overlays)} views -> {depth_vis_dir}")
 
         return serials
 
@@ -474,15 +564,65 @@ class PerceptionPipeline:
         logger.info(f"Best: {best_serial}, mean IoU={best_iou:.3f}")
         return best_serial, best_pose
 
-    def change_object(self, mesh_path: str):
-        """Change target object."""
-        self.mesh_path = mesh_path
-        self._sil_optimizer = None
+    def _save_pose_overlay(self, pose_world, serials, img_dir, intrinsics, extrinsics, H, W, overlay_dir):
+        """Render mesh overlay on each camera view and save as grid + individual images."""
+        self._load_sil_optimizer()
+        mt = self._sil_optimizer.mesh_tensors
+        glctx = self._sil_optimizer.glctx
+        _fp_root = str(Path(__file__).resolve().parents[3] / "autodex/perception/thirdparty/FoundationPose")
+        if _fp_root not in sys.path:
+            sys.path.insert(0, _fp_root)
+        from Utils import nvdiffrast_render
+
+        overlays = []
+        for s in serials:
+            img = cv2.imread(str(img_dir / f"{s}.png"))
+            if img is None:
+                continue
+            K = intrinsics[s].astype(np.float32)
+            pose_cam = extrinsics[s] @ pose_world
+            pt = torch.as_tensor(pose_cam, device="cuda", dtype=torch.float32).reshape(1, 4, 4)
+            rc, _, _ = nvdiffrast_render(K=K, H=H, W=W, ob_in_cams=pt, glctx=glctx,
+                                          mesh_tensors=mt, use_light=False)
+            render = rc[0].detach().cpu().numpy()  # (H, W, 3) float 0-1
+            mask = render.sum(axis=2) > 0
+            # Green tint overlay
+            overlay = img.copy()
+            overlay[mask] = (overlay[mask] * 0.5 + np.array([0, 200, 0]) * 0.5).astype(np.uint8)
+            cv2.imwrite(str(overlay_dir / f"{s}.png"), overlay)
+            # Resize for grid
+            small = cv2.resize(overlay, (W // 2, H // 2))
+            overlays.append(small)
+
+        # Save grid (rows of 4)
+        if overlays:
+            n_cols = 4
+            n_rows = (len(overlays) + n_cols - 1) // n_cols
+            h, w = overlays[0].shape[:2]
+            grid = np.zeros((n_rows * h, n_cols * w, 3), dtype=np.uint8)
+            for i, ov in enumerate(overlays):
+                r, c = i // n_cols, i % n_cols
+                grid[r * h:(r + 1) * h, c * w:(c + 1) * w] = ov
+            cv2.imwrite(str(overlay_dir / "grid.png"), grid)
+            logger.info(f"Pose overlay: {len(overlays)} views -> {overlay_dir}")
+
+    def _send_mesh_to_daemons(self):
+        """Send obj_name (preferred) or mesh_path to FPose daemons."""
         for client in self.fpose_clients:
             try:
-                client.request({"command": "reset_mesh", "mesh_path": mesh_path})
+                if self.obj_name:
+                    client.request({"command": "reset_mesh", "obj_name": self.obj_name})
+                else:
+                    client.request({"command": "reset_mesh", "mesh_path": self.mesh_path})
             except Exception as e:
-                logger.warning(f"Failed to reset mesh: {e}")
+                logger.warning(f"Failed to send mesh to FPose daemon: {e}")
+
+    def change_object(self, mesh_path: str, obj_name: str = None):
+        """Change target object."""
+        self.mesh_path = mesh_path
+        self.obj_name = obj_name
+        self._sil_optimizer = None
+        self._send_mesh_to_daemons()
 
     def close(self):
         for c in self.sam3_clients:

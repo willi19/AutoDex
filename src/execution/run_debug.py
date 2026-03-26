@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Debug mode: Perception (distributed) -> Planning -> GUI Controller.
+"""Debug mode: Perception (distributed) -> Planning -> Visualize -> GUI Controller.
 
 Uses distributed daemon pipeline for fast perception,
 then launches the GUI controller for manual step-by-step execution.
@@ -19,14 +19,12 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
-from paradex.io.robot_controller.gui_controller import RobotGUIController
-from paradex.io.robot_controller import get_arm, get_hand
 from paradex.io.camera_system.remote_camera_controller import remote_camera_controller
 from paradex.calibration.utils import save_current_camparam, save_current_C2R, load_c2r
 
 from autodex.utils.conversion import se32cart
 from autodex.utils.path import project_dir, obj_path
-from autodex.utils.robot_config import INIT_STATE, XARM_INIT, ALLEGRO_INIT, LINK6_TO_WRIST
+from autodex.utils.robot_config import INIT_STATE, XARM_INIT, ALLEGRO_INIT
 from autodex.planner import GraspPlanner
 from autodex.planner.obstacles import add_obstacles
 from autodex.planner.visualizer import ScenePlanVisualizer
@@ -89,18 +87,6 @@ def pose_world_to_scene_cfg(pose_world, c2r, obj_name):
     }
 
 
-def _convert_hand(hand_pose):
-    """Reorder Allegro joints: move last 4 (thumb) to front."""
-    out = hand_pose.copy()
-    if hand_pose.ndim == 1:
-        out[:4] = hand_pose[12:]
-        out[4:] = hand_pose[:12]
-    else:
-        out[:, :4] = hand_pose[:, 12:]
-        out[:, 4:] = hand_pose[:, :12]
-    return out
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--obj", type=str, required=True)
@@ -114,7 +100,6 @@ def main():
     obj_name = args.obj
     exp_name = args.exp_name
     grasp_version = args.grasp_version
-    scene_type = args.scene
 
     rcc = remote_camera_controller("test_lookup_obstacle")
 
@@ -125,54 +110,77 @@ def main():
         sam3_hosts=SAM3_HOSTS,
         fpose_hosts=FPOSE_HOSTS,
         mesh_path=mesh_path,
+        obj_name=obj_name,
         depth_method=args.depth,
     )
 
+    timing = {}
+
+    def _ts():
+        return datetime.datetime.now().isoformat()
+
     # ── 2. Capture images ────────────────────────────────────────────────
-    dir_idx = f"{scene_type}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    img_dir = os.path.join(project_dir, "experiment", exp_name, obj_name, dir_idx)
+    dir_idx = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    hand_type = "allegro"
+    scene_prefix = args.scene if args.scene != "table" else ""
+    img_dir = os.path.join(project_dir, "experiment", exp_name, scene_prefix, hand_type, obj_name, dir_idx) if scene_prefix else os.path.join(project_dir, "experiment", exp_name, hand_type, obj_name, dir_idx)
     os.makedirs(img_dir, exist_ok=True)
 
-    print(f"[1/4] Capturing images -> {dir_idx}")
+    print(f"[1/5] Capturing images -> {dir_idx}")
+    timing["capture_start"] = _ts()
     t0 = time.time()
-    rcc.start("image", False, os.path.join("AutoDex", "experiment", exp_name, obj_name, dir_idx, "raw"))
+    rcc.start("image", False, os.path.join("shared_data", "AutoDex", "experiment", exp_name, scene_prefix, hand_type, obj_name, dir_idx, "raw"))
     rcc.stop()
     save_current_C2R(img_dir)
     save_current_camparam(img_dir)
-    print(f"    Capture: {time.time() - t0:.1f}s")
+    timing["capture_s"] = round(time.time() - t0, 1)
+    print(f"    Capture: {timing['capture_s']}s")
 
     # ── 3. Distributed perception ────────────────────────────────────────
-    print(f"[2/4] Perception (distributed, depth={args.depth})...")
+    print(f"[2/5] Perception (distributed, depth={args.depth})...")
+    timing["perception_start"] = _ts()
     t0 = time.time()
     pose_world, perc_timing = pipeline.run(capture_dir=img_dir)
-    print(f"    Perception: {time.time() - t0:.1f}s")
+    timing["perception_s"] = round(time.time() - t0, 1)
+    print(f"    Perception: {timing['perception_s']}s")
 
     if pose_world is None:
         print("Perception failed. Exiting.")
+        timing["perception_failed"] = True
+        with open(os.path.join(img_dir, "timing.json"), "w") as f:
+            json.dump(timing, f, indent=2)
         pipeline.close()
         rcc.end()
         return
 
     np.save(os.path.join(img_dir, "pose_world.npy"), pose_world)
     if perc_timing:
-        with open(os.path.join(img_dir, "perception_timing.json"), "w") as f:
-            json.dump(perc_timing, f, indent=2)
+        timing["perception_detail"] = perc_timing
 
     # ── 4. Plan ──────────────────────────────────────────────────────────
-    print(f"[3/4] Planning (version={grasp_version})...")
+    print(f"[3/5] Planning (version={grasp_version})...")
+    timing["planning_start"] = _ts()
     t0 = time.time()
     c2r = load_c2r(img_dir)
     scene_cfg = pose_world_to_scene_cfg(pose_world, c2r, obj_name)
-    scene_cfg = add_obstacles(scene_cfg, scene_type)
+    scene_cfg = add_obstacles(scene_cfg, args.scene)
     planner = GraspPlanner()
     result = planner.plan(scene_cfg, obj_name, grasp_version)
-    print(f"    Planning: {time.time() - t0:.1f}s  success={result.success}")
+    timing["planning_s"] = round(time.time() - t0, 1)
+    print(f"    Planning: {timing['planning_s']}s  success={result.success}")
 
     if not result.success:
         print("No valid trajectory found. Exiting.")
+        timing["planning_success"] = False
+        with open(os.path.join(img_dir, "timing.json"), "w") as f:
+            json.dump(timing, f, indent=2)
         pipeline.close()
         rcc.end()
         return
+
+    timing["planning_success"] = True
+    if result.timing:
+        timing["planning_detail"] = result.timing
 
     # Save plan
     plan_dir = os.path.join(img_dir, "plan")
@@ -181,49 +189,34 @@ def main():
     np.save(os.path.join(plan_dir, "wrist_se3.npy"), result.wrist_se3)
     np.save(os.path.join(plan_dir, "pregrasp_pose.npy"), result.pregrasp_pose)
     np.save(os.path.join(plan_dir, "grasp_pose.npy"), result.grasp_pose)
-    if result.timing:
-        with open(os.path.join(plan_dir, "timing.json"), "w") as f:
-            json.dump(result.timing, f, indent=2)
     print(f"    Scene info: {result.scene_info}")
 
-    # ── 5. Visualize scene + trajectory ────────────────────────────────────
+    # ── 5. Visualize scene + trajectory ──────────────────────────────────
     print(f"[4/5] Launching scene visualizer (http://localhost:8080)...")
     vis = ScenePlanVisualizer(scene_cfg, result, port=8080)
     vis.start_viewer(use_thread=True)
-    input("    Press Enter to proceed to GUI controller (visualizer stays open)...")
+
+    while True:
+        cont = input("Press 'y' to execute on robot, 'q' to quit: ").strip().lower()
+        if cont in ("y", "q"):
+            break
+
+    if cont == "q":
+        print("Skipping execution.")
+        with open(os.path.join(img_dir, "timing.json"), "w") as f:
+            json.dump(timing, f, indent=2)
+        pipeline.close()
+        rcc.end()
+        return
 
     # ── 6. GUI Controller ────────────────────────────────────────────────
     print(f"[5/5] Launching GUI controller...")
-    traj = result.traj
-    pg_hand = _convert_hand(result.pregrasp_pose)
-    g_hand = _convert_hand(result.grasp_pose)
-    wrist_ee = result.wrist_se3 @ np.linalg.inv(LINK6_TO_WRIST)
+    timing["execution_start"] = _ts()
 
-    squeeze_level = 10
-    s_hand = g_hand * squeeze_level - pg_hand * (squeeze_level - 1)
-
-    approach_traj = np.column_stack([
-        traj[:, :6],
-        np.array([_convert_hand(traj[i, 6:]) for i in range(len(traj))]),
-    ])
-
-    arm = get_arm("xarm")
-    hand = get_hand("allegro")
-
-    rgc = RobotGUIController(
-        robot_controller=arm,
-        hand_controller=hand,
-        grasp_pose={
-            "start": approach_traj[0, 6:],
-            "pregrasp": pg_hand,
-            "grasp": g_hand,
-            "squeezed": s_hand,
-        },
-        approach_traj=approach_traj,
-        lift_distance=120.0,
-        place_distance=40.0,
-    )
-    rgc.run()
+    from autodex.executor.real import RealExecutor
+    executor = RealExecutor(mode="gui")
+    s_hand = executor.execute(result)
+    timing["execution_states"] = executor.state_timestamps
 
     # ── Label ────────────────────────────────────────────────────────────
     while True:
@@ -231,14 +224,33 @@ def main():
         if label in ("y", "n"):
             break
 
-    json.dump(
-        {"scene_info": result.scene_info, "success": label == "y"},
-        open(os.path.join(img_dir, "result.json"), "w"),
-    )
+    timing["label_start"] = _ts()
+
+    # Release & return to init
+    executor.release(result)
+
+    if s_hand is not None:
+        np.save(os.path.join(img_dir, "squeeze_hand.npy"), s_hand)
+
+    trial_result = {
+        "scene_info": result.scene_info,
+        "success": label == "y",
+        "timing": timing,
+    }
+    with open(os.path.join(img_dir, "result.json"), "w") as f:
+        json.dump(trial_result, f, indent=2)
+
+    # Save result to candidate path (table only — other scenes are testing)
+    if result.scene_info is not None and args.scene == "table":
+        from autodex.utils.path import candidate_path
+        sei = result.scene_info
+        cand_result_path = os.path.join(candidate_path, grasp_version, obj_name, sei[0], sei[1], sei[2], "result.json")
+        with open(cand_result_path, "w") as f:
+            json.dump({"success": label == "y", "dir_idx": dir_idx}, f)
+
     print(f"Result saved to {img_dir}/result.json")
 
-    arm.end()
-    hand.end()
+    executor.shutdown()
     pipeline.close()
     rcc.end()
 
