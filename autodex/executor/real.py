@@ -21,10 +21,14 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from autodex.planner import PlanResult
-from autodex.utils.robot_config import XARM_INIT, ALLEGRO_INIT, LINK6_TO_WRIST
+from autodex.utils.robot_config import (
+    XARM_INIT, XARM_INSPIRE_INIT,
+    ALLEGRO_INIT, ALLEGRO_LINK6_TO_WRIST,
+    INSPIRE_INIT, INSPIRE_LINK6_TO_WRIST,
+)
 
-
-def _convert_hand_pose(hand_pose: np.ndarray) -> np.ndarray:
+# Per-hand config: (init_joints, link6_to_wrist, convert_fn)
+def _convert_allegro(hand_pose: np.ndarray) -> np.ndarray:
     """Reorder Allegro joints: move last 4 (thumb) to front."""
     if hand_pose.ndim == 1:
         out = hand_pose.copy()
@@ -35,6 +39,25 @@ def _convert_hand_pose(hand_pose: np.ndarray) -> np.ndarray:
         out[:, :4] = hand_pose[:, 12:]
         out[:, 4:] = hand_pose[:, :12]
     return out
+
+def _convert_inspire(hand_pose: np.ndarray) -> np.ndarray:
+    """Inspire hand: no reordering needed."""
+    return hand_pose
+
+HAND_CONFIG = {
+    "allegro": {
+        "init": ALLEGRO_INIT,
+        "link6_to_wrist": ALLEGRO_LINK6_TO_WRIST,
+        "convert": _convert_allegro,
+        "xarm_init": XARM_INIT,
+    },
+    "inspire": {
+        "init": INSPIRE_INIT,
+        "link6_to_wrist": INSPIRE_LINK6_TO_WRIST,
+        "convert": _convert_inspire,
+        "xarm_init": XARM_INSPIRE_INIT,
+    },
+}
 
 
 class RealExecutor:
@@ -48,9 +71,18 @@ class RealExecutor:
     ):
         if mode not in ("auto", "gui"):
             raise ValueError(f"mode must be 'auto' or 'gui', got '{mode}'")
+        if hand_name not in HAND_CONFIG:
+            raise ValueError(f"Unknown hand: {hand_name}. Choose from {list(HAND_CONFIG)}")
         self.mode = mode
         self.dt = dt
         self.squeeze_level = squeeze_level
+        self.hand_name = hand_name
+
+        hcfg = HAND_CONFIG[hand_name]
+        self._convert = hcfg["convert"]
+        self._hand_init = hcfg["init"]
+        self._link6_to_wrist = hcfg["link6_to_wrist"]
+        self._xarm_init = hcfg["xarm_init"]
 
         from paradex.io.robot_controller import get_arm, get_hand
         self.arm = get_arm(arm_name)
@@ -154,9 +186,9 @@ class RealExecutor:
 
         self.state_timestamps = []
         traj = plan_result.traj
-        pg_hand = _convert_hand_pose(plan_result.pregrasp_pose)
-        g_hand = _convert_hand_pose(plan_result.grasp_pose)
-        wrist_ee = plan_result.wrist_se3 @ np.linalg.inv(LINK6_TO_WRIST)
+        pg_hand = self._convert(plan_result.pregrasp_pose)
+        g_hand = self._convert(plan_result.grasp_pose)
+        wrist_ee = plan_result.wrist_se3 @ np.linalg.inv(self._link6_to_wrist)
 
         if self.mode == "gui":
             return self._execute_gui(traj, pg_hand, g_hand, wrist_ee, lift_height)
@@ -168,11 +200,11 @@ class RealExecutor:
 
         # 1. Return to init pose (joint 0 first)
         self._log_state("init")
-        self._move_joint_sequential(XARM_INIT[:6], [0], threshold=0.06)
+        self._move_joint_sequential(self._xarm_init[:6], [0], threshold=0.06)
 
         # 2. Approach trajectory
         self._log_state("approach")
-        hand_traj = np.array([_convert_hand_pose(traj[i, 6:]) for i in range(len(traj))])
+        hand_traj = np.array([self._convert(traj[i, 6:]) for i in range(len(traj))])
         self._move_joints(traj[:, :6], hand_traj)
 
         # 3. Pregrasp
@@ -214,11 +246,11 @@ class RealExecutor:
 
         # 1. Init (joint 0 only — same as _execute_auto)
         self._log_state("init")
-        rgc.add_waypoint("init", "joint", target=XARM_INIT[:6])
+        rgc.add_waypoint("init", "joint", target=self._xarm_init[:6])
 
         # 2. Approach (full trajectory)
         self._log_state("approach")
-        hand_traj = np.array([_convert_hand_pose(traj[i, 6:]) for i in range(len(traj))])
+        hand_traj = np.array([self._convert(traj[i, 6:]) for i in range(len(traj))])
         for i in range(len(traj)):
             rgc.add_waypoint(f"approach_{i}", "joint", target=traj[i, :6], hand_qpos=hand_traj[i])
 
@@ -247,8 +279,8 @@ class RealExecutor:
         if not plan_result.success:
             return
 
-        pg_hand = _convert_hand_pose(plan_result.pregrasp_pose)
-        g_hand = _convert_hand_pose(plan_result.grasp_pose)
+        pg_hand = self._convert(plan_result.pregrasp_pose)
+        g_hand = self._convert(plan_result.grasp_pose)
 
         if self.mode == "gui":
             self._release_gui(pg_hand, g_hand)
@@ -269,14 +301,14 @@ class RealExecutor:
         time.sleep(0.01)
         self._move_hand(pg_hand)
         time.sleep(0.01)
-        self._move_hand(_convert_hand_pose(ALLEGRO_INIT))
+        self._move_hand(self._convert(self._hand_init))
 
         # Return arm to init
         execute_order = [1, 2, 5, 0, 3, 4]
-        if self.arm.get_data()["qpos"][1] < XARM_INIT[1]:
+        if self.arm.get_data()["qpos"][1] < self._xarm_init[1]:
             execute_order = [2, 1, 5, 0, 3, 4]
 
-        clear_view = XARM_INIT.copy()
+        clear_view = self._xarm_init.copy()
         clear_view[0] -= 60 * np.pi / 180
         self._move_joint_sequential(clear_view[:6], execute_order, threshold=0.06)
 
@@ -287,7 +319,7 @@ class RealExecutor:
         sl = self.squeeze_level
         s_hand = g_hand * sl - pg_hand * (sl - 1)
 
-        clear_view = XARM_INIT.copy()
+        clear_view = self._xarm_init.copy()
         clear_view[0] -= 60 * np.pi / 180
 
         rgc = RobotGUIController(self.arm, self.hand)
@@ -298,7 +330,7 @@ class RealExecutor:
         rgc.add_waypoint("release_pregrasp", "joint",
                          target=self.arm.get_data()["qpos"], hand_qpos=pg_hand)
         rgc.add_waypoint("release_open", "joint",
-                         target=self.arm.get_data()["qpos"], hand_qpos=_convert_hand_pose(ALLEGRO_INIT))
+                         target=self.arm.get_data()["qpos"], hand_qpos=self._convert(self._hand_init))
         rgc.add_waypoint("return_init", "joint", target=clear_view[:6])
 
         rgc.run()

@@ -94,7 +94,7 @@ def run_sam3_daemon(port: int, gpu: int = 0):
 
 MESH_ROOT = os.path.expanduser("~/shared_data/object_6d/data/mesh")
 
-def _find_mesh(obj_name: str) -> str | None:
+def _find_mesh(obj_name: str):
     """Resolve obj_name to mesh path under MESH_ROOT."""
     for name in [f"{obj_name}.obj", "simplified.obj", "coacd.obj"]:
         p = os.path.join(MESH_ROOT, obj_name, name)

@@ -181,7 +181,7 @@ class GraspPlanner:
         self._ik_solver = IKSolver(config)
 
     def solve_ik(self, scene_cfg: dict, obj_name: str, grasp_version: str,
-                 seed: Optional[int] = None):
+                 seed: Optional[int] = None, hand: str = "allegro"):
         """
         IK-only reachability check for all grasp candidates.
 
@@ -199,7 +199,7 @@ class GraspPlanner:
 
         t0 = _time.time()
         obj_pose = cart2se3(scene_cfg["mesh"]["target"]["pose"])
-        wrist_se3, pregrasp, grasp, scene_info = load_candidate(obj_name, obj_pose, grasp_version)
+        wrist_se3, pregrasp, grasp, scene_info = load_candidate(obj_name, obj_pose, grasp_version, hand=hand)
         t_load = _time.time() - t0
 
         t0 = _time.time()
@@ -396,7 +396,7 @@ class GraspPlanner:
     # ── public API ────────────────────────────────────────────────────────────
 
     def get_candidates(self, scene_cfg: dict, obj_name: str, grasp_version: str,
-                        success_only: bool = False, skip_done: bool = False):
+                        success_only: bool = False, skip_done: bool = False, hand: str = "allegro"):
         """
         Return all grasp candidates with collision filter applied (no motion planning).
 
@@ -408,7 +408,7 @@ class GraspPlanner:
         """
         obj_pose = cart2se3(scene_cfg["mesh"]["target"]["pose"])
         wrist_se3, pregrasp, grasp, _ = load_candidate(obj_name, obj_pose, grasp_version,
-                                                         skip_done=skip_done, success_only=success_only)
+                                                         skip_done=skip_done, success_only=success_only, hand=hand)
 
         world_cfg = _to_curobo_world(scene_cfg)
         if self._motion_gen is None:
@@ -423,7 +423,7 @@ class GraspPlanner:
         return wrist_se3, pregrasp, grasp, filtered
 
     def plan_all(self, scene_cfg: dict, obj_name: str, grasp_version: str,
-                 stop_on_first: bool = True):
+                 stop_on_first: bool = True, hand: str = "allegro"):
         """
         Plan trajectories for all candidates (for visualization / debugging).
 
@@ -443,7 +443,7 @@ class GraspPlanner:
 
         t0 = _time.time()
         obj_pose = cart2se3(scene_cfg["mesh"]["target"]["pose"])
-        wrist_se3, pregrasp, grasp, scene_info = load_candidate(obj_name, obj_pose, grasp_version)
+        wrist_se3, pregrasp, grasp, scene_info = load_candidate(obj_name, obj_pose, grasp_version, hand=hand)
         print(f"[planner] load candidates: {_time.time() - t0:.2f}s ({len(wrist_se3)} candidates)")
 
         t0 = _time.time()
@@ -517,7 +517,8 @@ class GraspPlanner:
 
     def plan(self, scene_cfg: dict, obj_name: str, grasp_version: str,
              mode: str = "batch", seed: Optional[int] = None,
-             skip_done: bool = True, success_only: bool = False) -> PlanResult:
+             skip_done: bool = True, success_only: bool = False,
+             hand: str = "allegro") -> PlanResult:
         import time as _time
 
         if seed is not None:
@@ -527,7 +528,7 @@ class GraspPlanner:
         # 1. Load candidates
         t0 = _time.time()
         obj_pose = cart2se3(scene_cfg["mesh"]["target"]["pose"])
-        wrist_se3, pregrasp, grasp, scene_info = load_candidate(obj_name, obj_pose, grasp_version, skip_done=skip_done, success_only=success_only)
+        wrist_se3, pregrasp, grasp, scene_info = load_candidate(obj_name, obj_pose, grasp_version, skip_done=skip_done, success_only=success_only, hand=hand)
         t_load = _time.time() - t0
 
         if len(wrist_se3) == 0:

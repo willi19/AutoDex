@@ -9,11 +9,15 @@ shared_dir = os.path.join(home_path, "shared_data")
 project_dir = os.path.join(shared_dir, "AutoDex")
 bodex_path = os.path.join(code_path, "BODex_outputs")
 repo_dir = os.path.join(home_path, "AutoDex")
-candidate_path = os.path.join(project_dir, "candidates", "allegro")
+candidate_path = os.path.join(project_dir, "candidates", "allegro")  # default, use get_candidate_path() for other hands
 
 robot_configs_path = os.path.join(project_dir, "content", "configs", "robot")
 obj_path = os.path.join(project_dir, "object", "paradex")
 urdf_path = os.path.join(project_dir, "content", "assets", "robot", "allegro_description")
+
+
+def get_candidate_path(hand: str = "allegro") -> str:
+    return os.path.join(project_dir, "candidates", hand)
 
 
 def get_object_mesh(obj_name):
@@ -23,13 +27,13 @@ def get_object_mesh(obj_name):
     return mesh
 
 
-def load_candidate(obj_name, obj_pose, version, shuffle=True, skip_done=True, success_only=False):
+def load_candidate(obj_name, obj_pose, version, shuffle=True, skip_done=True, success_only=False, hand="allegro"):
     wrist_se3_list = []
     pregrasp_pose_list = []
     grasp_pose_list = []
     scene_info = []
 
-    candidate_obj_path = os.path.join(candidate_path, version, obj_name)
+    candidate_obj_path = os.path.join(get_candidate_path(hand), version, obj_name)
 
     scene_types = os.listdir(candidate_obj_path)
     if shuffle:

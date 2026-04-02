@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 MESH_ROOT = os.path.expanduser("~/shared_data/object_6d/data/mesh")
 
-def _find_mesh(obj_name: str) -> str | None:
+def _find_mesh(obj_name: str):
     """Resolve obj_name to mesh path."""
     for name in [f"{obj_name}.obj", "simplified.obj", "coacd.obj"]:
         p = os.path.join(MESH_ROOT, obj_name, name)
