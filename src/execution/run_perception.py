@@ -38,17 +38,6 @@ FPOSE_HOSTS = [
 ]
 
 
-def find_mesh(obj_name):
-    for name in [f"{obj_name}.obj", "simplified.obj", "coacd.obj"]:
-        p = MESH_ROOT / obj_name / name
-        if p.exists():
-            return str(p)
-    objs = list((MESH_ROOT / obj_name).glob("*.obj"))
-    if objs:
-        return str(objs[0])
-    raise FileNotFoundError(f"No mesh for {obj_name}")
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--depth", type=str, default="da3", choices=["da3", "stereo"])
@@ -81,17 +70,16 @@ def main():
                 print(f"Object not found: {user_input}")
                 continue
             current_obj = user_input
-            mesh_path = find_mesh(current_obj)
             if pipeline is None:
                 pipeline = PerceptionPipeline(
                     sam3_hosts=SAM3_HOSTS,
                     fpose_hosts=FPOSE_HOSTS,
-                    mesh_path=mesh_path,
+                    obj_name=current_obj,
                     depth_method=args.depth,
                 )
             else:
-                pipeline.change_object(mesh_path)
-            print(f"Object: {current_obj} ({mesh_path})")
+                pipeline.change_object(current_obj)
+            print(f"Object: {current_obj}")
             continue
 
         # Empty input or path — run perception

@@ -32,7 +32,6 @@ from src.execution.daemon.perception_pipeline import PerceptionPipeline
 
 logging.basicConfig(level=logging.INFO, format='[%(name)s] %(message)s')
 
-MESH_ROOT = os.path.expanduser("~/shared_data/object_6d/data/mesh")
 
 SAM3_HOSTS = [
     ("192.168.0.101", 5001),
@@ -44,19 +43,6 @@ FPOSE_HOSTS = [
     ("192.168.0.105", 5003),
     ("192.168.0.106", 5003),
 ]
-
-
-def find_mesh(obj_name):
-    base = os.path.join(MESH_ROOT, obj_name)
-    for name in [f"{obj_name}.obj", "simplified.obj", "coacd.obj"]:
-        p = os.path.join(base, name)
-        if os.path.exists(p):
-            return p
-    import glob
-    objs = glob.glob(os.path.join(base, "*.obj"))
-    if objs:
-        return objs[0]
-    raise FileNotFoundError(f"No mesh for {obj_name}")
 
 
 def find_planning_mesh(obj_name):
@@ -176,12 +162,10 @@ def main():
     rcc = remote_camera_controller("test_lookup_obstacle")
 
     # ── 1. Perception pipeline init ──────────────────────────────────────
-    mesh_path = find_mesh(obj_name)
-    print(f"Initializing perception pipeline (mesh={mesh_path}, depth={args.depth})...")
+    print(f"Initializing perception pipeline (obj={obj_name}, depth={args.depth})...")
     pipeline = PerceptionPipeline(
         sam3_hosts=SAM3_HOSTS,
         fpose_hosts=FPOSE_HOSTS,
-        mesh_path=mesh_path,
         obj_name=obj_name,
         depth_method=args.depth,
     )

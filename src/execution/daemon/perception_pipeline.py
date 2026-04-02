@@ -12,11 +12,12 @@ Usage:
     pipeline = PerceptionPipeline(
         sam3_hosts=[("192.168.0.102", 5001), ("192.168.0.103", 5001), ("192.168.0.104", 5001)],
         fpose_hosts=[("192.168.0.104", 5003), ("192.168.0.105", 5003), ("192.168.0.106", 5003)],
-        mesh_path="/path/to/mesh.obj",
+        obj_name="attached_container",
     )
     pose_world = pipeline.run(capture_dir="/path/to/episode")
 """
 import json
+import os
 import sys
 import time
 import logging
@@ -29,6 +30,16 @@ import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
+
+MESH_ROOT = os.path.expanduser("~/shared_data/object_6d/data/mesh")
+
+def _find_mesh(obj_name: str) -> str | None:
+    """Resolve obj_name to mesh path."""
+    for name in [f"{obj_name}.obj", "simplified.obj", "coacd.obj"]:
+        p = os.path.join(MESH_ROOT, obj_name, name)
+        if os.path.exists(p):
+            return p
+    return None
 
 
 class ZMQClient:
@@ -74,15 +85,16 @@ class PerceptionPipeline:
         self,
         sam3_hosts: List[Tuple[str, int]],
         fpose_hosts: List[Tuple[str, int]],
-        mesh_path: str,
-        obj_name: str = None,
+        obj_name: str,
         depth_method: str = "da3",  # "da3" or "stereo"
         device: str = "cuda",
     ):
         self.sam3_clients = [ZMQClient(h, p) for h, p in sam3_hosts]
         self.fpose_clients = [ZMQClient(h, p) for h, p in fpose_hosts]
-        self.mesh_path = mesh_path
         self.obj_name = obj_name
+        self.mesh_path = _find_mesh(obj_name)
+        if not self.mesh_path:
+            raise FileNotFoundError(f"Mesh not found for {obj_name} in {MESH_ROOT}")
         self.depth_method = depth_method
         self.device = device
 
@@ -611,20 +623,19 @@ class PerceptionPipeline:
             logger.info(f"Pose overlay: {len(overlays)} views -> {overlay_dir}")
 
     def _send_mesh_to_daemons(self):
-        """Send obj_name (preferred) or mesh_path to FPose daemons."""
+        """Send obj_name to FPose daemons."""
         for client in self.fpose_clients:
             try:
-                if self.obj_name:
-                    client.request({"command": "reset_mesh", "obj_name": self.obj_name})
-                else:
-                    client.request({"command": "reset_mesh", "mesh_path": self.mesh_path})
+                client.request({"command": "reset_mesh", "obj_name": self.obj_name})
             except Exception as e:
                 logger.warning(f"Failed to send mesh to FPose daemon: {e}")
 
-    def change_object(self, mesh_path: str, obj_name: str = None):
+    def change_object(self, obj_name: str):
         """Change target object."""
-        self.mesh_path = mesh_path
         self.obj_name = obj_name
+        self.mesh_path = _find_mesh(obj_name)
+        if not self.mesh_path:
+            raise FileNotFoundError(f"Mesh not found for {obj_name} in {MESH_ROOT}")
         self._sil_optimizer = None
         self._send_mesh_to_daemons()
 

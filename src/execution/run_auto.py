@@ -37,8 +37,6 @@ from src.execution.daemon.perception_pipeline import PerceptionPipeline
 
 logging.basicConfig(level=logging.INFO, format='[%(name)s] %(message)s')
 
-MESH_ROOT = os.path.expanduser("~/shared_data/object_6d/data/mesh")
-
 SAM3_HOSTS = [
     ("192.168.0.101", 5001),
     ("192.168.0.102", 5001),
@@ -50,17 +48,7 @@ FPOSE_HOSTS = [
     ("192.168.0.106", 5003),
 ]
 
-def find_mesh(obj_name):
-    base = os.path.join(MESH_ROOT, obj_name)
-    for name in [f"{obj_name}.obj", "simplified.obj", "coacd.obj"]:
-        p = os.path.join(base, name)
-        if os.path.exists(p):
-            return p
-    import glob
-    objs = glob.glob(os.path.join(base, "*.obj"))
-    if objs:
-        return objs[0]
-    raise FileNotFoundError(f"No mesh for {obj_name}")
+
 
 
 def find_planning_mesh(obj_name):
@@ -381,12 +369,10 @@ def main():
     timestamp_monitor = TimestampMonitor(**network_info["timestamp"]["param"])
 
     # Perception pipeline init (distributed daemons)
-    mesh_path = find_mesh(args.obj)
-    print(f"Initializing perception pipeline (mesh={mesh_path}, depth={args.depth})...")
+    print(f"Initializing perception pipeline (obj={args.obj}, depth={args.depth})...")
     pipeline = PerceptionPipeline(
         sam3_hosts=SAM3_HOSTS,
         fpose_hosts=FPOSE_HOSTS,
-        mesh_path=mesh_path,
         obj_name=args.obj,
         depth_method=args.depth,
     )
