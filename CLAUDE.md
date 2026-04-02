@@ -382,6 +382,75 @@ python src/grasp_generation/order/compute_order.py --hand inspire --version v3
 
 Output: `~/AutoDex/candidates/{hand}/v3_order/{obj}/setcover_order.json`
 
+## Execution Pipeline (`src/execution/`)
+
+### run_auto.py — Automated grasp evaluation loop
+
+```bash
+# Basic (table, all candidates)
+python src/execution/run_auto.py --obj wood_organizer
+
+# Success-only candidates (retest proven grasps)
+python src/execution/run_auto.py --obj brown_ramen --success_only
+
+# Scene modes
+python src/execution/run_auto.py --obj brown_ramen --scene wall --wall_angle 0 --wall_gap 0.04 --success_only
+python src/execution/run_auto.py --obj brown_ramen --scene shelf --success_only
+python src/execution/run_auto.py --obj brown_ramen --scene cluttered --clutter_seed 42 --clutter_min_dist 0.12 --success_only
+python src/execution/run_auto.py --obj brown_ramen --viz  # launch viser visualizer
+```
+
+### run_debug.py — Manual step-through with GUI controller
+
+```bash
+python src/execution/run_debug.py --obj wood_organizer
+```
+
+### Key Design Decisions
+
+- **Candidate result tracking**: `result.json` saved in candidate dir (`candidates/allegro/selected_100/{obj}/{scene}/{id}/{grasp}/`). `load_candidate` skips candidates with existing results (table mode). Other scenes (`--success_only`, wall, shelf, cluttered) don't skip/save to candidates.
+- **Cylinder symmetry**: Objects with y-axis symmetry (defined in `CYLINDER_OBJECTS` list: pepper_tuna, pepper_tuna_light, pepsi, pepsi_light) get their rotation snapped to the tabletop pose whose y-axis direction best matches the estimated pose. Only rotmat is replaced, translation preserved. Tabletop poses at `{obj_path}/{obj}/processed_data/info/tabletop/*.npy`. NOTE: cylinder snap had multiple bugs (wrong frame, wrong tabletop selection causing standing→lying). Some early cylinder experiments (pepper_tuna, pepper_tuna_light success_only) may have bad data from buggy snap.
+- **Table surface snap**: `_snap_z_to_table` ensures mesh bottom ≥ TABLE_SURFACE_Z (0.039m). Prevents hand from going below table. NOTE: changed from 0.037→0.043→0.045→0.042→0.039 on 2026-03-27. Higher values caused planning failures (too much lift), lower values caused table scratching. 0.039 works well — revisit if issues recur.
+- **Lift speed**: `_move_cartesian` lift uses `vel_scale=1/1.5` (slower than default). Changed 2026-03-30 — default was too fast, causing drops.
+- **Sil loss threshold**: Perception returns None if silhouette matching loss > 0.003 (unreliable pose).
+- **IK retract_config**: IK solver uses `retract_config=INIT_STATE` so joint solutions stay near start configuration. Fixes joint 6 wrapping issue (IK returning values in [-2π, 2π]).
+
+### Experiment Storage Layout
+
+```
+~/shared_data/AutoDex/experiment/{exp_name}/
+├── allegro/{obj}/{timestamp}/              # table (default)
+├── success_only/allegro/{obj}/{timestamp}/ # --success_only
+├── wall/allegro/{obj}/{timestamp}/         # --scene wall
+├── wall_success_only/allegro/{obj}/{timestamp}/
+├── shelf/allegro/{obj}/{timestamp}/
+├── shelf_success_only/allegro/{obj}/{timestamp}/
+├── cluttered/allegro/{obj}/{timestamp}/
+└── cluttered_success_only/allegro/{obj}/{timestamp}/
+```
+
+Each experiment dir contains: `raw/`, `images/`, `cam_param/`, `pose_world.npy`, `pose_overlay/`, `plan/`, `result.json`.
+
+### Scene Obstacles (`autodex/planner/obstacles.py`)
+
+- **table**: Table cuboid only
+- **wall**: Single wall around object. `--wall_gap` (meters), `--wall_angle` (degrees, 0=+y)
+- **shelf**: Open-front shelf. `--shelf_width/depth/height/gap`, `--no_shelf_back/sides/top`
+- **cluttered**: Random cubes. `--clutter_seed`, `--clutter_n`, `--clutter_min_dist/max_dist`
+
+### Known Issues / Fixes Applied
+
+- **URDF joint 6 limits**: `xarm_allegro.urdf` has ±2π, real xarm6 is ±π. IK can return values outside ±π. Fixed via `retract_config=INIT_STATE` in IK solver (not URDF change).
+- **Allegro collision sphere**: `spheres/allegro.yml` base_link had radius 0.5 (typo, should be 0.015). Fixed.
+- **moviepy import**: DA3 `gs.py` imports `moviepy.editor` which doesn't exist in moviepy 2.x. Fixed with try/except.
+- **PySpin version**: Must match Spinnaker SDK version (4.3.0.189). PySpin 4.2 causes symbol errors.
+- **numpy version**: PySpin 4.3 requires numpy<2.
+- **FPose daemon mesh**: Pipeline `__init__` must send mesh/obj_name to FPose daemons. Daemon supports `obj_name` lookup from NAS (`~/shared_data/object_6d/data/mesh/{obj}/`).
+
+### Reference
+
+`~/RSS_2026/planner/inference/train/run_auto_v2.py` is the reference implementation. All execution sequences (init → approach → pregrasp → grasp → squeeze → lift → release) match this reference.
+
 ## Ongoing Refactoring
 
 `src/process/` scripts have heavy code duplication with `autodex/perception/`.

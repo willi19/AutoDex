@@ -23,7 +23,7 @@ def get_object_mesh(obj_name):
     return mesh
 
 
-def load_candidate(obj_name, obj_pose, version, shuffle=True):
+def load_candidate(obj_name, obj_pose, version, shuffle=True, skip_done=True, success_only=False):
     wrist_se3_list = []
     pregrasp_pose_list = []
     grasp_pose_list = []
@@ -53,8 +53,18 @@ def load_candidate(obj_name, obj_pose, version, shuffle=True):
 
             for grasp_idx in grasp_idxs:
                 base = os.path.join(candidate_obj_path, scene_type, scene_id, grasp_idx)
-                # Skip candidates that already have a result
-                if os.path.exists(os.path.join(base, "result.json")):
+                result_path = os.path.join(base, "result.json")
+                has_result = os.path.exists(result_path)
+                # success_only: only load candidates with success=True
+                if success_only:
+                    if not has_result:
+                        continue
+                    import json
+                    with open(result_path) as f:
+                        if not json.load(f).get("success", False):
+                            continue
+                # skip_done: skip candidates that already have a result
+                elif skip_done and has_result:
                     continue
                 pregrasp = np.load(os.path.join(base, "pregrasp_pose.npy"))
                 pregrasp_pose_list.append(pregrasp)

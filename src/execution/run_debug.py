@@ -69,8 +69,80 @@ def find_planning_mesh(obj_name):
     raise FileNotFoundError(f"No planning mesh for {obj_name}")
 
 
+TABLE_SURFACE_Z = -0.1 + 0.039 + 0.1  # 0.039
+
+CYLINDER_OBJECTS = [
+    "pepper_tuna", "pepper_tuna_light", "pepsi", "pepsi_light",
+]
+
+def _snap_z_to_table(pose_robot, mesh_path):
+    """Ensure mesh bottom doesn't go below table surface."""
+    import trimesh
+
+    mesh = trimesh.load(mesh_path, process=False)
+    if isinstance(mesh, trimesh.Scene):
+        mesh = mesh.dump(concatenate=True)
+    verts = np.asarray(mesh.vertices)
+    verts_h = np.hstack([verts, np.ones((len(verts), 1))])
+    verts_robot = (pose_robot @ verts_h.T).T[:, :3]
+    bottom_z = verts_robot[:, 2].min()
+
+    if bottom_z < TABLE_SURFACE_Z:
+        delta = TABLE_SURFACE_Z - bottom_z
+        print(f"    [snap] Object bottom {bottom_z:.4f} < table {TABLE_SURFACE_Z:.4f}, raising by {delta:.4f}m")
+        pose_robot = pose_robot.copy()
+        pose_robot[2, 3] += delta
+
+    return pose_robot
+
+
+def _snap_cylinder_pose(pose_robot, obj_name):
+    """For y-axis symmetric objects, snap rotation to nearest tabletop pose."""
+    import glob
+
+    tabletop_dir = os.path.join(obj_path, obj_name, "processed_data", "info", "tabletop")
+    if not os.path.isdir(tabletop_dir):
+        return pose_robot
+
+    tabletop_files = sorted(glob.glob(os.path.join(tabletop_dir, "*.npy")))
+    if not tabletop_files:
+        return pose_robot
+
+    R_est = pose_robot[:3, :3]
+    y_est = R_est @ np.array([0, 1, 0])
+
+    best_diff = float("inf")
+    best_R_tab = R_est
+
+    for tf in tabletop_files:
+        R_tab = np.load(tf)[:3, :3]
+        y_tab_z = R_tab[2, 1]
+        diff = np.abs(np.abs(y_est[2]) - np.abs(y_tab_z))
+        if diff < best_diff:
+            best_diff = diff
+            best_R_tab = R_tab.copy()
+            if y_est[2] * y_tab_z < 0:
+                best_R_tab = best_R_tab @ np.diag([1, -1, -1]).astype(float)
+
+    y_tab = best_R_tab[:, 1]
+    phi = np.arctan2(y_est[1], y_est[0]) - np.arctan2(y_tab[1], y_tab[0])
+    c, s = np.cos(phi), np.sin(phi)
+    R_z = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+    best_R = R_z @ best_R_tab
+
+    print(f"    [cylinder] Snapped (y-z diff={best_diff:.3f}, z-rot={np.degrees(phi):.1f}deg)")
+    pose_robot = pose_robot.copy()
+    pose_robot[:3, :3] = best_R
+
+    return pose_robot
+
+
 def pose_world_to_scene_cfg(pose_world, c2r, obj_name):
     pose_robot = np.linalg.inv(c2r) @ pose_world
+    mesh_path = find_planning_mesh(obj_name)
+    if obj_name in CYLINDER_OBJECTS:
+        pose_robot = _snap_cylinder_pose(pose_robot, obj_name)
+    pose_robot = _snap_z_to_table(pose_robot, mesh_path)
     return {
         "mesh": {
             "target": {

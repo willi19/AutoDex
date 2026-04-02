@@ -90,14 +90,15 @@ class RealExecutor:
         self.hand.move(target)
         time.sleep(self.dt)
 
-    def _move_cartesian(self, target_pose, threshold_t=0.002, threshold_r=0.02):
+    def _move_cartesian(self, target_pose, threshold_t=0.002, threshold_r=0.02, vel_scale=1.0):
         target_rot = Rotation.from_matrix(target_pose[:3, :3])
         for _ in range(500):
             cur = self.arm.get_data()["position"].copy()
             t_delta = target_pose[:3, 3] - cur[:3, 3]
             t_dist = np.linalg.norm(t_delta)
-            if t_dist > self.cart_vel_limit:
-                t_delta = t_delta / t_dist * self.cart_vel_limit
+            vel = self.cart_vel_limit * vel_scale
+            if t_dist > vel:
+                t_delta = t_delta / t_dist * vel
             cur[:3, 3] += t_delta
             cur_rot = Rotation.from_matrix(cur[:3, :3])
             r_delta = (target_rot * cur_rot.inv()).as_rotvec()
@@ -193,7 +194,7 @@ class RealExecutor:
         self._log_state("lift")
         lift_pose = wrist_ee.copy()
         lift_pose[2, 3] += lift_height
-        self._move_cartesian(lift_pose)
+        self._move_cartesian(lift_pose, vel_scale=1/1.5)
 
         self._log_state("done")
         return s_hand

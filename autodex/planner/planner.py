@@ -122,8 +122,8 @@ class GraspPlanner:
         self._plan_cfg = MotionGenPlanConfig(
             enable_graph=True,
             enable_opt=True,
-            enable_graph_attempt=2,
-            max_attempts=10,
+            enable_graph_attempt=4,
+            max_attempts=20,
             enable_finetune_trajopt=True,
             num_trajopt_seeds=32,
             num_ik_seeds=32,
@@ -162,7 +162,10 @@ class GraspPlanner:
 
         q_t = torch.tensor(q, dtype=torch.float32, device=self._tensor_args.device)
         d_world, d_self = rw.get_world_self_collision_distance_from_joints(q_t)
-        return torch.logical_or(d_world > 0, d_self > 0).cpu().numpy()
+        world_coll = (d_world > 0).cpu().numpy()
+        self_coll = (d_self > 0).cpu().numpy()
+        print(f"[collision] world={world_coll.sum()} self={self_coll.sum()} / {len(world_coll)}")
+        return world_coll | self_coll
 
     # ── IK solver ─────────────────────────────────────────────────────────────
 
@@ -211,7 +214,7 @@ class GraspPlanner:
 
         # Filter: backward + hand-table collision (no object mesh — hand should be near object)
         t0 = _time.time()
-        backward = wrist_se3[:, 0, 2] < 0.3
+        backward = wrist_se3[:, 0, 2] < 0.0
         collision = self._check_collision(world_cfg_no_target, wrist_se3, pregrasp)
         filtered = backward | collision
         valid = np.where(~filtered)[0]
@@ -335,7 +338,7 @@ class GraspPlanner:
 
         t0 = _time.time()
         collision = self._check_collision(world_cfg, wrist_se3, pregrasp)
-        backward = wrist_se3[:, 0, 2] < 0.3
+        backward = wrist_se3[:, 0, 2] < 0.0
         valid = np.where(~(collision | backward))[0]
         timing["collision_check_s"] = round(_time.time() - t0, 3)
 
@@ -392,7 +395,8 @@ class GraspPlanner:
 
     # ── public API ────────────────────────────────────────────────────────────
 
-    def get_candidates(self, scene_cfg: dict, obj_name: str, grasp_version: str):
+    def get_candidates(self, scene_cfg: dict, obj_name: str, grasp_version: str,
+                        success_only: bool = False, skip_done: bool = False):
         """
         Return all grasp candidates with collision filter applied (no motion planning).
 
@@ -403,7 +407,8 @@ class GraspPlanner:
             collision  (N,) bool  — True if filtered out (collision OR backward)
         """
         obj_pose = cart2se3(scene_cfg["mesh"]["target"]["pose"])
-        wrist_se3, pregrasp, grasp, _ = load_candidate(obj_name, obj_pose, grasp_version)
+        wrist_se3, pregrasp, grasp, _ = load_candidate(obj_name, obj_pose, grasp_version,
+                                                         skip_done=skip_done, success_only=success_only)
 
         world_cfg = _to_curobo_world(scene_cfg)
         if self._motion_gen is None:
@@ -412,7 +417,7 @@ class GraspPlanner:
             self._update_world(world_cfg)
 
         collision = self._check_collision(world_cfg, wrist_se3, pregrasp)
-        backward  = wrist_se3[:, 0, 2] < 0.3
+        backward  = np.zeros(len(wrist_se3), dtype=bool)
         filtered  = collision | backward
         print(f"[planner] total={len(wrist_se3)}  collision={collision.sum()}  backward={backward.sum()}  valid={(~filtered).sum()}")
         return wrist_se3, pregrasp, grasp, filtered
@@ -452,7 +457,7 @@ class GraspPlanner:
         t0 = _time.time()
         N = len(wrist_se3)
         collision = self._check_collision(world_cfg, wrist_se3, pregrasp)
-        backward = wrist_se3[:, 0, 2] < 0.3
+        backward = wrist_se3[:, 0, 2] < 0.0
         filtered = collision | backward
         valid = np.where(~filtered)[0]
         print(f"[planner] collision check: {_time.time() - t0:.2f}s")
@@ -511,7 +516,8 @@ class GraspPlanner:
         return wrist_se3, pregrasp, grasp, succ_mask, filtered, traj_list
 
     def plan(self, scene_cfg: dict, obj_name: str, grasp_version: str,
-             mode: str = "batch", seed: Optional[int] = None) -> PlanResult:
+             mode: str = "batch", seed: Optional[int] = None,
+             skip_done: bool = True, success_only: bool = False) -> PlanResult:
         import time as _time
 
         if seed is not None:
@@ -521,8 +527,16 @@ class GraspPlanner:
         # 1. Load candidates
         t0 = _time.time()
         obj_pose = cart2se3(scene_cfg["mesh"]["target"]["pose"])
-        wrist_se3, pregrasp, grasp, scene_info = load_candidate(obj_name, obj_pose, grasp_version)
+        wrist_se3, pregrasp, grasp, scene_info = load_candidate(obj_name, obj_pose, grasp_version, skip_done=skip_done, success_only=success_only)
         t_load = _time.time() - t0
+
+        if len(wrist_se3) == 0:
+            print(f"[planner] No candidates available (all done or no success)")
+            return PlanResult(
+                success=False, traj=None, wrist_se3=None,
+                pregrasp_pose=None, grasp_pose=None, scene_info=[],
+                timing={"load_candidates_s": round(t_load, 3), "n_total": 0},
+            )
 
         # 2. World setup (motion_gen for trajectory, ik_solver for IK)
         t0 = _time.time()
@@ -541,7 +555,8 @@ class GraspPlanner:
 
         # 3. Filter: backward + hand-table collision
         t0 = _time.time()
-        backward = wrist_se3[:, 0, 2] < 0.3
+        backward = wrist_se3[:, 0, 2] < 0.0
+        print(f"[backward] wrist x-axis z: {wrist_se3[:, 0, 2]}")
         collision = self._check_collision(world_cfg_no_target, wrist_se3, pregrasp)
         valid = np.where(~(backward | collision))[0]
         t_filter = _time.time() - t0
@@ -625,12 +640,14 @@ class GraspPlanner:
                   f"{'ok' if ok else 'fail'} ({_time.time() - t1:.2f}s)")
             if ok:
                 t_plan = _time.time() - t0
+                print(f"[planner] Selected candidate #{idx}/{N}")
                 return PlanResult(
                     success=True, traj=traj, wrist_se3=wrist_se3[idx],
                     pregrasp_pose=pregrasp[idx], grasp_pose=grasp[idx],
                     scene_info=scene_info[idx],
                     timing={**base_timing, "plan_single_js_s": round(t_plan, 3),
-                            "n_plan_attempts": n_attempts},
+                            "n_plan_attempts": n_attempts,
+                            "candidate_idx": int(idx)},
                 )
 
         t_plan = _time.time() - t0

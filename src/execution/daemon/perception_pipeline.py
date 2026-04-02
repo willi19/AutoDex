@@ -202,32 +202,31 @@ class PerceptionPipeline:
         n_masks = sum(1 for v in masks.values() if v)
         logger.info(f"SAM3: {n_masks}/{len(serials)} masks in {t_sam3:.2f}s")
 
-        # Save mask overlay
-        mask_vis_dir = work_dir / "mask_vis"
-        mask_vis_dir.mkdir(exist_ok=True)
-        mask_overlays = []
-        for s in serials:
-            img_path = img_dir / f"{s}.png"
-            msk_path = mask_dir / f"{s}.png"
-            if not msk_path.exists():
-                continue
-            img = cv2.imread(str(img_path))
-            msk = cv2.imread(str(msk_path), cv2.IMREAD_GRAYSCALE)
-            if img is None or msk is None:
-                continue
-            overlay = img.copy()
-            overlay[msk > 127] = (overlay[msk > 127] * 0.5 + np.array([0, 0, 255]) * 0.5).astype(np.uint8)
-            cv2.imwrite(str(mask_vis_dir / f"{s}.png"), overlay)
-            mask_overlays.append(cv2.resize(overlay, (W // 2, H // 2)))
-        if mask_overlays:
-            n_cols = 4
-            n_rows = (len(mask_overlays) + n_cols - 1) // n_cols
-            h, w = mask_overlays[0].shape[:2]
-            grid = np.zeros((n_rows * h, n_cols * w, 3), dtype=np.uint8)
-            for i, ov in enumerate(mask_overlays):
-                r, c = i // n_cols, i % n_cols
-                grid[r * h:(r + 1) * h, c * w:(c + 1) * w] = ov
-            cv2.imwrite(str(mask_vis_dir / "grid.png"), grid)
+        # # Save mask overlay (background)
+        # import threading
+        # def _save_mask_overlay():
+        #     mask_vis_dir = work_dir / "mask_vis"
+        #     mask_vis_dir.mkdir(exist_ok=True)
+        #     overlays = []
+        #     for s in serials:
+        #         img = cv2.imread(str(img_dir / f"{s}.png"))
+        #         msk = cv2.imread(str(mask_dir / f"{s}.png"), cv2.IMREAD_GRAYSCALE)
+        #         if img is None or msk is None:
+        #             continue
+        #         ov = img.copy()
+        #         ov[msk > 127] = (ov[msk > 127] * 0.5 + np.array([0, 0, 255]) * 0.5).astype(np.uint8)
+        #         cv2.imwrite(str(mask_vis_dir / f"{s}.png"), ov)
+        #         overlays.append(cv2.resize(ov, (W // 2, H // 2)))
+        #     if overlays:
+        #         n_cols = 4
+        #         n_rows = (len(overlays) + n_cols - 1) // n_cols
+        #         h, w = overlays[0].shape[:2]
+        #         grid = np.zeros((n_rows * h, n_cols * w, 3), dtype=np.uint8)
+        #         for i, o in enumerate(overlays):
+        #             r, c = i // n_cols, i % n_cols
+        #             grid[r*h:(r+1)*h, c*w:(c+1)*w] = o
+        #         cv2.imwrite(str(mask_vis_dir / "grid.png"), grid)
+        # threading.Thread(target=_save_mask_overlay, daemon=True).start()
 
         # ── Step 1.5: Select best 5 views (pre-determined) ──
         best5 = self.BEST_5_DA3 if self.depth_method == "da3" else self.BEST_5_STEREO
@@ -296,7 +295,7 @@ class PerceptionPipeline:
         t_sil = time.perf_counter() - t0
         logger.info(f"Sil matching: {t_sil:.2f}s ({len(views)} views, {sil_iters} iters, loss={sil_loss:.6f})")
 
-        # ── Step 6: Pose overlay visualization (always, even on reject) ──
+        # ── Step 6: Pose overlay visualization ──
         overlay_dir = capture_dir / "pose_overlay"
         overlay_dir.mkdir(exist_ok=True)
         self._save_pose_overlay(
@@ -383,34 +382,39 @@ class PerceptionPipeline:
             d_mm = (d_np * 1000).clip(0, 65535).astype(np.uint16)
             cv2.imwrite(str(depth_dir / f"{s}.png"), d_mm)
 
-        # Save depth colormap overlay
-        depth_vis_dir = depth_dir.parent / "depth_vis"
-        depth_vis_dir.mkdir(exist_ok=True)
-        overlays = []
-        for i, s in enumerate(serials):
-            img = cv2.imread(str(img_dir / f"{s}.png"))
-            d_mm = cv2.imread(str(depth_dir / f"{s}.png"), cv2.IMREAD_UNCHANGED)
-            # Normalize per-image for better contrast
-            valid = d_mm[d_mm > 0]
-            if len(valid) > 0:
-                d_min, d_max = np.percentile(valid, [2, 98])
-            else:
-                d_min, d_max = 0, 3000
-            d_norm = ((d_mm.astype(np.float32) - d_min) / max(d_max - d_min, 1) * 255).clip(0, 255).astype(np.uint8)
-            d_vis = cv2.applyColorMap(d_norm, cv2.COLORMAP_TURBO)
-            blend = cv2.addWeighted(img, 0.5, d_vis, 0.5, 0)
-            cv2.imwrite(str(depth_vis_dir / f"{s}.png"), blend)
-            overlays.append(cv2.resize(blend, (W // 2, H // 2)))
-        if overlays:
-            n_cols = 4
-            n_rows = (len(overlays) + n_cols - 1) // n_cols
-            h, w = overlays[0].shape[:2]
-            grid = np.zeros((n_rows * h, n_cols * w, 3), dtype=np.uint8)
-            for i, ov in enumerate(overlays):
-                r, c = i // n_cols, i % n_cols
-                grid[r * h:(r + 1) * h, c * w:(c + 1) * w] = ov
-            cv2.imwrite(str(depth_vis_dir / "grid.png"), grid)
-            logger.info(f"Depth vis: {len(overlays)} views -> {depth_vis_dir}")
+        # # Save depth colormap overlay (background)
+        # import threading
+        # _serials = list(serials)
+        # _img_dir = img_dir
+        # _depth_dir = depth_dir
+        # _H, _W = H, W
+        # def _save_depth_vis():
+        #     depth_vis_dir = _depth_dir.parent / "depth_vis"
+        #     depth_vis_dir.mkdir(exist_ok=True)
+        #     overlays = []
+        #     for s in _serials:
+        #         img = cv2.imread(str(_img_dir / f"{s}.png"))
+        #         d_mm = cv2.imread(str(_depth_dir / f"{s}.png"), cv2.IMREAD_UNCHANGED)
+        #         valid = d_mm[d_mm > 0]
+        #         if len(valid) > 0:
+        #             d_min, d_max = np.percentile(valid, [2, 98])
+        #         else:
+        #             d_min, d_max = 0, 3000
+        #         d_norm = ((d_mm.astype(np.float32) - d_min) / max(d_max - d_min, 1) * 255).clip(0, 255).astype(np.uint8)
+        #         d_vis = cv2.applyColorMap(d_norm, cv2.COLORMAP_TURBO)
+        #         blend = cv2.addWeighted(img, 0.5, d_vis, 0.5, 0)
+        #         cv2.imwrite(str(depth_vis_dir / f"{s}.png"), blend)
+        #         overlays.append(cv2.resize(blend, (_W // 2, _H // 2)))
+        #     if overlays:
+        #         n_cols = 4
+        #         n_rows = (len(overlays) + n_cols - 1) // n_cols
+        #         h, w = overlays[0].shape[:2]
+        #         grid = np.zeros((n_rows * h, n_cols * w, 3), dtype=np.uint8)
+        #         for i, ov in enumerate(overlays):
+        #             r, c = i // n_cols, i % n_cols
+        #             grid[r * h:(r + 1) * h, c * w:(c + 1) * w] = ov
+        #         cv2.imwrite(str(depth_vis_dir / "grid.png"), grid)
+        # threading.Thread(target=_save_depth_vis, daemon=True).start()
 
         return serials
 
