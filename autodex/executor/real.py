@@ -41,8 +41,35 @@ def _convert_allegro(hand_pose: np.ndarray) -> np.ndarray:
     return out
 
 def _convert_inspire(hand_pose: np.ndarray) -> np.ndarray:
-    """Inspire hand: no reordering needed."""
-    return hand_pose
+    """Convert inspire qpos (radians) to controller action (0-1000).
+
+    qpos order:   [thumb_yaw, thumb_pitch, index, middle, ring, pinky]
+    action order:  [pinky, ring, middle, index, thumb_pitch, thumb_yaw]
+    """
+    limits = np.array([1.15, 0.55, 1.6, 1.6, 1.6, 1.6])
+    if hand_pose.ndim == 1:
+        q = hand_pose[:6]
+        normalized = np.clip(q / limits, 0.0, 1.0)
+        action_float = (1.0 - normalized) * 1000.0
+        action = np.zeros(6, dtype=np.float64)
+        action[0] = np.clip(action_float[5], 0, 1000)  # pinky
+        action[1] = np.clip(action_float[4], 0, 1000)  # ring
+        action[2] = np.clip(action_float[3], 0, 1000)  # middle
+        action[3] = np.clip(action_float[2], 0, 1000)  # index
+        action[4] = np.clip(action_float[1], 0, 1000)  # thumb_pitch
+        action[5] = np.clip(action_float[0], 0, 1000)  # thumb_yaw
+    else:
+        q = hand_pose[:, :6]
+        normalized = np.clip(q / limits, 0.0, 1.0)
+        action_float = (1.0 - normalized) * 1000.0
+        action = np.zeros_like(hand_pose)
+        action[:, 0] = np.clip(action_float[:, 5], 0, 1000)
+        action[:, 1] = np.clip(action_float[:, 4], 0, 1000)
+        action[:, 2] = np.clip(action_float[:, 3], 0, 1000)
+        action[:, 3] = np.clip(action_float[:, 2], 0, 1000)
+        action[:, 4] = np.clip(action_float[:, 1], 0, 1000)
+        action[:, 5] = np.clip(action_float[:, 0], 0, 1000)
+    return action
 
 HAND_CONFIG = {
     "allegro": {
