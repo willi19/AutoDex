@@ -38,47 +38,62 @@ def get_table_obstacles(obj_pose):
     return {"table": TABLE_CUBOID}
 
 
-def get_wall_obstacles(obj_pose, wall_distance=0.12, wall_thickness=0.02,
-                       wall_width=0.5, wall_height=0.4):
-    """Vertical wall behind the object (positive y direction in robot frame).
+def get_wall_obstacles(obj_pose, wall_gap=0.04, wall_angle=0.0,
+                       wall_thickness=0.02, wall_width=0.5, wall_height=0.4):
+    """Wall placed around object, rotated by wall_angle around object center.
+
+    wall_angle=0: wall behind (+y), 90: right (+x), 180: front (-y), 270: left (-x).
 
     Args:
         obj_pose: (4,4) SE3 in robot frame
-        wall_distance: distance from object center to wall front face
+        wall_gap: distance from object center to wall front face (meters)
+        wall_angle: rotation angle (degrees) around object z-axis. 0=+y.
         wall_thickness: wall thickness
-        wall_width: wall extent along x
+        wall_width: wall extent (tangent direction)
         wall_height: wall extent along z
     """
     obj_xyz = obj_pose[:3, 3]
     table_z = TABLE_CUBOID["pose"][2] + TABLE_CUBOID["dims"][2] / 2
 
+    angle_rad = np.radians(wall_angle)
+    # Direction from object center to wall center
+    dx = -np.sin(angle_rad)
+    dy = np.cos(angle_rad)
+    dist = wall_gap + wall_thickness / 2
+
     wall_center = [
-        float(obj_xyz[0]),
-        float(obj_xyz[1] + wall_distance + wall_thickness / 2),
+        float(obj_xyz[0] + dx * dist),
+        float(obj_xyz[1] + dy * dist),
         float(table_z + wall_height / 2),
     ]
 
+    # Wall orientation: normal faces toward object
+    wall_quat = _quat_from_euler(yaw=angle_rad)
+
     return {
         "table": TABLE_CUBOID,
-        "wall_back": {
+        "wall": {
             "dims": [wall_width, wall_thickness, wall_height],
-            "pose": wall_center + _quat_identity(),
+            "pose": wall_center + wall_quat,
         },
     }
 
 
 def get_shelf_obstacles(obj_pose, shelf_width=0.30, shelf_depth=0.30,
-                        shelf_height=0.30, thickness=0.01):
-    """Open-front shelf (5 panels: back, left, right, top, bottom).
-
-    The shelf is centered on the object, open toward the robot (negative y).
+                        shelf_height=0.30, shelf_gap=0.02, thickness=0.01,
+                        back=True, sides=True, top=True, shelf_angle=0.0):
+    """Shelf around object with selectable panels.
 
     Args:
         obj_pose: (4,4) SE3 in robot frame
         shelf_width: inner width (x direction)
         shelf_depth: inner depth (y direction)
         shelf_height: inner height (z direction)
+        shelf_gap: gap between object and shelf walls
         thickness: panel thickness
+        back: include back wall
+        sides: include left+right walls
+        top: include top panel
     """
     obj_xyz = obj_pose[:3, 3]
     table_z = TABLE_CUBOID["pose"][2] + TABLE_CUBOID["dims"][2] / 2
@@ -89,36 +104,39 @@ def get_shelf_obstacles(obj_pose, shelf_width=0.30, shelf_depth=0.30,
 
     hw = shelf_width / 2
     hd = shelf_depth / 2
-    hh = shelf_height / 2
+    angle_rad = np.radians(shelf_angle)
+
+    def _rotate_xy(dx, dy):
+        """Rotate (dx, dy) offset around object center by shelf_angle."""
+        c, s = np.cos(angle_rad), np.sin(angle_rad)
+        return cx + c * dx - s * dy, cy + s * dx + c * dy
 
     cuboids = {"table": TABLE_CUBOID}
+    quat = _quat_from_euler(yaw=angle_rad)
 
-    # Back wall
-    cuboids["shelf_back"] = {
-        "dims": [shelf_width + 2 * thickness, thickness, shelf_height],
-        "pose": [cx, cy + hd + thickness / 2, cz] + _quat_identity(),
-    }
-    # Left wall
-    cuboids["shelf_left"] = {
-        "dims": [thickness, shelf_depth, shelf_height],
-        "pose": [cx - hw - thickness / 2, cy, cz] + _quat_identity(),
-    }
-    # Right wall
-    cuboids["shelf_right"] = {
-        "dims": [thickness, shelf_depth, shelf_height],
-        "pose": [cx + hw + thickness / 2, cy, cz] + _quat_identity(),
-    }
-    # Top
-    cuboids["shelf_top"] = {
-        "dims": [shelf_width + 2 * thickness, shelf_depth + thickness, thickness],
-        "pose": [cx, cy + thickness / 2, cz + hh + thickness / 2] + _quat_identity(),
-    }
-    # Bottom
-    cuboids["shelf_bottom"] = {
-        "dims": [shelf_width + 2 * thickness, shelf_depth + thickness, thickness],
-        "pose": [cx, cy + thickness / 2, table_z + thickness / 2] + _quat_identity(),
-    }
-
+    if back:
+        bx, by = _rotate_xy(0, hd + shelf_gap + thickness / 2)
+        cuboids["shelf_back"] = {
+            "dims": [shelf_width + 2 * thickness, thickness, shelf_height],
+            "pose": [bx, by, cz] + quat,
+        }
+    if sides:
+        lx, ly = _rotate_xy(-hw - shelf_gap - thickness / 2, 0)
+        cuboids["shelf_left"] = {
+            "dims": [thickness, shelf_depth, shelf_height],
+            "pose": [lx, ly, cz] + quat,
+        }
+        rx, ry = _rotate_xy(hw + shelf_gap + thickness / 2, 0)
+        cuboids["shelf_right"] = {
+            "dims": [thickness, shelf_depth, shelf_height],
+            "pose": [rx, ry, cz] + quat,
+        }
+    if top:
+        tx, ty = _rotate_xy(0, thickness / 2)
+        cuboids["shelf_top"] = {
+            "dims": [shelf_width + 2 * thickness, shelf_depth + thickness, thickness],
+            "pose": [tx, ty, cz + shelf_height / 2 + shelf_gap + thickness / 2] + quat,
+        }
     return cuboids
 
 
@@ -184,13 +202,18 @@ SCENE_TYPES = {
 }
 
 
-def add_obstacles(scene_cfg, scene_type, seed=None):
+def add_obstacles(scene_cfg, scene_type, seed=None, wall_gap=0.04, wall_angle=0.0,
+                  clutter_min_dist=0.12, clutter_max_dist=0.20, clutter_n=4,
+                  shelf_width=0.30, shelf_depth=0.30, shelf_height=0.30, shelf_gap=0.02,
+                  shelf_back=True, shelf_sides=True, shelf_top=True):
     """Add virtual obstacles to scene_cfg based on scene type.
 
     Args:
         scene_cfg: dict with "mesh" and "cuboid" keys
         scene_type: one of "table", "wall", "shelf", "cluttered"
         seed: random seed (only used for "cluttered")
+        wall_gap: distance from object center to wall (only for "wall")
+        wall_angle: wall rotation around object in degrees (only for "wall")
 
     Returns:
         scene_cfg with updated "cuboid" dict
@@ -205,7 +228,14 @@ def add_obstacles(scene_cfg, scene_type, seed=None):
     obj_pose = cart2se3(obj_pose_7d)
 
     if scene_type == "cluttered":
-        cuboids = get_cluttered_obstacles(obj_pose, seed=seed)
+        cuboids = get_cluttered_obstacles(obj_pose, seed=seed, n_obstacles=clutter_n, min_dist=clutter_min_dist, max_dist=clutter_max_dist)
+    elif scene_type == "wall":
+        cuboids = get_wall_obstacles(obj_pose, wall_gap=wall_gap, wall_angle=wall_angle)
+    elif scene_type == "shelf":
+        cuboids = get_shelf_obstacles(obj_pose, shelf_width=shelf_width, shelf_depth=shelf_depth,
+                                      shelf_height=shelf_height, shelf_gap=shelf_gap,
+                                      back=shelf_back, sides=shelf_sides, top=shelf_top,
+                                      shelf_angle=wall_angle)
     else:
         cuboids = SCENE_TYPES[scene_type](obj_pose)
 

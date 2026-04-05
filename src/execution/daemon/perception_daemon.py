@@ -17,6 +17,7 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -91,12 +92,31 @@ def run_sam3_daemon(port: int, gpu: int = 0):
     ctx.term()
 
 
-def run_fpose_daemon(port: int, mesh_path: str, gpu: int = 0):
+MESH_ROOT = os.path.expanduser("~/shared_data/object_6d/data/mesh")
+
+def _find_mesh(obj_name: str):
+    """Resolve obj_name to mesh path under MESH_ROOT."""
+    for name in [f"{obj_name}.obj", "simplified.obj", "coacd.obj"]:
+        p = os.path.join(MESH_ROOT, obj_name, name)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def run_fpose_daemon(port: int, obj_name: str = None, gpu: int = 0):
     """FoundationPose daemon. Receives image/depth/mask paths, returns pose."""
-    logger.info(f"Loading FoundationPose on GPU {gpu}...")
     from autodex.perception import PoseTracker
-    tracker = PoseTracker(mesh_path, device_id=gpu)
-    logger.info("FPose loaded")
+    tracker = None
+    if obj_name:
+        mesh_path = _find_mesh(obj_name)
+        if mesh_path:
+            logger.info(f"Loading FoundationPose on GPU {gpu} with {mesh_path}...")
+            tracker = PoseTracker(mesh_path, device_id=gpu)
+            logger.info("FPose loaded")
+        else:
+            logger.warning(f"Mesh not found for {obj_name}, waiting for reset_mesh")
+    else:
+        logger.info(f"FPose daemon starting on GPU {gpu} (no obj — waiting for reset_mesh)")
 
     ctx = zmq.Context()
     sock = ctx.socket(zmq.REP)
@@ -113,10 +133,22 @@ def run_fpose_daemon(port: int, mesh_path: str, gpu: int = 0):
                 continue
 
             if req.get("command") == "reset_mesh":
-                new_mesh = _localize_path(req["mesh_path"])
-                tracker = PoseTracker(new_mesh, device_id=gpu)
-                logger.info(f"Mesh reset to {new_mesh}")
-                sock.send_string(json.dumps({"status": "ok"}))
+                new_mesh = None
+                if "obj_name" in req:
+                    new_mesh = _find_mesh(req["obj_name"])
+                elif "mesh_path" in req:
+                    new_mesh = _localize_path(req["mesh_path"])
+                if new_mesh and os.path.exists(new_mesh):
+                    tracker = PoseTracker(new_mesh, device_id=gpu)
+                    logger.info(f"Mesh reset to {new_mesh}")
+                    sock.send_string(json.dumps({"status": "ok"}))
+                else:
+                    logger.error(f"Mesh not found: {req}")
+                    sock.send_string(json.dumps({"status": "error", "msg": "mesh not found"}))
+                continue
+
+            if tracker is None:
+                sock.send_string(json.dumps({"status": "error", "msg": "no mesh loaded — send reset_mesh first"}))
                 continue
 
             image_path = _localize_path(req["image_path"])
@@ -184,15 +216,13 @@ def main():
     parser.add_argument("--model", type=str, required=True, choices=["sam3", "fpose"])
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--gpu", type=int, default=0)
-    parser.add_argument("--mesh", type=str, default=None, help="Mesh path (fpose only)")
+    parser.add_argument("--obj", type=str, default=None, help="Object name (fpose only, optional)")
     args = parser.parse_args()
 
     if args.model == "sam3":
         run_sam3_daemon(args.port, args.gpu)
     elif args.model == "fpose":
-        if not args.mesh:
-            parser.error("--mesh required for fpose")
-        run_fpose_daemon(args.port, args.mesh, args.gpu)
+        run_fpose_daemon(args.port, args.obj, args.gpu)
 
 
 if __name__ == "__main__":

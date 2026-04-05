@@ -5,21 +5,30 @@ Two modes:
     - "auto" (default): autonomous trajectory execution (no GUI)
     - "gui":  interactive Tkinter GUI with manual control
 
+Execution sequence (matches RSS2026 reference: planner/inference/train/run_auto_v2.py):
+    execute:  init(joint0) -> approach(traj) -> pregrasp -> grasp -> squeeze -> lift
+    release:  reverse_squeeze -> grasp -> pregrasp -> allegro_init -> arm_return
+
 Usage:
     executor = RealExecutor(mode="auto")
     executor.execute(plan_result)
     executor.release(plan_result)
     executor.shutdown()
 """
+import datetime
 import time
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 from autodex.planner import PlanResult
-from autodex.utils.robot_config import XARM_INIT, ALLEGRO_INIT, LINK6_TO_WRIST
+from autodex.utils.robot_config import (
+    XARM_INIT, XARM_INSPIRE_INIT,
+    ALLEGRO_INIT, ALLEGRO_LINK6_TO_WRIST,
+    INSPIRE_INIT, INSPIRE_LINK6_TO_WRIST,
+)
 
-
-def _convert_hand_pose(hand_pose: np.ndarray) -> np.ndarray:
+# Per-hand config: (init_joints, link6_to_wrist, convert_fn)
+def _convert_allegro(hand_pose: np.ndarray) -> np.ndarray:
     """Reorder Allegro joints: move last 4 (thumb) to front."""
     if hand_pose.ndim == 1:
         out = hand_pose.copy()
@@ -31,19 +40,54 @@ def _convert_hand_pose(hand_pose: np.ndarray) -> np.ndarray:
         out[:, 4:] = hand_pose[:, :12]
     return out
 
+def _convert_inspire(hand_pose: np.ndarray) -> np.ndarray:
+    """Convert inspire qpos (radians) to controller action (0-1000).
+
+    qpos order:   [thumb_yaw, thumb_pitch, index, middle, ring, pinky]
+    action order:  [pinky, ring, middle, index, thumb_pitch, thumb_yaw]
+    """
+    limits = np.array([1.15, 0.55, 1.6, 1.6, 1.6, 1.6])
+    if hand_pose.ndim == 1:
+        q = hand_pose[:6]
+        normalized = np.clip(q / limits, 0.0, 1.0)
+        action_float = (1.0 - normalized) * 1000.0
+        action = np.zeros(6, dtype=np.float64)
+        action[0] = np.clip(action_float[5], 0, 1000)  # pinky
+        action[1] = np.clip(action_float[4], 0, 1000)  # ring
+        action[2] = np.clip(action_float[3], 0, 1000)  # middle
+        action[3] = np.clip(action_float[2], 0, 1000)  # index
+        action[4] = np.clip(action_float[1], 0, 1000)  # thumb_pitch
+        action[5] = np.clip(action_float[0], 0, 1000)  # thumb_yaw
+    else:
+        q = hand_pose[:, :6]
+        normalized = np.clip(q / limits, 0.0, 1.0)
+        action_float = (1.0 - normalized) * 1000.0
+        action = np.zeros_like(hand_pose)
+        action[:, 0] = np.clip(action_float[:, 5], 0, 1000)
+        action[:, 1] = np.clip(action_float[:, 4], 0, 1000)
+        action[:, 2] = np.clip(action_float[:, 3], 0, 1000)
+        action[:, 3] = np.clip(action_float[:, 2], 0, 1000)
+        action[:, 4] = np.clip(action_float[:, 1], 0, 1000)
+        action[:, 5] = np.clip(action_float[:, 0], 0, 1000)
+    return action
+
+HAND_CONFIG = {
+    "allegro": {
+        "init": ALLEGRO_INIT,
+        "link6_to_wrist": ALLEGRO_LINK6_TO_WRIST,
+        "convert": _convert_allegro,
+        "xarm_init": XARM_INIT,
+    },
+    "inspire": {
+        "init": INSPIRE_INIT,
+        "link6_to_wrist": INSPIRE_LINK6_TO_WRIST,
+        "convert": _convert_inspire,
+        "xarm_init": XARM_INSPIRE_INIT,
+    },
+}
+
 
 class RealExecutor:
-    """
-    Execute a planned grasp on real hardware.
-
-    Args:
-        mode: "auto" (default) or "gui"
-        arm_name: robot arm type (default "xarm")
-        hand_name: robot hand type (default "allegro")
-        dt: control loop period in seconds
-        squeeze_level: how many squeeze increments (default 10)
-    """
-
     def __init__(
         self,
         mode: str = "auto",
@@ -54,21 +98,30 @@ class RealExecutor:
     ):
         if mode not in ("auto", "gui"):
             raise ValueError(f"mode must be 'auto' or 'gui', got '{mode}'")
+        if hand_name not in HAND_CONFIG:
+            raise ValueError(f"Unknown hand: {hand_name}. Choose from {list(HAND_CONFIG)}")
         self.mode = mode
         self.dt = dt
         self.squeeze_level = squeeze_level
+        self.hand_name = hand_name
+
+        hcfg = HAND_CONFIG[hand_name]
+        self._convert = hcfg["convert"]
+        self._hand_init = hcfg["init"]
+        self._link6_to_wrist = hcfg["link6_to_wrist"]
+        self._xarm_init = hcfg["xarm_init"]
 
         from paradex.io.robot_controller import get_arm, get_hand
         self.arm = get_arm(arm_name)
         self.hand = get_hand(hand_name)
 
-        # Safety velocity limits (auto mode)
+        # Safety velocity limits
         self.joint_vel_limit = 0.05
         self.cart_vel_limit = 0.002
         self.rot_vel_limit = 0.01
         self.hand_vel_limit = 0.03
 
-    # ── low-level motion primitives (auto mode) ──────────────────────────
+    # ── low-level motion primitives ──────────────────────────────────────
 
     def _safe_joint_step(self, current, target, vel_limit=None):
         delta = target - current
@@ -79,7 +132,6 @@ class RealExecutor:
         return current + delta
 
     def _move_joints(self, arm_traj, hand_traj=None, threshold=0.02):
-        """Follow a joint-space trajectory with velocity limiting."""
         for i in range(len(arm_traj)):
             target_arm = arm_traj[i]
             target_hand = hand_traj[i] if hand_traj is not None else None
@@ -97,18 +149,28 @@ class RealExecutor:
         self.hand.move(target)
         time.sleep(self.dt)
 
-    def _move_cartesian(self, target_pose, threshold_t=0.002, threshold_r=0.02):
-        """Cartesian move with velocity limiting."""
+    def _move_cartesian(self, target_pose, threshold_t=0.002, threshold_r=0.02, vel_scale=1.0):
         target_rot = Rotation.from_matrix(target_pose[:3, :3])
+        stall_count = 0
+        prev_pos = None
         for _ in range(500):
             cur = self.arm.get_data()["position"].copy()
-            # translation
+            # Detect stall: arm not moving toward target (kinematic error)
+            cur_pos = cur[:3, 3].copy()
+            if prev_pos is not None and np.linalg.norm(cur_pos - prev_pos) < 1e-4:
+                stall_count += 1
+                if stall_count >= 20:
+                    print("[executor] Arm stalled during cartesian move, aborting lift")
+                    break
+            else:
+                stall_count = 0
+            prev_pos = cur_pos
             t_delta = target_pose[:3, 3] - cur[:3, 3]
             t_dist = np.linalg.norm(t_delta)
-            if t_dist > self.cart_vel_limit:
-                t_delta = t_delta / t_dist * self.cart_vel_limit
+            vel = self.cart_vel_limit * vel_scale
+            if t_dist > vel:
+                t_delta = t_delta / t_dist * vel
             cur[:3, 3] += t_delta
-            # rotation
             cur_rot = Rotation.from_matrix(cur[:3, :3])
             r_delta = (target_rot * cur_rot.inv()).as_rotvec()
             r_dist = np.linalg.norm(r_delta)
@@ -118,29 +180,20 @@ class RealExecutor:
                 cur[:3, :3] = (Rotation.from_rotvec(r_delta) * cur_rot).as_matrix()
             self.arm.move(cur, is_servo=True)
             time.sleep(self.dt)
-            # convergence check
             actual = self.arm.get_data()["position"]
             if (np.linalg.norm(actual[:3, 3] - target_pose[:3, 3]) < threshold_t
                     and np.linalg.norm((target_rot * Rotation.from_matrix(actual[:3, :3]).inv()).as_rotvec()) < threshold_r):
                 break
 
-    def _move_joint_sequential(self, target_qpos, joint_order, threshold=0.01):
-        """Move joints one-by-one in the given order."""
+    def _move_joint_sequential(self, target_qpos, joint_order, speed=1.0):
         current_target = self.arm.get_data()["qpos"].copy()
         for j in joint_order:
             current_target[j] = target_qpos[j]
-            while True:
-                cur = self.arm.get_data()["qpos"]
-                nxt = self._safe_joint_step(cur, current_target, vel_limit=0.06)
-                self.arm.move(nxt, is_servo=True)
-                time.sleep(self.dt)
-                if np.abs(self.arm.get_data()["qpos"][j] - target_qpos[j]) < threshold:
-                    break
+            self.arm.move(current_target, is_servo=False, speed=speed)
 
     # ── public API ────────────────────────────────────────────────────────
 
     def start_recording(self, save_dir: str):
-        """Start recording arm and hand trajectories."""
         import os
         os.makedirs(save_dir, exist_ok=True)
         self.hand.start(os.path.join(save_dir, "hand"))
@@ -150,75 +203,108 @@ class RealExecutor:
         self.arm.stop()
         self.hand.stop()
 
-    def execute(self, plan_result: PlanResult, lift_height: float = 0.12):
-        """
-        Execute the grasp: approach -> pre-grasp -> grasp -> squeeze -> lift.
+    def _log_state(self, state):
+        ts = datetime.datetime.now().isoformat()
+        self.state_timestamps.append({"state": state, "time": ts})
 
-        Returns the squeezed hand pose (for logging).
+    def execute(self, plan_result: PlanResult, lift_height: float = 0.10):
+        """
+        Execute: init -> approach -> pregrasp -> grasp -> squeeze -> lift.
+        State timestamps stored in self.state_timestamps.
+        Returns the squeezed hand pose.
         """
         if not plan_result.success:
             print("Planning failed — nothing to execute.")
             return None
 
-        traj = plan_result.traj                          # (T, 22) arm6 + hand16
-        pg_hand = _convert_hand_pose(plan_result.pregrasp_pose)
-        g_hand = _convert_hand_pose(plan_result.grasp_pose)
-        wrist_se3 = plan_result.wrist_se3 @ np.linalg.inv(LINK6_TO_WRIST)
+        self.state_timestamps = []
+        traj = plan_result.traj
+        pg_hand = self._convert(plan_result.pregrasp_pose)
+        g_hand = self._convert(plan_result.grasp_pose)
+        wrist_ee = plan_result.wrist_se3 @ np.linalg.inv(self._link6_to_wrist)
 
         if self.mode == "gui":
-            return self._execute_gui(traj, pg_hand, g_hand, wrist_se3, lift_height)
-        return self._execute_auto(traj, pg_hand, g_hand, wrist_se3, lift_height)
+            return self._execute_gui(traj, pg_hand, g_hand, wrist_ee, lift_height)
+        return self._execute_auto(traj, pg_hand, g_hand, wrist_ee, lift_height)
 
-    def _execute_auto(self, traj, pg_hand, g_hand, wrist_se3, lift_height):
+    def _execute_auto(self, traj, pg_hand, g_hand, wrist_ee, lift_height):
+        """Reference: run_auto_v2.py lines 318-335"""
         sl = self.squeeze_level
 
-        # Move to init
-        self._move_joint_sequential(XARM_INIT[:6], [0], threshold=0.06)
+        # 1. Return to init pose (joint 0 first)
+        self._log_state("init")
+        self._move_joint_sequential(self._xarm_init[:6], [0])
 
-        # Approach trajectory
-        hand_traj = np.array([_convert_hand_pose(traj[i, 6:]) for i in range(len(traj))])
+        # 2. Approach trajectory
+        self._log_state("approach")
+        hand_traj = np.array([self._convert(traj[i, 6:]) for i in range(len(traj))])
         self._move_joints(traj[:, :6], hand_traj)
 
-        # Grasp sequence
+        # 3. Pregrasp
+        self._log_state("pregrasp")
         self._move_hand(pg_hand)
+
+        # 4. Grasp
+        self._log_state("grasp")
         self._move_hand(g_hand)
+
+        # 5. Squeeze
+        self._log_state("squeeze")
         for i in range(sl * 5):
             s_hand = g_hand * (1 + i / 5) - pg_hand * (i / 5)
             self._move_hand(s_hand)
             time.sleep(0.01)
 
-        # Lift
-        lift_pose = wrist_se3.copy()
+        # 6. Lift
+        self._log_state("lift")
+        lift_pose = wrist_ee.copy()
         lift_pose[2, 3] += lift_height
-        self._move_cartesian(lift_pose)
+        self._move_cartesian(lift_pose, vel_scale=1/1.5)
 
+        self._log_state("done")
         return s_hand
 
-    def _execute_gui(self, traj, pg_hand, g_hand, wrist_se3, lift_height):
+    def _execute_gui(self, traj, pg_hand, g_hand, wrist_ee, lift_height):
+        """Same sequence as _execute_auto, but via GUI waypoints."""
         from paradex.io.robot_controller.gui_controller import RobotGUIController
 
         sl = self.squeeze_level
         s_hand = g_hand * sl - pg_hand * (sl - 1)
+        last_arm = traj[-1, :6]
 
-        lift_pose = wrist_se3.copy()
+        lift_pose = wrist_ee.copy()
         lift_pose[2, 3] += lift_height
 
-        rgc = RobotGUIController(
-            self.arm,
-            self.hand,
-            grasp_pose={
-                "start": _convert_hand_pose(ALLEGRO_INIT),
-                "pregrasp": pg_hand,
-                "grasp": g_hand,
-                "squeezed": s_hand,
-            },
-            approach_traj=np.column_stack([
-                traj[:, :6],
-                np.array([_convert_hand_pose(traj[i, 6:]) for i in range(len(traj))])
-            ]),
-            lift_distance=lift_height * 1000,  # m -> mm
-        )
-        rgc.run()  # blocks until GUI is closed
+        rgc = RobotGUIController(self.arm, self.hand)
+
+        # 1. Init (joint 0 only — same as _execute_auto)
+        self._log_state("init")
+        rgc.add_waypoint("init", "joint", target=self._xarm_init[:6])
+
+        # 2. Approach (full trajectory)
+        self._log_state("approach")
+        hand_traj = np.array([self._convert(traj[i, 6:]) for i in range(len(traj))])
+        for i in range(len(traj)):
+            rgc.add_waypoint(f"approach_{i}", "joint", target=traj[i, :6], hand_qpos=hand_traj[i])
+
+        # 3. Pregrasp
+        self._log_state("pregrasp")
+        rgc.add_waypoint("pregrasp", "joint", target=last_arm, hand_qpos=pg_hand)
+
+        # 4. Grasp
+        self._log_state("grasp")
+        rgc.add_waypoint("grasp", "joint", target=last_arm, hand_qpos=g_hand)
+
+        # 5. Squeeze
+        self._log_state("squeeze")
+        rgc.add_waypoint("squeeze", "joint", target=last_arm, hand_qpos=s_hand)
+
+        # 6. Lift
+        self._log_state("lift")
+        rgc.add_waypoint("lift", "cartesian", target=lift_pose)
+
+        self._log_state("done")
+        rgc.run()
         return s_hand
 
     def release(self, plan_result: PlanResult):
@@ -226,9 +312,8 @@ class RealExecutor:
         if not plan_result.success:
             return
 
-        pg_hand = _convert_hand_pose(plan_result.pregrasp_pose)
-        g_hand = _convert_hand_pose(plan_result.grasp_pose)
-        sl = self.squeeze_level
+        pg_hand = self._convert(plan_result.pregrasp_pose)
+        g_hand = self._convert(plan_result.grasp_pose)
 
         if self.mode == "gui":
             self._release_gui(pg_hand, g_hand)
@@ -236,6 +321,7 @@ class RealExecutor:
             self._release_auto(pg_hand, g_hand)
 
     def _release_auto(self, pg_hand, g_hand):
+        """Reference: run_auto_v2.py lines 357-375"""
         sl = self.squeeze_level
 
         # Reverse squeeze
@@ -248,36 +334,40 @@ class RealExecutor:
         time.sleep(0.01)
         self._move_hand(pg_hand)
         time.sleep(0.01)
-        self._move_hand(_convert_hand_pose(ALLEGRO_INIT))
+        self._move_hand(self._convert(self._hand_init))
 
         # Return arm to init
         execute_order = [1, 2, 5, 0, 3, 4]
-        if self.arm.get_data()["qpos"][1] < XARM_INIT[1]:
+        if self.arm.get_data()["qpos"][1] < self._xarm_init[1]:
             execute_order = [2, 1, 5, 0, 3, 4]
 
-        clear_view = XARM_INIT.copy()
+        clear_view = self._xarm_init.copy()
         clear_view[0] -= 60 * np.pi / 180
-        self._move_joint_sequential(clear_view[:6], execute_order, threshold=0.06)
+        self._move_joint_sequential(clear_view[:6], execute_order)
 
     def _release_gui(self, pg_hand, g_hand):
+        """Same release sequence via GUI waypoints."""
         from paradex.io.robot_controller.gui_controller import RobotGUIController
 
         sl = self.squeeze_level
         s_hand = g_hand * sl - pg_hand * (sl - 1)
 
-        rgc = RobotGUIController(
-            self.arm,
-            self.hand,
-            grasp_pose={
-                "start": s_hand,
-                "pregrasp": g_hand,
-                "grasp": pg_hand,
-                "squeezed": _convert_hand_pose(ALLEGRO_INIT),
-            },
-        )
+        clear_view = self._xarm_init.copy()
+        clear_view[0] -= 60 * np.pi / 180
+
+        rgc = RobotGUIController(self.arm, self.hand)
+
+        # Reverse: squeeze -> grasp -> pregrasp -> open -> arm return
+        rgc.add_waypoint("release_grasp", "joint",
+                         target=self.arm.get_data()["qpos"], hand_qpos=g_hand)
+        rgc.add_waypoint("release_pregrasp", "joint",
+                         target=self.arm.get_data()["qpos"], hand_qpos=pg_hand)
+        rgc.add_waypoint("release_open", "joint",
+                         target=self.arm.get_data()["qpos"], hand_qpos=self._convert(self._hand_init))
+        rgc.add_waypoint("return_init", "joint", target=clear_view[:6])
+
         rgc.run()
 
     def shutdown(self):
-        """Shut down arm and hand controllers."""
         self.arm.end()
         self.hand.end()

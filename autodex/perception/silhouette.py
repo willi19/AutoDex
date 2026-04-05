@@ -235,7 +235,7 @@ class SilhouetteOptimizer:
                 logging.info(f"  Iter {it + 1}/{iters} - loss: {loss.item():.6f}")
 
         pose_world_opt = self._build_pose_from_r6d_t(optim_r6d, optim_t).detach().cpu().numpy()
-        return pose_world_opt
+        return pose_world_opt, loss.item()
 
     @staticmethod
     def _make_soft_mask(mask: np.ndarray, ksize: int, sigma: float) -> np.ndarray:

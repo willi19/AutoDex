@@ -43,8 +43,11 @@ autodex/perception/thirdparty/*
 !autodex/perception/thirdparty/Depth-Anything-3
 autodex/perception/thirdparty/FoundationPose/weights
 autodex/perception/thirdparty/weights
+autodex/tmp/
 bodex_outputs/*
 candidates/*
 outputs/*
 logging/*
 order/*
+rebuttal/cache/*
+rebuttal/scenes/*

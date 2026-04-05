@@ -28,7 +28,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.expanduser("~"), "paradex"))
 
 from autodex.planner import GraspPlanner
-from autodex.utils.path import obj_path, candidate_path
+from autodex.utils.path import obj_path, get_candidate_path
 from autodex.utils.conversion import se32cart
 
 
@@ -75,9 +75,9 @@ def get_tabletop_poses(obj_name):
     return sorted([f.replace(".npy", "") for f in os.listdir(pose_dir) if f.endswith(".npy")])
 
 
-def get_all_objects(version):
+def get_all_objects(version, hand="allegro"):
     """Find objects that have both tabletop poses and grasp candidates."""
-    cand_dir = os.path.join(candidate_path, version)
+    cand_dir = os.path.join(get_candidate_path(hand), version)
     if not os.path.isdir(cand_dir):
         return []
     cand_objects = set(os.listdir(cand_dir))
@@ -90,7 +90,7 @@ def get_all_objects(version):
 
 
 def run_planning_grid(obj_name, grasp_version, n_trials,
-                      x_offsets, z_rotations_deg, save_dir=None):
+                      x_offsets, z_rotations_deg, save_dir=None, hand="allegro"):
     """Run planning grid search for one object. Supports resume from partial results."""
     pose_indices = get_tabletop_poses(obj_name)
     if not pose_indices:
@@ -139,7 +139,7 @@ def run_planning_grid(obj_name, grasp_version, n_trials,
         print("  All points already done")
     else:
         logging.getLogger("curobo").setLevel(logging.ERROR)
-        planner = GraspPlanner()
+        planner = GraspPlanner(hand=hand)
 
     stage_keys = ["load_candidates_s", "world_setup_s", "filter_s",
                   "ik_s", "plan_single_js_s"]
@@ -168,7 +168,7 @@ def run_planning_grid(obj_name, grasp_version, n_trials,
             result = planner.plan(
                 scene_cfg, obj_name=obj_name,
                 grasp_version=grasp_version, mode="batch",
-                seed=trial,
+                seed=trial, hand=hand,
             )
             trial_timings.append(result.timing)
             ik_counts.append(result.timing.get("n_ik_success", 0))
@@ -327,6 +327,7 @@ if __name__ == "__main__":
     parser.add_argument("--x_step", type=float, default=0.05, help="X offset step")
     parser.add_argument("--z_step", type=float, default=30, help="Z rotation step (degrees)")
     parser.add_argument("--save_dir", type=str, default=None, help="Output directory")
+    parser.add_argument("--hand", type=str, default="allegro", choices=["allegro", "inspire"])
     args = parser.parse_args()
 
     x_offsets = np.arange(args.x_min, args.x_max + 1e-6, args.x_step).round(3).tolist()
@@ -335,7 +336,7 @@ if __name__ == "__main__":
     if args.obj is not None:
         objects = [args.obj]
     else:
-        objects = get_all_objects(args.version)
+        objects = get_all_objects(args.version, hand=args.hand)
         print(f"Found {len(objects)} objects with tabletop poses + candidates\n")
 
     all_summaries = {}
@@ -361,6 +362,7 @@ if __name__ == "__main__":
                 x_offsets=x_offsets,
                 z_rotations_deg=z_rotations_deg,
                 save_dir=args.save_dir,
+                hand=args.hand,
             )
             if summary:
                 all_summaries[obj_name] = summary

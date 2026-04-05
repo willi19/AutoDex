@@ -359,9 +359,9 @@ ssh capture2 "cd ~/AutoDex && conda activate sam3 && python src/execution/daemon
 ssh capture3 "cd ~/AutoDex && conda activate sam3 && python src/execution/daemon/perception_daemon.py --model sam3 --port 5001"
 
 # 2. Start FPose daemons (capture4, 5, 6)
-ssh capture4 "cd ~/AutoDex && conda activate foundationpose && python src/execution/daemon/perception_daemon.py --model fpose --port 5003 --mesh ~/shared_data/object_6d/data/mesh/attached_container/attached_container.obj"
-ssh capture5 "cd ~/AutoDex && conda activate foundationpose && python src/execution/daemon/perception_daemon.py --model fpose --port 5003 --mesh ~/shared_data/object_6d/data/mesh/attached_container/attached_container.obj"
-ssh capture6 "cd ~/AutoDex && conda activate foundationpose && python src/execution/daemon/perception_daemon.py --model fpose --port 5003 --mesh ~/shared_data/object_6d/data/mesh/attached_container/attached_container.obj"
+ssh capture4 "cd ~/AutoDex && conda activate foundationpose && python src/execution/daemon/perception_daemon.py --model fpose --port 5003"
+ssh capture5 "cd ~/AutoDex && conda activate foundationpose && python src/execution/daemon/perception_daemon.py --model fpose --port 5003"
+ssh capture6 "cd ~/AutoDex && conda activate foundationpose && python src/execution/daemon/perception_daemon.py --model fpose --port 5003"
 
 # 3. Run pipeline (robot PC)
 ssh robot
@@ -381,6 +381,79 @@ python src/grasp_generation/order/compute_order.py --hand inspire --version v3
 ```
 
 Output: `~/AutoDex/candidates/{hand}/v3_order/{obj}/setcover_order.json`
+
+## Execution Pipeline (`src/execution/`)
+
+### run_auto.py — Automated grasp evaluation loop
+
+```bash
+# Basic (table, all candidates)
+python src/execution/run_auto.py --obj wood_organizer
+
+# Success-only candidates (retest proven grasps)
+python src/execution/run_auto.py --obj brown_ramen --success_only
+
+# Scene modes
+python src/execution/run_auto.py --obj brown_ramen --scene wall --wall_angle 0 --wall_gap 0.04 --success_only
+python src/execution/run_auto.py --obj brown_ramen --scene shelf --success_only
+python src/execution/run_auto.py --obj brown_ramen --scene cluttered --clutter_seed 42 --clutter_min_dist 0.12 --success_only
+python src/execution/run_auto.py --obj brown_ramen --viz  # launch viser visualizer
+```
+
+### run_debug.py — Manual step-through with GUI controller
+
+```bash
+python src/execution/run_debug.py --obj wood_organizer
+```
+
+### Key Design Decisions
+
+- **Candidate result tracking**: `result.json` saved in candidate dir (`candidates/allegro/selected_100/{obj}/{scene}/{id}/{grasp}/`). `load_candidate` skips candidates with existing results (table mode). Other scenes (`--success_only`, wall, shelf, cluttered) don't skip/save to candidates.
+- **Cylinder symmetry**: Objects with y-axis symmetry (defined in `CYLINDER_OBJECTS` list: pepper_tuna, pepper_tuna_light, pepsi, pepsi_light) get their rotation snapped to the tabletop pose whose y-axis direction best matches the estimated pose. Only rotmat is replaced, translation preserved. Tabletop poses at `{obj_path}/{obj}/processed_data/info/tabletop/*.npy`. NOTE: cylinder snap had multiple bugs (wrong frame, wrong tabletop selection causing standing→lying). Some early cylinder experiments (pepper_tuna, pepper_tuna_light success_only) may have bad data from buggy snap.
+- **Table surface snap**: `_snap_z_to_table` ensures mesh bottom ≥ TABLE_SURFACE_Z (0.039m). Prevents hand from going below table. NOTE: changed from 0.037→0.043→0.045→0.042→0.039 on 2026-03-27. Higher values caused planning failures (too much lift), lower values caused table scratching. 0.039 works well — revisit if issues recur.
+- **Lift speed**: `_move_cartesian` lift uses `vel_scale=1/1.5` (slower than default). Changed 2026-03-30 — default was too fast, causing drops.
+- **Sil loss threshold**: Perception returns None if silhouette matching loss > 0.003 (unreliable pose).
+- **IK retract_config**: IK solver uses `retract_config=INIT_STATE` so joint solutions stay near start configuration. Fixes joint 6 wrapping issue (IK returning values in [-2π, 2π]).
+- **Trajectory smoothing**: Uses `get_interpolated_plan()` instead of raw `optimized_plan` (64 waypoints → dense interpolated trajectory). Allegro uses CUBIC interpolation (jerk minimization), Inspire uses LINEAR_CUDA. Changed 2026-04-03 — raw optimized_plan had jerky motion.
+- **Per-hand planner config**: `GraspPlanner(hand=)` selects YAML configs, collision_activation_distance, num_trajopt_seeds, and interpolation_type per hand. Allegro: `xarm_allegro.yml`, act_dist=0.01, 32 seeds, CUBIC. Inspire: `xarm_inspire.yml`, act_dist=0.002, 32 seeds, LINEAR_CUDA.
+- **Inspire hand conversion**: `_convert_inspire` maps radians → 0-1000 controller units with joint reordering (cuRobo order: thumb_yaw/pitch/index/middle/ring/pinky → controller order: pinky/ring/middle/index/thumb_pitch/thumb_yaw). Joints are normalized by per-joint limits `[1.15, 0.55, 1.6, 1.6, 1.6, 1.6]`, inverted (1000=fully open, 0=fully closed).
+- **retract_config fix**: `xarm_allegro.yml` retract_config finger joints updated to `ALLEGRO_INIT` values — old values had thumb base violating joint limit [0.263, 1.396]. Code uses `robot_config.py` INIT_STATE instead of YAML retract_config for `plan_single_js` start state.
+
+### Experiment Storage Layout
+
+```
+~/shared_data/AutoDex/experiment/{exp_name}/
+├── allegro/{obj}/{timestamp}/              # table (default)
+├── success_only/allegro/{obj}/{timestamp}/ # --success_only
+├── wall/allegro/{obj}/{timestamp}/         # --scene wall
+├── wall_success_only/allegro/{obj}/{timestamp}/
+├── shelf/allegro/{obj}/{timestamp}/
+├── shelf_success_only/allegro/{obj}/{timestamp}/
+├── cluttered/allegro/{obj}/{timestamp}/
+└── cluttered_success_only/allegro/{obj}/{timestamp}/
+```
+
+Each experiment dir contains: `raw/`, `images/`, `cam_param/`, `pose_world.npy`, `pose_overlay/`, `plan/`, `result.json`.
+
+### Scene Obstacles (`autodex/planner/obstacles.py`)
+
+- **table**: Table cuboid only
+- **wall**: Single wall around object. `--wall_gap` (meters), `--wall_angle` (degrees, 0=+y)
+- **shelf**: Open-front shelf. `--shelf_width/depth/height/gap`, `--no_shelf_back/sides/top`
+- **cluttered**: Random cubes. `--clutter_seed`, `--clutter_n`, `--clutter_min_dist/max_dist`
+
+### Known Issues / Fixes Applied
+
+- **URDF joint 6 limits**: `xarm_allegro.urdf` has ±2π, real xarm6 is ±π. IK can return values outside ±π. Fixed via `retract_config=INIT_STATE` in IK solver (not URDF change).
+- **Allegro collision sphere**: `spheres/allegro.yml` base_link had radius 0.5 (typo, should be 0.015). Fixed.
+- **moviepy import**: DA3 `gs.py` imports `moviepy.editor` which doesn't exist in moviepy 2.x. Fixed with try/except.
+- **PySpin version**: Must match Spinnaker SDK version (4.3.0.189). PySpin 4.2 causes symbol errors.
+- **numpy version**: PySpin 4.3 requires numpy<2.
+- **FPose daemon mesh**: Pipeline `__init__` must send mesh/obj_name to FPose daemons. Daemon supports `obj_name` lookup from NAS (`~/shared_data/object_6d/data/mesh/{obj}/`).
+
+### Reference
+
+`~/RSS_2026/planner/inference/train/run_auto_v2.py` is the reference implementation. All execution sequences (init → approach → pregrasp → grasp → squeeze → lift → release) match this reference.
 
 ## Ongoing Refactoring
 
