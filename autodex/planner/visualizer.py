@@ -13,6 +13,19 @@ from autodex.utils.path import urdf_path
 from autodex.utils.conversion import cart2se3
 import os
 
+_ASSET_ROOT = os.path.join(os.path.expanduser("~"), "shared_data", "AutoDex", "content", "assets", "robot")
+
+HAND_URDF = {
+    "allegro": (
+        os.path.join(_ASSET_ROOT, "allegro_description", "xarm_allegro.urdf"),
+        os.path.join(_ASSET_ROOT, "allegro_description", "allegro_hand_description_right.urdf"),
+    ),
+    "inspire": (
+        os.path.join(_ASSET_ROOT, "inspire_description", "xarm_inspire.urdf"),
+        os.path.join(_ASSET_ROOT, "inspire_description", "inspire_hand_right.urdf"),
+    ),
+}
+
 
 class ScenePlanVisualizer(ViserViewer):
     """Visualize scene_cfg + PlanResult in viser.
@@ -24,11 +37,12 @@ class ScenePlanVisualizer(ViserViewer):
         vis.start_viewer(use_thread=False)  # blocks
     """
 
-    def __init__(self, scene_cfg, plan_result=None, port=8080):
+    def __init__(self, scene_cfg, plan_result=None, port=8080, hand="allegro"):
         super().__init__(port_number=port)
         self.port = port
         self.scene_cfg = scene_cfg
         self.plan_result = plan_result
+        self._urdf_full, self._urdf_hand = HAND_URDF.get(hand, HAND_URDF["allegro"])
 
         self._add_scene()
 
@@ -66,15 +80,14 @@ class ScenePlanVisualizer(ViserViewer):
     def _add_trajectory(self, result):
         """Add trajectory robot + grasp hand."""
         # Full robot trajectory
-        urdf_full = os.path.join(urdf_path, "xarm_allegro.urdf")
-        self.add_robot("traj_robot", urdf_full)
+        self.add_robot("traj_robot", self._urdf_full)
 
         # Show final pose
         traj = result.traj
         self.robot_dict["traj_robot"].update_cfg(traj[-1])
 
         # Grasp hand at wrist
-        urdf_hand = os.path.join(urdf_path, "allegro_hand_description_right.urdf")
+        urdf_hand = self._urdf_hand
         self.add_robot("grasp_hand", urdf_hand, pose=result.wrist_se3)
         self.robot_dict["grasp_hand"].update_cfg(result.grasp_pose)
         self.change_color("grasp_hand", [0.0, 1.0, 0.0, 0.6])
@@ -112,7 +125,7 @@ class ScenePlanVisualizer(ViserViewer):
         self._cand_grasp = grasp_pose
         self._cand_filtered = filtered
 
-        urdf_hand = os.path.join(urdf_path, "allegro_hand_description_right.urdf")
+        urdf_hand = self._urdf_hand
         self.add_robot("cand_hand", urdf_hand)
         self.robot_dict["cand_hand"].set_visibility(False)
 

@@ -151,8 +151,20 @@ class RealExecutor:
 
     def _move_cartesian(self, target_pose, threshold_t=0.002, threshold_r=0.02, vel_scale=1.0):
         target_rot = Rotation.from_matrix(target_pose[:3, :3])
+        stall_count = 0
+        prev_pos = None
         for _ in range(500):
             cur = self.arm.get_data()["position"].copy()
+            # Detect stall: arm not moving toward target (kinematic error)
+            cur_pos = cur[:3, 3].copy()
+            if prev_pos is not None and np.linalg.norm(cur_pos - prev_pos) < 1e-4:
+                stall_count += 1
+                if stall_count >= 20:
+                    print("[executor] Arm stalled during cartesian move, aborting lift")
+                    break
+            else:
+                stall_count = 0
+            prev_pos = cur_pos
             t_delta = target_pose[:3, 3] - cur[:3, 3]
             t_dist = np.linalg.norm(t_delta)
             vel = self.cart_vel_limit * vel_scale
@@ -173,17 +185,11 @@ class RealExecutor:
                     and np.linalg.norm((target_rot * Rotation.from_matrix(actual[:3, :3]).inv()).as_rotvec()) < threshold_r):
                 break
 
-    def _move_joint_sequential(self, target_qpos, joint_order, threshold=0.01):
+    def _move_joint_sequential(self, target_qpos, joint_order, speed=1.0):
         current_target = self.arm.get_data()["qpos"].copy()
         for j in joint_order:
             current_target[j] = target_qpos[j]
-            while True:
-                cur = self.arm.get_data()["qpos"]
-                nxt = self._safe_joint_step(cur, current_target, vel_limit=0.06)
-                self.arm.move(nxt, is_servo=True)
-                time.sleep(self.dt)
-                if np.abs(self.arm.get_data()["qpos"][j] - target_qpos[j]) < threshold:
-                    break
+            self.arm.move(current_target, is_servo=False, speed=speed)
 
     # ── public API ────────────────────────────────────────────────────────
 
@@ -201,7 +207,7 @@ class RealExecutor:
         ts = datetime.datetime.now().isoformat()
         self.state_timestamps.append({"state": state, "time": ts})
 
-    def execute(self, plan_result: PlanResult, lift_height: float = 0.12):
+    def execute(self, plan_result: PlanResult, lift_height: float = 0.10):
         """
         Execute: init -> approach -> pregrasp -> grasp -> squeeze -> lift.
         State timestamps stored in self.state_timestamps.
@@ -227,7 +233,7 @@ class RealExecutor:
 
         # 1. Return to init pose (joint 0 first)
         self._log_state("init")
-        self._move_joint_sequential(self._xarm_init[:6], [0], threshold=0.06)
+        self._move_joint_sequential(self._xarm_init[:6], [0])
 
         # 2. Approach trajectory
         self._log_state("approach")
@@ -337,7 +343,7 @@ class RealExecutor:
 
         clear_view = self._xarm_init.copy()
         clear_view[0] -= 60 * np.pi / 180
-        self._move_joint_sequential(clear_view[:6], execute_order, threshold=0.06)
+        self._move_joint_sequential(clear_view[:6], execute_order)
 
     def _release_gui(self, pg_hand, g_hand):
         """Same release sequence via GUI waypoints."""

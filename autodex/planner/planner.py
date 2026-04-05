@@ -20,7 +20,10 @@ from curobo.util.trajectory import InterpolateType
 
 from autodex.utils.path import robot_configs_path, load_candidate
 from autodex.utils.conversion import se32action, cart2se3
-from autodex.utils.robot_config import INIT_STATE, XARM_INSPIRE_INIT, INSPIRE_INIT
+from autodex.utils.robot_config import (
+    INIT_STATE, XARM_INIT, INSPIRE_INIT,
+    ALLEGRO_LINK6_TO_WRIST, INSPIRE_LINK6_TO_WRIST,
+)
 
 
 # ── Result ────────────────────────────────────────────────────────────────────
@@ -111,11 +114,17 @@ class GraspPlanner:
         self._plan_cfg: Optional[MotionGenPlanConfig] = None
         self._ik_solver: Optional[IKSolver] = None
 
-        # Init state: use robot_config.py values (validated against URDF joint limits)
+        # Init state: same arm position for all hands, hand-specific finger init
         if hand == "inspire":
-            self._init_state = np.concatenate([XARM_INSPIRE_INIT, INSPIRE_INIT]).astype(np.float32)
+            self._init_state = np.concatenate([XARM_INIT, INSPIRE_INIT]).astype(np.float32)
+            self._link6_to_wrist_rot = INSPIRE_LINK6_TO_WRIST[:3, :3]
         else:
             self._init_state = INIT_STATE.astype(np.float32)
+            self._link6_to_wrist_rot = ALLEGRO_LINK6_TO_WRIST[:3, :3]
+
+        # Precompute link6 y-axis in wrist frame for backward filter
+        self._link6_y_in_wrist = np.linalg.inv(self._link6_to_wrist_rot) @ np.array([0, 1, 0])
+        self._hand = hand
 
     # ── world setup ───────────────────────────────────────────────────────────
 
@@ -233,7 +242,7 @@ class GraspPlanner:
 
         # Filter: backward + hand-table collision (no object mesh — hand should be near object)
         t0 = _time.time()
-        backward = wrist_se3[:, 0, 2] < 0.0
+        backward = np.zeros(len(wrist_se3), dtype=bool) if self._hand == "inspire" else (wrist_se3[:, :3, :3] @ self._link6_y_in_wrist)[:, 2] < 0.3
         collision = self._check_collision(world_cfg_no_target, wrist_se3, pregrasp)
         filtered = backward | collision
         valid = np.where(~filtered)[0]
@@ -267,7 +276,12 @@ class GraspPlanner:
                 for i, idx in enumerate(chunk_idx):
                     if succ[i]:
                         ik_success[idx] = True
-                        ik_qpos[idx, :6] = q_sol[i, :6]
+                        arm_q = q_sol[i, :6].copy()
+                        # Snap joint 6 to nearest equivalent angle to init_state
+                        # IK can return any angle in [-2π, 2π]; pick closest to start
+                        diff = arm_q[5] - self._init_state[5]
+                        arm_q[5] -= np.round(diff / (2 * np.pi)) * 2 * np.pi
+                        ik_qpos[idx, :6] = arm_q
                         ik_qpos[idx, 6:] = pregrasp[idx]
         t_ik = _time.time() - t0
 
@@ -349,9 +363,54 @@ class GraspPlanner:
                 print(f"    [plan_single_js] status={result.status} (act_dist={self._collision_act_dist})")
             if hasattr(result, 'valid_query') and result.valid_query is not None:
                 print(f"    [plan_single_js] valid_query={result.valid_query}")
+            # Export collision debug meshes on failure
+            self._export_collision_debug(goal_joint)
         if result.success.item():
             return True, result.get_interpolated_plan().position.cpu().numpy()
         return False, None
+
+    def _export_collision_debug(self, goal_joint: np.ndarray):
+        """Export hand collision spheres + world meshes at goal state for debugging."""
+        try:
+            import trimesh
+            debug_dir = "/tmp/collision_debug"
+            os.makedirs(debug_dir, exist_ok=True)
+
+            # Get collision spheres at goal state
+            q = torch.tensor(goal_joint, dtype=torch.float32, device=self._tensor_args.device).unsqueeze(0)
+            kin = self._motion_gen.kinematics
+            spheres = kin.get_robot_as_spheres(q)
+
+            # Save spheres as mesh
+            sphere_meshes = []
+            for sphere_batch in spheres:
+                for s in sphere_batch:
+                    pos = s[:3].cpu().numpy()
+                    rad = s[3].item()
+                    if rad > 0:
+                        m = trimesh.creation.icosphere(radius=rad)
+                        m.apply_translation(pos)
+                        sphere_meshes.append(m)
+            if sphere_meshes:
+                combined = trimesh.util.concatenate(sphere_meshes)
+                out = os.path.join(debug_dir, "hand_spheres.obj")
+                combined.export(out)
+                print(f"    [debug] Hand spheres -> {out}")
+
+            # Save world meshes
+            if self._motion_gen.world_model is not None:
+                wm = self._motion_gen.world_model
+                if hasattr(wm, 'mesh') and wm.mesh:
+                    for mesh_name in wm.mesh:
+                        m = wm.mesh[mesh_name]
+                        if hasattr(m, 'vertices') and hasattr(m, 'faces'):
+                            tm = trimesh.Trimesh(vertices=m.vertices.cpu().numpy(),
+                                                 faces=m.faces.cpu().numpy())
+                            out = os.path.join(debug_dir, f"world_{mesh_name}.obj")
+                            tm.export(out)
+                            print(f"    [debug] World mesh -> {out}")
+        except Exception as e:
+            print(f"    [debug] Export failed: {e}")
 
     # ── internal pipeline ─────────────────────────────────────────────────────
 
@@ -362,7 +421,7 @@ class GraspPlanner:
 
         t0 = _time.time()
         collision = self._check_collision(world_cfg, wrist_se3, pregrasp)
-        backward = wrist_se3[:, 0, 2] < 0.0
+        backward = np.zeros(len(wrist_se3), dtype=bool) if self._hand == "inspire" else (wrist_se3[:, :3, :3] @ self._link6_y_in_wrist)[:, 2] < 0.3
         valid = np.where(~(collision | backward))[0]
         timing["collision_check_s"] = round(_time.time() - t0, 3)
 
@@ -481,7 +540,7 @@ class GraspPlanner:
         t0 = _time.time()
         N = len(wrist_se3)
         collision = self._check_collision(world_cfg, wrist_se3, pregrasp)
-        backward = wrist_se3[:, 0, 2] < 0.0
+        backward = np.zeros(len(wrist_se3), dtype=bool) if self._hand == "inspire" else (wrist_se3[:, :3, :3] @ self._link6_y_in_wrist)[:, 2] < 0.3
         filtered = collision | backward
         valid = np.where(~filtered)[0]
         print(f"[planner] collision check: {_time.time() - t0:.2f}s")
@@ -580,7 +639,7 @@ class GraspPlanner:
 
         # 3. Filter: backward + hand-table collision
         t0 = _time.time()
-        backward = wrist_se3[:, 0, 2] < 0.0
+        backward = np.zeros(len(wrist_se3), dtype=bool) if self._hand == "inspire" else (wrist_se3[:, :3, :3] @ self._link6_y_in_wrist)[:, 2] < 0.3
         print(f"[backward] wrist x-axis z: {wrist_se3[:, 0, 2]}")
         collision = self._check_collision(world_cfg_no_target, wrist_se3, pregrasp)
         valid = np.where(~(backward | collision))[0]
@@ -644,9 +703,33 @@ class GraspPlanner:
                     ik_qpos[idx, 6:] = pregrasp[idx]
         t_ik = _time.time() - t0
 
+        # Lift IK check: verify z+12cm pose is reachable (avoids joint limit errors during lift)
+        LIFT_HEIGHT = 0.10
+        ik_valid_pre = np.where(ik_success)[0]
+        if len(ik_valid_pre) > 0:
+            lift_poses = wrist_se3[ik_valid_pre].copy()
+            lift_poses[:, 2, 3] += LIFT_HEIGHT
+            for chunk_start in range(0, len(ik_valid_pre), self.BATCH_SIZE):
+                chunk = ik_valid_pre[chunk_start : chunk_start + self.BATCH_SIZE]
+                chunk_poses = lift_poses[chunk_start : chunk_start + len(chunk)]
+                B = len(chunk_poses)
+                if B < self.BATCH_SIZE:
+                    pad = self.BATCH_SIZE - B
+                    chunk_poses = np.concatenate(
+                        [chunk_poses, np.tile(chunk_poses[:1], (pad, 1, 1))], axis=0)
+                goal = _to_curobo_pose(chunk_poses, self._tensor_args.device)
+                result = self._ik_solver.solve_batch(goal)
+                lift_succ = result.success.cpu().numpy()[:B]
+                for i, idx in enumerate(chunk):
+                    if not lift_succ[i]:
+                        ik_success[idx] = False
+            n_lift_fail = len(ik_valid_pre) - int(ik_success.sum())
+            if n_lift_fail > 0:
+                print(f"[planner] Lift IK check: {n_lift_fail} candidates failed (z+{LIFT_HEIGHT}m unreachable)")
+
         ik_valid = np.where(ik_success)[0]
         n_ik_success = len(ik_valid)
-        print(f"[planner] IK: {n_ik_success}/{len(valid)} success")
+        print(f"[planner] IK: {n_ik_success}/{len(valid)} success (after lift check)")
         base_timing["ik_s"] = round(t_ik, 3)
         base_timing["n_ik_success"] = n_ik_success
         base_timing["n_valid"] = int(len(valid))

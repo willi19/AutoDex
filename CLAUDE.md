@@ -359,9 +359,9 @@ ssh capture2 "cd ~/AutoDex && conda activate sam3 && python src/execution/daemon
 ssh capture3 "cd ~/AutoDex && conda activate sam3 && python src/execution/daemon/perception_daemon.py --model sam3 --port 5001"
 
 # 2. Start FPose daemons (capture4, 5, 6)
-ssh capture4 "cd ~/AutoDex && conda activate foundationpose && python src/execution/daemon/perception_daemon.py --model fpose --port 5003 --mesh ~/shared_data/object_6d/data/mesh/attached_container/attached_container.obj"
-ssh capture5 "cd ~/AutoDex && conda activate foundationpose && python src/execution/daemon/perception_daemon.py --model fpose --port 5003 --mesh ~/shared_data/object_6d/data/mesh/attached_container/attached_container.obj"
-ssh capture6 "cd ~/AutoDex && conda activate foundationpose && python src/execution/daemon/perception_daemon.py --model fpose --port 5003 --mesh ~/shared_data/object_6d/data/mesh/attached_container/attached_container.obj"
+ssh capture4 "cd ~/AutoDex && conda activate foundationpose && python src/execution/daemon/perception_daemon.py --model fpose --port 5003"
+ssh capture5 "cd ~/AutoDex && conda activate foundationpose && python src/execution/daemon/perception_daemon.py --model fpose --port 5003"
+ssh capture6 "cd ~/AutoDex && conda activate foundationpose && python src/execution/daemon/perception_daemon.py --model fpose --port 5003"
 
 # 3. Run pipeline (robot PC)
 ssh robot
@@ -414,6 +414,10 @@ python src/execution/run_debug.py --obj wood_organizer
 - **Lift speed**: `_move_cartesian` lift uses `vel_scale=1/1.5` (slower than default). Changed 2026-03-30 — default was too fast, causing drops.
 - **Sil loss threshold**: Perception returns None if silhouette matching loss > 0.003 (unreliable pose).
 - **IK retract_config**: IK solver uses `retract_config=INIT_STATE` so joint solutions stay near start configuration. Fixes joint 6 wrapping issue (IK returning values in [-2π, 2π]).
+- **Trajectory smoothing**: Uses `get_interpolated_plan()` instead of raw `optimized_plan` (64 waypoints → dense interpolated trajectory). Allegro uses CUBIC interpolation (jerk minimization), Inspire uses LINEAR_CUDA. Changed 2026-04-03 — raw optimized_plan had jerky motion.
+- **Per-hand planner config**: `GraspPlanner(hand=)` selects YAML configs, collision_activation_distance, num_trajopt_seeds, and interpolation_type per hand. Allegro: `xarm_allegro.yml`, act_dist=0.01, 32 seeds, CUBIC. Inspire: `xarm_inspire.yml`, act_dist=0.002, 32 seeds, LINEAR_CUDA.
+- **Inspire hand conversion**: `_convert_inspire` maps radians → 0-1000 controller units with joint reordering (cuRobo order: thumb_yaw/pitch/index/middle/ring/pinky → controller order: pinky/ring/middle/index/thumb_pitch/thumb_yaw). Joints are normalized by per-joint limits `[1.15, 0.55, 1.6, 1.6, 1.6, 1.6]`, inverted (1000=fully open, 0=fully closed).
+- **retract_config fix**: `xarm_allegro.yml` retract_config finger joints updated to `ALLEGRO_INIT` values — old values had thumb base violating joint limit [0.263, 1.396]. Code uses `robot_config.py` INIT_STATE instead of YAML retract_config for `plan_single_js` start state.
 
 ### Experiment Storage Layout
 

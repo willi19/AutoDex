@@ -34,7 +34,7 @@ collision_spheres:
       "radius": 0.01929
     - "center": [0.023, -0.004, -0.068]
       "radius": 0.01929
-    # Wrist spheres (same as Allegro — shared arm mount)
+    # Wrist spheres (same as Allegro - shared arm mount)
     - "center": [0.0, 0.0, 0.035]
       "radius": 0.04
     - "center": [0.0, 0.0, 0.075]
@@ -99,7 +99,7 @@ collision_spheres:
       "radius": 0.00866
   right_thumb_1:
     - "center": [0.0, 0.0, 0.0]
-      "radius": 0.00
+      "radius": 0.005
   right_thumb_2:
     - "center": [0.019, 0.014, -0.012]
       "radius": 0.016

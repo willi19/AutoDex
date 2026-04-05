@@ -153,6 +153,7 @@ def main():
     parser.add_argument("--depth", type=str, default="da3", choices=["da3", "stereo"])
     parser.add_argument("--scene", type=str, default="table",
                         choices=["table", "wall", "shelf", "cluttered"])
+    parser.add_argument("--hand", type=str, default="allegro", choices=["allegro", "inspire"])
     args = parser.parse_args()
 
     obj_name = args.obj
@@ -177,7 +178,7 @@ def main():
 
     # ── 2. Capture images ────────────────────────────────────────────────
     dir_idx = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    hand_type = "allegro"
+    hand_type = args.hand
     scene_prefix = args.scene if args.scene != "table" else ""
     img_dir = os.path.join(project_dir, "experiment", exp_name, scene_prefix, hand_type, obj_name, dir_idx) if scene_prefix else os.path.join(project_dir, "experiment", exp_name, hand_type, obj_name, dir_idx)
     os.makedirs(img_dir, exist_ok=True)
@@ -220,8 +221,8 @@ def main():
     c2r = load_c2r(img_dir)
     scene_cfg = pose_world_to_scene_cfg(pose_world, c2r, obj_name)
     scene_cfg = add_obstacles(scene_cfg, args.scene)
-    planner = GraspPlanner()
-    result = planner.plan(scene_cfg, obj_name, grasp_version)
+    planner = GraspPlanner(hand=args.hand)
+    result = planner.plan(scene_cfg, obj_name, grasp_version, hand=args.hand)
     timing["planning_s"] = round(time.time() - t0, 1)
     print(f"    Planning: {timing['planning_s']}s  success={result.success}")
 
@@ -249,7 +250,7 @@ def main():
 
     # ── 5. Visualize scene + trajectory ──────────────────────────────────
     print(f"[4/5] Launching scene visualizer (http://localhost:8080)...")
-    vis = ScenePlanVisualizer(scene_cfg, result, port=8080)
+    vis = ScenePlanVisualizer(scene_cfg, result, port=8080, hand=args.hand)
     vis.start_viewer(use_thread=True)
 
     while True:
@@ -270,7 +271,7 @@ def main():
     timing["execution_start"] = _ts()
 
     from autodex.executor.real import RealExecutor
-    executor = RealExecutor(mode="gui")
+    executor = RealExecutor(mode="gui", hand_name=args.hand)
     s_hand = executor.execute(result)
     timing["execution_states"] = executor.state_timestamps
 
@@ -298,9 +299,9 @@ def main():
 
     # Save result to candidate path (table only — other scenes are testing)
     if result.scene_info is not None and args.scene == "table":
-        from autodex.utils.path import candidate_path
+        from autodex.utils.path import get_candidate_path
         sei = result.scene_info
-        cand_result_path = os.path.join(candidate_path, grasp_version, obj_name, sei[0], sei[1], sei[2], "result.json")
+        cand_result_path = os.path.join(get_candidate_path(args.hand), grasp_version, obj_name, sei[0], sei[1], sei[2], "result.json")
         with open(cand_result_path, "w") as f:
             json.dump({"success": label == "y", "dir_idx": dir_idx}, f)
 

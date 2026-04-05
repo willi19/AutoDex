@@ -36,6 +36,7 @@ from autodex.executor.real import RealExecutor
 from src.execution.daemon.perception_pipeline import PerceptionPipeline
 
 logging.basicConfig(level=logging.INFO, format='[%(name)s] %(message)s')
+logging.getLogger("curobo").setLevel(logging.WARNING)
 
 SAM3_HOSTS = [
     ("192.168.0.101", 5001),
@@ -67,6 +68,12 @@ TABLE_SURFACE_Z = -0.1 + 0.039 + 0.1  # 0.039
 # Objects with y-axis cylindrical symmetry — snap to nearest tabletop pose
 CYLINDER_OBJECTS = [
     "pepper_tuna", "pepper_tuna_light", "pepsi", "pepsi_light",
+    "smallbowl", "jja_ramen", "open_short_pringles",
+]
+
+# Spherical objects — use first tabletop pose rotation directly
+SPHERE_OBJECTS = [
+    "baseball", "tennis_ball",
 ]
 
 def _snap_z_to_table(pose_robot, mesh_path):
@@ -135,13 +142,35 @@ def _snap_cylinder_pose(pose_robot, obj_name):
     return pose_robot
 
 
+def _snap_sphere_pose(pose_robot, obj_name):
+    """For spherical objects, replace rotation with first tabletop pose."""
+    import glob
+
+    tabletop_dir = os.path.join(obj_path, obj_name, "processed_data", "info", "tabletop")
+    if not os.path.isdir(tabletop_dir):
+        return pose_robot
+
+    tabletop_files = sorted(glob.glob(os.path.join(tabletop_dir, "*.npy")))
+    if not tabletop_files:
+        return pose_robot
+
+    R_tab = np.load(tabletop_files[0])[:3, :3]
+    print(f"    [sphere] Replaced rotation with tabletop pose 0")
+    pose_robot = pose_robot.copy()
+    pose_robot[:3, :3] = R_tab
+
+    return pose_robot
+
+
 def pose_world_to_scene_cfg(pose_world, c2r, obj_name):
     """Convert world-frame 4x4 pose to scene_cfg dict for planner."""
     pose_robot = np.linalg.inv(c2r) @ pose_world
     mesh_path = find_planning_mesh(obj_name)
-    if obj_name in CYLINDER_OBJECTS:
+    if obj_name in SPHERE_OBJECTS:
+        pose_robot = _snap_sphere_pose(pose_robot, obj_name)
+    elif obj_name in CYLINDER_OBJECTS:
         pose_robot = _snap_cylinder_pose(pose_robot, obj_name)
-    pose_robot = _snap_z_to_table(pose_robot, mesh_path)
+    # pose_robot = _snap_z_to_table(pose_robot, mesh_path)  # disabled — caused hand to go too high
     return {
         "mesh": {
             "target": {
@@ -159,11 +188,24 @@ def pose_world_to_scene_cfg(pose_world, c2r, obj_name):
 
 
 def get_label():
+    """Returns (success: bool|None, note: str|None).
+    y=success, n=fail, c=skip(issue) with optional memo."""
     while True:
         chime.success()
-        label = input("Press 'y' if the grasp was successful, 'n' if not: ").strip().lower()
-        if label in ("y", "n"):
-            return label == "y"
+        label = input("Label [y/n/c=issue / ym/nm=with memo]: ").strip().lower()
+        if label == "y":
+            return True, None
+        elif label == "ym":
+            note = input("  Note: ").strip()
+            return True, note or None
+        elif label == "n":
+            return False, None
+        elif label == "nm":
+            note = input("  Note: ").strip()
+            return False, note or None
+        elif label == "c":
+            note = input("  Note: ").strip()
+            return None, note or "issue"
 
 
 _active_vis = None
@@ -173,6 +215,7 @@ def run_single_trial(
     wall_gap, wall_angle, clutter_seed, clutter_min_dist, clutter_max_dist, clutter_n, success_only,
     shelf_width, shelf_depth, shelf_height, shelf_gap, shelf_back, shelf_sides, shelf_top,
     planner, pipeline, executor, rcc, sync_generator, timestamp_monitor,
+    hand="allegro",
 ):
     global _active_vis
     if _active_vis is not None:
@@ -182,7 +225,7 @@ def run_single_trial(
             pass
         _active_vis = None
     """Run one capture -> perceive -> plan -> execute -> label cycle."""
-    hand_type = "allegro"
+    hand_type = hand
     dir_idx = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     scene_prefix = scene_type if scene_type != "table" else ""
     if success_only and scene_prefix:
@@ -243,7 +286,7 @@ def run_single_trial(
                               shelf_gap=shelf_gap, shelf_back=shelf_back, shelf_sides=shelf_sides, shelf_top=shelf_top)
     result = planner.plan(scene_cfg, obj_name, grasp_version,
                           skip_done=(scene_type == "table"),
-                          success_only=success_only)
+                          success_only=success_only, hand=hand)
     timing["plan_s"] = round(time.time() - t0, 1)
     print(f"    Plan: {timing['plan_s']}s  success={result.success}")
 
@@ -251,8 +294,8 @@ def run_single_trial(
         print("    Planning FAILED — launching visualizer to inspect...")
         # Show scene + all candidate wrist poses
         wrist_se3, _, grasp_pose, filtered = planner.get_candidates(scene_cfg, obj_name, grasp_version,
-                                                                    success_only=success_only, skip_done=(scene_type == "table"))
-        fail_vis = ScenePlanVisualizer(scene_cfg, None, port=8080)
+                                                                    success_only=success_only, skip_done=(scene_type == "table"), hand=hand)
+        fail_vis = ScenePlanVisualizer(scene_cfg, None, port=8080, hand=hand)
         fail_vis.add_candidates(wrist_se3, grasp_pose, filtered)
         fail_vis.start_viewer(use_thread=True)
         _active_vis = fail_vis
@@ -275,7 +318,7 @@ def run_single_trial(
     # ── 3.5 Visualize (optional, stays open until next trial) ──────────
     if viz:
         print("    Launching visualizer (http://localhost:8080)...")
-        scene_vis = ScenePlanVisualizer(scene_cfg, result, port=8080)
+        scene_vis = ScenePlanVisualizer(scene_cfg, result, port=8080, hand=hand)
         scene_vis.start_viewer(use_thread=True)
         _active_vis = scene_vis
 
@@ -303,7 +346,13 @@ def run_single_trial(
     print(f"[5/6] Label the result")
     rcc.start("image", False, os.path.join("shared_data", "AutoDex", "experiment", exp_name, scene_prefix, hand_type, obj_name, dir_idx, "label", "raw"))
     rcc.stop()
-    succ = get_label()
+    try:
+        succ, note = get_label()
+    except KeyboardInterrupt:
+        print("\n[interrupted] Releasing and cleaning up...")
+        executor.release(result)
+        executor.stop_recording()
+        raise
 
     # ── 6. Release & save ────────────────────────────────────────────────
     print(f"[6/6] Releasing...")
@@ -321,18 +370,22 @@ def run_single_trial(
         "candidate_idx": result.timing.get("candidate_idx") if result.timing else None,
         "timing": timing,
     }
+    if note is not None:
+        trial_result["note"] = note
     with open(os.path.join(img_dir, "result.json"), "w") as f:
         json.dump(trial_result, f, indent=2)
 
     # Save result to candidate path (table only — other scenes are testing)
-    if result.scene_info is not None and scene_type == "table":
-        from autodex.utils.path import candidate_path
+    # Skip saving to candidate dir if label is issue (success=None)
+    if succ is not None and result.scene_info is not None and scene_type == "table":
+        from autodex.utils.path import get_candidate_path
         sei = result.scene_info
-        cand_result_path = os.path.join(candidate_path, grasp_version, obj_name, sei[0], sei[1], sei[2], "result.json")
+        cand_result_path = os.path.join(get_candidate_path(hand), grasp_version, obj_name, sei[0], sei[1], sei[2], "result.json")
         with open(cand_result_path, "w") as f:
             json.dump({"success": succ, "dir_idx": dir_idx}, f)
 
-    print(f"    Result: {'SUCCESS' if succ else 'FAIL'}  saved to {img_dir}/result.json")
+    status = "SUCCESS" if succ else ("ISSUE" if succ is None else "FAIL")
+    print(f"    Result: {status}  saved to {img_dir}/result.json")
     return trial_result
 
 
@@ -359,6 +412,7 @@ def main():
     parser.add_argument("--no_shelf_top", action="store_true", help="Remove shelf top panel")
     parser.add_argument("--success_only", action="store_true", help="Only use previously successful grasps")
     parser.add_argument("--viz", action="store_true", help="Launch scene visualizer after planning")
+    parser.add_argument("--hand", type=str, default="allegro", choices=["allegro", "inspire"])
     args = parser.parse_args()
     if args.exp_name is None:
         args.exp_name = args.grasp_version
@@ -379,11 +433,30 @@ def main():
 
     # Planner init (warmup once, reuse across trials)
     print("Initializing planner...")
-    planner = GraspPlanner()
+    planner = GraspPlanner(hand=args.hand)
 
     # Executor init (reuse across trials — reference: arm/hand init once)
     print("Initializing executor...")
-    executor = RealExecutor(mode="auto")
+    executor = RealExecutor(mode="auto", hand_name=args.hand)
+
+    def _cleanup():
+        print("\n[cleanup] Stopping hardware...")
+        try:
+            rcc.stop()
+        except Exception:
+            pass
+        try:
+            timestamp_monitor.stop()
+        except Exception:
+            pass
+        try:
+            sync_generator.stop()
+        except Exception:
+            pass
+        try:
+            executor.stop_recording()
+        except Exception:
+            pass
 
     results = []
     trial = 0
@@ -394,7 +467,11 @@ def main():
         print(f"{'#'*60}")
 
         chime.info()
-        cmd = input("Press Enter to start trial, 'q' to quit: ").strip().lower()
+        try:
+            cmd = input("Press Enter to start trial, 'q' to quit: ").strip().lower()
+        except KeyboardInterrupt:
+            _cleanup()
+            break
         if cmd == "q":
             break
 
@@ -425,6 +502,7 @@ def main():
             rcc=rcc,
             sync_generator=sync_generator,
             timestamp_monitor=timestamp_monitor,
+            hand=args.hand,
         )
         results.append(trial_result)
 
@@ -448,7 +526,7 @@ def main():
         scene_pfx = f"{scene_pfx}_success_only"
     elif args.success_only:
         scene_pfx = "success_only"
-    summary_path = os.path.join(project_dir, "experiment", args.exp_name, scene_pfx, "allegro", args.obj, "summary.json") if scene_pfx else os.path.join(project_dir, "experiment", args.exp_name, "allegro", args.obj, "summary.json")
+    summary_path = os.path.join(project_dir, "experiment", args.exp_name, scene_pfx, args.hand, args.obj, "summary.json") if scene_pfx else os.path.join(project_dir, "experiment", args.exp_name, args.hand, args.obj, "summary.json")
     os.makedirs(os.path.dirname(summary_path), exist_ok=True)
     with open(summary_path, "w") as f:
         json.dump(results, f, indent=2)
