@@ -135,10 +135,20 @@ def run_fpose_daemon(port: int, obj_name: str = None, gpu: int = 0):
             if req.get("command") == "reset_mesh":
                 new_mesh = None
                 if "obj_name" in req:
+                    if not req["obj_name"]:
+                        sock.send_string(json.dumps({"status": "ok", "msg": "no obj_name, skipping"}))
+                        continue
                     new_mesh = _find_mesh(req["obj_name"])
                 elif "mesh_path" in req:
                     new_mesh = _localize_path(req["mesh_path"])
                 if new_mesh and os.path.exists(new_mesh):
+                    # Free old tracker before creating new one
+                    if tracker is not None:
+                        del tracker
+                        tracker = None
+                        import gc, torch
+                        gc.collect()
+                        torch.cuda.empty_cache()
                     tracker = PoseTracker(new_mesh, device_id=gpu)
                     logger.info(f"Mesh reset to {new_mesh}")
                     sock.send_string(json.dumps({"status": "ok"}))

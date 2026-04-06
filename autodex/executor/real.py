@@ -137,8 +137,24 @@ class RealExecutor:
             target_hand = hand_traj[i] if hand_traj is not None else None
             if target_hand is not None:
                 self.hand.move(target_hand)
+            stall_count = 0
+            prev_qpos = None
+            recovered = False
             for _ in range(500):
                 cur = self.arm.get_data()["qpos"]
+                if prev_qpos is not None and np.linalg.norm(cur - prev_qpos) < 1e-4:
+                    stall_count += 1
+                    if stall_count >= 50 and not recovered:
+                        print("[executor] stall detected, clearing error...")
+                        self.arm.clear_error()
+                        recovered = True
+                        stall_count = 0
+                    elif stall_count >= 100:
+                        print("[executor] stall after recovery, aborting")
+                        break
+                else:
+                    stall_count = 0
+                prev_qpos = cur.copy()
                 nxt = self._safe_joint_step(cur, target_arm)
                 self.arm.move(nxt, is_servo=True)
                 time.sleep(self.dt)
@@ -153,14 +169,19 @@ class RealExecutor:
         target_rot = Rotation.from_matrix(target_pose[:3, :3])
         stall_count = 0
         prev_pos = None
+        recovered = False
         for _ in range(500):
             cur = self.arm.get_data()["position"].copy()
-            # Detect stall: arm not moving toward target (kinematic error)
             cur_pos = cur[:3, 3].copy()
             if prev_pos is not None and np.linalg.norm(cur_pos - prev_pos) < 1e-4:
                 stall_count += 1
-                if stall_count >= 20:
-                    print("[executor] Arm stalled during cartesian move, aborting lift")
+                if stall_count >= 50 and not recovered:
+                    print("[executor] stall detected, clearing error...")
+                    self.arm.clear_error()
+                    recovered = True
+                    stall_count = 0
+                elif stall_count >= 100:
+                    print("[executor] stall after recovery, aborting")
                     break
             else:
                 stall_count = 0
@@ -185,11 +206,33 @@ class RealExecutor:
                     and np.linalg.norm((target_rot * Rotation.from_matrix(actual[:3, :3]).inv()).as_rotvec()) < threshold_r):
                 break
 
-    def _move_joint_sequential(self, target_qpos, joint_order, speed=1.0):
+    def _move_joint_sequential(self, target_qpos, joint_order, threshold=0.06):
         current_target = self.arm.get_data()["qpos"].copy()
         for j in joint_order:
             current_target[j] = target_qpos[j]
-            self.arm.move(current_target, is_servo=False, speed=speed)
+            stall_count = 0
+            prev_qpos = None
+            recovered = False
+            for _ in range(500):
+                cur = self.arm.get_data()["qpos"]
+                if prev_qpos is not None and np.linalg.norm(cur - prev_qpos) < 1e-4:
+                    stall_count += 1
+                    if stall_count >= 50 and not recovered:
+                        print(f"[executor] joint {j} stall, clearing error...")
+                        self.arm.clear_error()
+                        recovered = True
+                        stall_count = 0
+                    elif stall_count >= 100:
+                        print(f"[executor] joint {j} stall after recovery, skipping")
+                        break
+                else:
+                    stall_count = 0
+                prev_qpos = cur.copy()
+                nxt = self._safe_joint_step(cur, current_target, vel_limit=0.06)
+                self.arm.move(nxt, is_servo=True)
+                time.sleep(self.dt)
+                if np.abs(self.arm.get_data()["qpos"][j] - target_qpos[j]) < threshold:
+                    break
 
     # ── public API ────────────────────────────────────────────────────────
 
