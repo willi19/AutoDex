@@ -385,8 +385,8 @@ class GraspPlanner:
             sphere_meshes = []
             for sphere_batch in spheres:
                 for s in sphere_batch:
-                    pos = s[:3].cpu().numpy()
-                    rad = s[3].item()
+                    pos = np.asarray(s.position)
+                    rad = float(s.radius)
                     if rad > 0:
                         m = trimesh.creation.icosphere(radius=rad)
                         m.apply_translation(pos)
