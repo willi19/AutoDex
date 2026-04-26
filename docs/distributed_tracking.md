@@ -47,12 +47,12 @@ Goal: replace `src/execution/daemon/perception_pipeline.py` (SAM3 + DA3 + FPose 
 ## Setup steps
 
 ### 1. MV-GoTrack repo
-The fork lives at `autodex/perception/thirdparty/MV-GoTrack/` as a submodule of the AutoDex repo. Initial install (replicate on each PC):
+The fork lives at `autodex/perception/thirdparty/MV-GoTrack/`. **It is NOT registered as a submodule of AutoDex** (gitignored placeholder dir), so you have to clone it manually on each PC. The fork URL is `https://github.com/gunhee1113/MV-GoTrack.git`.
 
 ```bash
-cd ~/AutoDex
-git submodule update --init --recursive autodex/perception/thirdparty/MV-GoTrack
-cd autodex/perception/thirdparty/MV-GoTrack
+cd ~/AutoDex/autodex/perception/thirdparty
+git clone https://github.com/gunhee1113/MV-GoTrack.git
+cd MV-GoTrack
 
 # (a) Submodules of the fork itself (bop_toolkit + dinov2)
 git submodule update --init --recursive
@@ -88,6 +88,11 @@ git lfs fetch upstream main --include="gotrack_checkpoint.pt"
 cp .git/lfs/objects/f7/d1/f7d127abe2b8e37b1322a19115343286a6560700c6e02fc6080b4e2426a01086 \
     gotrack_checkpoint.pt
 sha256sum gotrack_checkpoint.pt    # expect f7d127abe2b8...
+
+# (i) Apply our local patches (CRITICAL — removes silent pyrender fallback in
+#     renderer_nvdiffrast.py; without this you get the 25x slowdown described
+#     in Anti-patterns). The patch lives in the AutoDex repo.
+git apply ~/AutoDex/patches/MV-GoTrack-renderer-fix.patch
 ```
 
 After this, sanity-check that the env can import GoTrack and create a CUDA

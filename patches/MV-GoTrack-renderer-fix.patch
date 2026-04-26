@@ -1,0 +1,138 @@
+diff --git a/utils/renderer_nvdiffrast.py b/utils/renderer_nvdiffrast.py
+index d1187d2..d212142 100644
+--- a/utils/renderer_nvdiffrast.py
++++ b/utils/renderer_nvdiffrast.py
+@@ -14,7 +14,7 @@ import numpy as np
+ import torch
+ import trimesh
+ 
+-from utils import logging, renderer as pyrender_renderer
++from utils import logging
+ from utils import renderer_base, structs, torch_helpers, transform3d
+ 
+ logger = logging.get_logger(__name__)
+@@ -38,7 +38,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+         self.gotrack_translation_scale = 1.0
+         self.gotrack_translation_scale_by_object: Dict[int, float] = {}
+         self.backend_name = "nvdiffrast_cuda"
+-        self.is_fallback = False
+         self.object_meshes: Dict[int, trimesh.Trimesh] = {}
+         self._mesh_cache: Dict[int, Dict[str, torch.Tensor]] = {}
+         self._contexts: Dict[int, Any] = {}
+@@ -46,37 +45,15 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+         requested_device = torch.device(
+             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
+         )
+-        self.device = requested_device
+-
+-        try:
+-            import nvdiffrast.torch as dr  # type: ignore
+-
+-            self._dr = dr
+-        except Exception:
+-            logger.warning(
+-                "nvdiffrast is not available; falling back to PyrenderRasterizer."
+-            )
+-            self.backend_name = "nvdiffrast_unavailable_pyrender_fallback"
+-            self.is_fallback = True
+-            self._delegate = pyrender_renderer.PyrenderRasterizer(
+-                model_path=model_path,
+-                **kwargs,
+-            )
+-            return
+-
+         if requested_device.type != "cuda" or not torch.cuda.is_available():
+-            logger.warning(
+-                "nvdiffrast requires CUDA; falling back to PyrenderRasterizer."
+-            )
+-            self.backend_name = "nvdiffrast_cpu_requested_pyrender_fallback"
+-            self.is_fallback = True
+-            self._delegate = pyrender_renderer.PyrenderRasterizer(
+-                model_path=model_path,
+-                **kwargs,
++            raise RuntimeError(
++                "NvdiffrastRasterizer requires CUDA; got "
++                f"requested_device={requested_device}, cuda_available={torch.cuda.is_available()}."
+             )
+-            return
+ 
+-        self._delegate = None
++        import nvdiffrast.torch as dr  # type: ignore
++        self._dr = dr
++
+         self.device = torch.device(
+             "cuda",
+             requested_device.index
+@@ -84,11 +61,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+             else torch.cuda.current_device(),
+         )
+ 
+-    def __getattr__(self, name: str) -> Any:
+-        if self.is_fallback:
+-            return getattr(self._delegate, name)
+-        raise AttributeError(name)
+-
+     def _get_context(self) -> Any:
+         device_index = int(
+             self.device.index if self.device.index is not None else torch.cuda.current_device()
+@@ -201,15 +173,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+         mesh_color: Optional[structs.Color] = None,
+         **kwargs: Any,
+     ) -> None:
+-        if self.is_fallback:
+-            self._delegate.add_object_model(
+-                obj_id=obj_id,
+-                model_path=model_path,
+-                mesh_color=mesh_color,
+-                **kwargs,
+-            )
+-            return
+-
+         if obj_id in self._mesh_cache:
+             return
+ 
+@@ -483,9 +446,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+         return_tensors: bool = False,
+         background: Optional[structs.Color] = None,
+     ) -> structs.Collection:
+-        if self.is_fallback:
+-            raise RuntimeError("Batch object rendering is not available in fallback mode.")
+-
+         if len(obj_ids) != len(camera_models_c2w):
+             raise ValueError("Number of object ids and cameras must match.")
+ 
+@@ -559,16 +519,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+         background: Optional[structs.Color] = None,
+         **kwargs: Any,
+     ) -> Dict[renderer_base.RenderType, structs.ArrayData]:
+-        if self.is_fallback:
+-            return self._delegate.render_object_model(
+-                obj_id=obj_id,
+-                camera_model_c2w=camera_model_c2w,
+-                render_types=render_types,
+-                return_tensors=return_tensors,
+-                background=background,
+-                **kwargs,
+-            )
+-
+         batch = self.render_object_models_batch(
+             obj_ids=[obj_id],
+             camera_models_c2w=[camera_model_c2w],
+@@ -606,17 +556,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+         background: Optional[structs.Color] = None,
+         **kwargs: Any,
+     ) -> Dict[renderer_base.RenderType, structs.ArrayData]:
+-        if self.is_fallback:
+-            return self._delegate.render_meshes(
+-                meshes_in_w=meshes_in_w,
+-                camera_model_c2w=camera_model_c2w,
+-                render_types=render_types,
+-                mesh_colors=mesh_colors,
+-                return_tensors=return_tensors,
+-                background=background,
+-                **kwargs,
+-            )
+-
+         vertices_list = []
+         faces_list = []
+         colors_list = []
