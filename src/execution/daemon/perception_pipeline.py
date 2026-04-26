@@ -533,50 +533,26 @@ class PerceptionPipeline:
     def _select_best_pose(self, poses_cam, mask_dir, intrinsics, extrinsics, all_serials, H, W):
         """Select best pose by mean mask IoU across all views.
 
-        Uses cached mesh tensors + glctx from silhouette optimizer if available.
+        Uses cached mesh tensors + glctx from silhouette optimizer.
         """
+        from autodex.perception.pose_select import select_best_pose_by_iou, load_masks_bool
+
         self._load_sil_optimizer()
-        mt = self._sil_optimizer.mesh_tensors
-        glctx = self._sil_optimizer.glctx
-        _fp_root = str(Path(__file__).resolve().parents[3] / "autodex/perception/thirdparty/FoundationPose")
-        if _fp_root not in sys.path:
-            sys.path.insert(0, _fp_root)
-        from Utils import nvdiffrast_render
+        sam_masks = load_masks_bool(mask_dir, all_serials)
+        candidates = {
+            s: np.linalg.inv(extrinsics[s]) @ pose_cam
+            for s, pose_cam in poses_cam.items()
+        }
 
-        # Pre-load all masks
-        sam_masks = {}
-        for s in all_serials:
-            mp = mask_dir / f"{s}.png"
-            if mp.exists():
-                m = cv2.imread(str(mp), cv2.IMREAD_GRAYSCALE)
-                if m is not None:
-                    sam_masks[s] = m > 127
-
-        best_serial, best_iou, best_pose = None, -1, None
-
-        for src_s, pose_cam in poses_cam.items():
-            pose_world = np.linalg.inv(extrinsics[src_s]) @ pose_cam
-            ious = []
-
-            for tgt_s in all_serials:
-                if tgt_s not in sam_masks:
-                    continue
-                K = intrinsics[tgt_s].astype(np.float32)
-                pc = extrinsics[tgt_s] @ pose_world
-                pt = torch.as_tensor(pc, device="cuda", dtype=torch.float32).reshape(1, 4, 4)
-                rc, _, _ = nvdiffrast_render(K=K, H=H, W=W, ob_in_cams=pt, glctx=glctx,
-                                              mesh_tensors=mt, use_light=False)
-                sil = rc[0].detach().cpu().numpy().sum(axis=2) > 0
-                inter = (sil & sam_masks[tgt_s]).sum()
-                union = (sil | sam_masks[tgt_s]).sum()
-                ious.append(float(inter / union) if union > 0 else 0.0)
-
-            mean_iou = np.mean(ious) if ious else 0.0
-            if mean_iou > best_iou:
-                best_iou = mean_iou
-                best_serial = src_s
-                best_pose = pose_world
-
+        best_serial, best_pose, best_iou, _ = select_best_pose_by_iou(
+            candidates=candidates,
+            masks=sam_masks,
+            intrinsics=intrinsics,
+            extrinsics=extrinsics,
+            H=H, W=W,
+            glctx=self._sil_optimizer.glctx,
+            mesh_tensors=self._sil_optimizer.mesh_tensors,
+        )
         logger.info(f"Best: {best_serial}, mean IoU={best_iou:.3f}")
         return best_serial, best_pose
 
