@@ -118,15 +118,23 @@ if __name__ == "__main__":
                         help="Override candidate root directory")
     parser.add_argument("--output_root", type=str, default=None,
                         help="Override output root directory")
+    parser.add_argument("--obj_root_dir", type=str, default=None,
+                        help="Override object root dir (default: paradex)")
+    parser.add_argument("--obj_list_file", type=str, default=None,
+                        help="Object list file (default: src/grasp_generation/obj_list.txt)")
     args = parser.parse_args()
 
     # Object list
     if args.obj:
         obj_list = [args.obj]
     else:
-        obj_list_file = os.path.join(REPO_ROOT, "src", "grasp_generation", "obj_list.txt")
+        obj_list_file = args.obj_list_file or os.path.join(
+            REPO_ROOT, "src", "grasp_generation", "obj_list.txt"
+        )
         with open(obj_list_file) as f:
             obj_list = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+
+    obj_root = args.obj_root_dir or obj_path
 
     from autodex.utils.path import repo_dir
     candidate_root = args.candidate_root or os.path.join(repo_dir, "candidates", args.hand, args.version)
@@ -136,6 +144,7 @@ if __name__ == "__main__":
     hand_cfg_map = {
         "allegro": os.path.join(project_dir, "content", "configs", "robot", "allegro_floating.yml"),
         "inspire": os.path.join(project_dir, "content", "configs", "robot", "inspire_floating.yml"),
+        "inspire_left": os.path.join(project_dir, "content", "configs", "robot", "inspire_left_floating.yml"),
     }
     hand_cfg = hand_cfg_map.get(args.hand)
     planner = GraspPlanner(hand_cfg_path=hand_cfg)
@@ -156,7 +165,7 @@ if __name__ == "__main__":
         print(f"  Loaded {len(grasp_info_list)} candidates")
 
         # Build valid_array: for each scene, check collision-free reachability
-        scene_root = os.path.join(obj_path, obj_name, "scene")
+        scene_root = os.path.join(obj_root, obj_name, "scene")
         valid_array = []
 
         for scene_type in tqdm(sorted(os.listdir(scene_root)), desc="  Scene types", leave=False):

@@ -1,0 +1,164 @@
+robot_cfg:
+  robot_color:
+  - 0.9
+  - 0.45
+  - 0.1
+  - 1.0
+  kinematics:
+    base_link: base_link
+    use_root_pose: true
+    hand_pose_transfer_path: hand_pose_transfer/inspire_f1.yml
+    collision_link_names:
+    - base_link
+    - plam_2
+    - plam_3
+    - right_thumb_1
+    - right_thumb_2
+    - right_thumb_3
+    - right_thumb_4
+    - right_index_1
+    - right_index_2
+    - right_middle_1
+    - right_middle_2
+    - right_ring_1
+    - right_ring_2
+    - right_little_1
+    - right_little_2
+    - index_force_sensor
+    - middle_force_sensor
+    - ring_force_sensor
+    - little_force_sensor
+    - thumb_force_sensor
+    collision_sphere_buffer: 0.0
+    collision_spheres: spheres/inspire_f1.yml
+    ee_link: thumb_tip
+    link_names:
+    - thumb_tip
+    - index_tip
+    - middle_tip
+    - ring_tip
+    - little_tip
+    self_collision_buffer:
+      base_link: 0.0
+      plam_2: 0.0
+      plam_3: 0.0
+      right_thumb_1: 0.0
+      right_thumb_2: 0.002
+      right_thumb_3: 0.002
+      right_thumb_4: 0.0
+      right_index_1: 0.0
+      right_index_2: 0.0
+      right_middle_1: 0.0
+      right_middle_2: 0.0
+      right_ring_1: 0.0
+      right_ring_2: 0.0
+      right_little_1: 0.0
+      right_little_2: 0.0
+      index_force_sensor: 0.0
+      middle_force_sensor: 0.0
+      ring_force_sensor: 0.0
+      little_force_sensor: 0.0
+      thumb_force_sensor: 0.0
+    self_collision_ignore:
+      base_link:
+      - plam_2
+      - plam_3
+      - right_thumb_1
+      - right_index_1
+      - right_middle_1
+      - right_ring_1
+      - right_little_1
+      plam_2:
+      - plam_3
+      - right_little_1
+      - right_ring_1
+      - right_middle_1
+      - right_index_1
+      plam_3:
+      - right_little_1
+      - right_ring_1
+      right_thumb_1:
+      - right_thumb_2
+      right_thumb_2:
+      - right_thumb_3
+      - thumb_force_sensor
+      right_thumb_3:
+      - right_thumb_4
+      - thumb_force_sensor
+      right_thumb_4:
+      - thumb_force_sensor
+      thumb_force_sensor: []
+      right_index_1:
+      - right_index_2
+      right_index_2:
+      - index_force_sensor
+      index_force_sensor: []
+      right_middle_1:
+      - right_middle_2
+      right_middle_2:
+      - middle_force_sensor
+      middle_force_sensor: []
+      right_ring_1:
+      - right_ring_2
+      right_ring_2:
+      - ring_force_sensor
+      ring_force_sensor: []
+      right_little_1:
+      - right_little_2
+      right_little_2:
+      - little_force_sensor
+      little_force_sensor: []
+    urdf_path: robot/inspire_f1_description/inspire_f1_hand_right.urdf
+    asset_root_path: robot/inspire_f1_description
+    cspace:
+      joint_names:
+      - right_thumb_1_joint
+      - right_thumb_2_joint
+      - right_index_1_joint
+      - right_middle_1_joint
+      - right_ring_1_joint
+      - right_little_1_joint
+      cspace_distance_weight:
+      - 0.1
+      - 0.1
+      - 0.1
+      - 0.1
+      - 0.1
+      - 0.1
+      null_space_weight:
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      retract_config:
+      - 1.3
+      - 0.0
+      - 0.8
+      - 0.8
+      - 0.8
+      - 0.8
+      max_acceleration: 15.0
+      max_jerk: 500.0
+    mesh_link_names:
+    - base_link
+    - plam_2
+    - plam_3
+    - right_thumb_1
+    - right_thumb_2
+    - right_thumb_3
+    - right_thumb_4
+    - right_index_1
+    - right_index_2
+    - right_middle_1
+    - right_middle_2
+    - right_ring_1
+    - right_ring_2
+    - right_little_1
+    - right_little_2
+    - index_force_sensor
+    - middle_force_sensor
+    - ring_force_sensor
+    - little_force_sensor
+    - thumb_force_sensor

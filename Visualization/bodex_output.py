@@ -12,19 +12,37 @@ from paradex.visualization.visualizer.viser import ViserViewer
 from rsslib.conversion import se32cart
 from rsslib.path import candidate_path, obj_path
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BODEX_ASSET = os.path.join(REPO_ROOT, "src", "grasp_generation", "BODex", "src", "curobo", "content", "assets", "robot")
+
+HAND_URDFS = {
+    "allegro": os.path.join(BODEX_ASSET, "allegro_description", "allegro_hand_description_right.urdf"),
+    "inspire": os.path.join(BODEX_ASSET, "inspire_description", "inspire_hand_right.urdf"),
+    "inspire_left": os.path.join(BODEX_ASSET, "inspire_description", "inspire_hand_left.urdf"),
+}
+
+# Hand -> bodex root.  Old allegro data lives under rsslib candidate_path (no hand subdir).
+# New data (inspire, inspire_left) lives under AutoDex/bodex_outputs/{hand}/.
+HAND_ROOTS = {
+    "allegro": candidate_path,
+    "inspire": os.path.join(REPO_ROOT, "bodex_outputs", "inspire"),
+    "inspire_left": os.path.join(REPO_ROOT, "bodex_outputs", "inspire_left"),
+}
+
 class BODexVisualizer(ViserViewer):
     def __init__(self):
         super().__init__()
 
-        self.bodex_root = candidate_path
         self.obj_root = obj_path
-        
+        self.current_hand = "allegro"
+        self.bodex_root = HAND_ROOTS[self.current_hand]
+
         self.cur_version = None
         self.current_obj = None
         self.current_scene_type = None
         self.current_scene_idx = None
 
-        self.version_list = os.listdir(self.bodex_root)
+        self.version_list = os.listdir(self.bodex_root) if os.path.isdir(self.bodex_root) else []
         self.obj_list = []
         self.scene_type_list = []
         self.scene_idx_list = []
@@ -32,9 +50,15 @@ class BODexVisualizer(ViserViewer):
         self.all_grasp_dirs = []  # 모든 grasp
         self.filtered_grasp_dirs = []  # 필터링된 grasp
         self.gui_playing.value = True
-        
+
         # GUI
         with self.server.gui.add_folder("BODex Grasp Viewer"):
+            self.hand_selector = self.server.gui.add_dropdown(
+                "Hand",
+                options=list(HAND_URDFS.keys()),
+                initial_value=self.current_hand,
+            )
+
             self.version_selector = self.server.gui.add_dropdown(
                 "Version",
                 options=self.version_list,
@@ -86,6 +110,10 @@ class BODexVisualizer(ViserViewer):
         self._on_version_change()
         
         # Callbacks
+        @self.hand_selector.on_update
+        def _(event):
+            self._on_hand_change()
+
         @self.version_selector.on_update
         def _(event):
             self._on_version_change()
@@ -120,16 +148,25 @@ class BODexVisualizer(ViserViewer):
         
         self.squeeze_num = 10
 
+    def _on_hand_change(self):
+        self.current_hand = self.hand_selector.value
+        self.bodex_root = HAND_ROOTS.get(self.current_hand, HAND_ROOTS["allegro"])
+        self.version_list = sorted(os.listdir(self.bodex_root)) if os.path.isdir(self.bodex_root) else []
+        self.version_selector.options = self.version_list
+        if self.version_list:
+            self.version_selector.value = self.version_list[0]
+        self._on_version_change()
+
     def _on_version_change(self):
         self.cur_version = self.version_selector.value
         if not self.cur_version:
             return
-        
+
         objs = self._available_objects()
         if not objs:
             self.obj_selector.disabled = True
             return
-        
+
         self.obj_selector.disabled = False
         self.obj_selector.options = objs
         self.obj_selector.value = objs[0]
@@ -377,8 +414,8 @@ class BODexVisualizer(ViserViewer):
         # Transform to world frame
         robot_T = self.obj_pose @ wrist_se3
         
-        urdf_path = "BODex/src/curobo/content/assets/robot/allegro_description/allegro_hand_description_right.urdf"
-        self.add_robot("robot", urdf_path, pose=robot_T)
+        hand_urdf = HAND_URDFS.get(self.current_hand, HAND_URDFS["allegro"])
+        self.add_robot("robot", hand_urdf, pose=robot_T)
         
         
         # Show trajectory

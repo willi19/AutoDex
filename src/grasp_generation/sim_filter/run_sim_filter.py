@@ -42,6 +42,14 @@ HAND_PATHS = {
         "path": os.path.join(REPO_ROOT, "src", "grasp_generation", "BODex", "src", "curobo", "content", "assets", "robot", "inspire_description", "inspire_hand_right.urdf"),
         "weld_body": "wrist",
     },
+    "inspire_left": {
+        "path": os.path.join(REPO_ROOT, "src", "grasp_generation", "BODex", "src", "curobo", "content", "assets", "robot", "inspire_description", "inspire_hand_left.urdf"),
+        "weld_body": "wrist",
+    },
+    "inspire_f1": {
+        "path": os.path.join(REPO_ROOT, "src", "grasp_generation", "BODex", "src", "curobo", "content", "assets", "robot", "inspire_f1_description", "inspire_f1_hand_right.urdf"),
+        "weld_body": "base_link",
+    },
 }
 
 # R_delta (same as RSS_2026 base.py)
@@ -86,6 +94,25 @@ INSPIRE_MIMIC_MAP = [
     (4, 1.05, 0),   # ring2 = ring1 * 1.05
     None,           # little1 (act 5)
     (5, 1.18, 0),   # little2 = little1 * 1.18
+]
+
+# Inspire F1 (RH56F1): same 12-joint URDF order as inspire, different multipliers.
+# URDF order: thumb1, thumb2, thumb3(mimic thumb2*1.2953), thumb4(mimic thumb2*1.1610),
+#   index1, index2(mimic index1*1.1545), middle1, middle2(mimic middle1*1.1545),
+#   ring1, ring2(mimic ring1*1.1545), little1, little2(mimic little1*1.1545)
+INSPIRE_F1_MIMIC_MAP = [
+    None,             # thumb1 (act 0)
+    None,             # thumb2 (act 1)
+    (1, 1.2953, 0),   # thumb3 = thumb2 * 1.2953
+    (1, 1.1610, 0),   # thumb4 = thumb2 * 1.1610
+    None,             # index1 (act 2)
+    (2, 1.1545, 0),   # index2 = index1 * 1.1545
+    None,             # middle1 (act 3)
+    (3, 1.1545, 0),   # middle2 = middle1 * 1.1545
+    None,             # ring1 (act 4)
+    (4, 1.1545, 0),   # ring2 = ring1 * 1.1545
+    None,             # little1 (act 5)
+    (5, 1.1545, 0),   # little2 = little1 * 1.1545
 ]
 
 
@@ -166,7 +193,7 @@ def eval_single_grasp(mj, wrist_se3, pregrasp_joints, grasp_joints, mimic_map=No
     return True, traj
 
 
-def run_sim_filter(hand, version, obj_name, bodex_root, candidate_root, viewer=False, coll_only=False, sim_only=False):
+def run_sim_filter(hand, version, obj_name, bodex_root, candidate_root, viewer=False, coll_only=False, sim_only=False, obj_root_dir=None):
     bodex_obj_dir = os.path.join(bodex_root, obj_name)
     if not os.path.isdir(bodex_obj_dir):
         print(f"  No BODex outputs for {obj_name}")
@@ -177,7 +204,10 @@ def run_sim_filter(hand, version, obj_name, bodex_root, candidate_root, viewer=F
         print(f"  No hand config for {hand}")
         return 0, 0
 
-    from autodex.utils.path import obj_path as obj_data_path
+    if obj_root_dir is not None:
+        obj_data_path = obj_root_dir
+    else:
+        from autodex.utils.path import obj_path as obj_data_path
 
     # Group seeds by scene
     scene_seeds = {}  # (scene_type, scene_id) -> [(seed, seed_dir), ...]
@@ -210,11 +240,15 @@ def run_sim_filter(hand, version, obj_name, bodex_root, candidate_root, viewer=F
                     coll_valid[sd] = False
     else:
         print(f"  [1/2] Collision check...")
-        from autodex.utils.path import robot_configs_path
-        if hand == "allegro":
-            hand_coll_cfg = os.path.join(robot_configs_path, "allegro_floating.yml")
-        else:
-            hand_coll_cfg = os.path.join(robot_configs_path, "inspire_floating.yml")
+        # Use local planner configs (shared_data NAS may be read-only)
+        _local_configs = os.path.join(REPO_ROOT, "autodex", "planner", "src", "curobo", "content", "configs", "robot")
+        hand_coll_cfgs = {
+            "allegro": "allegro_floating.yml",
+            "inspire": "inspire_floating.yml",
+            "inspire_left": "inspire_left_floating.yml",
+            "inspire_f1": "inspire_f1_floating.yml",
+        }
+        hand_coll_cfg = os.path.join(_local_configs, hand_coll_cfgs.get(hand, "inspire_floating.yml"))
         planner = GraspPlanner(hand_cfg_path=hand_coll_cfg)
 
         n_coll_pass = 0
@@ -288,7 +322,8 @@ def run_sim_filter(hand, version, obj_name, bodex_root, candidate_root, viewer=F
     # --- Step 2: MuJoCo sim eval (only collision-free seeds) ---
     print(f"  [2/2] MuJoCo sim eval...")
     mj = MjHO(obj_name, hand_cfg["path"], weld_body_name=hand_cfg["weld_body"],
-              obj_mass=OBJ_MASS, debug_viewer=viewer)
+              obj_mass=OBJ_MASS, debug_viewer=viewer,
+              obj_root_dir=obj_root_dir)
 
     all_seeds = []
     for (scene_type, scene_id), seeds in scene_seeds.items():
@@ -328,7 +363,12 @@ def run_sim_filter(hand, version, obj_name, bodex_root, candidate_root, viewer=F
         pregrasp = np.load(os.path.join(seed_dir, "pregrasp_pose.npy"))
         grasp = np.load(os.path.join(seed_dir, "grasp_pose.npy"))
 
-        mimic_map = INSPIRE_MIMIC_MAP if hand == "inspire" else None
+        if hand in ("inspire", "inspire_left"):
+            mimic_map = INSPIRE_MIMIC_MAP
+        elif hand == "inspire_f1":
+            mimic_map = INSPIRE_F1_MIMIC_MAP
+        else:
+            mimic_map = None
         apply_r_delta = (hand == "allegro")  # R_DELTA is allegro-specific
         try:
             succ, traj_data = eval_single_grasp(mj, wrist_se3, pregrasp, grasp, mimic_map=mimic_map, apply_r_delta=apply_r_delta)
@@ -369,12 +409,18 @@ if __name__ == "__main__":
     parser.add_argument("--obj", type=str, default=None)
     parser.add_argument("--viewer", action="store_true")
     parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers (object-level)")
+    parser.add_argument("--obj_root_dir", type=str, default=None,
+                        help="Override object root dir (default: paradex from autodex.utils.path)")
+    parser.add_argument("--obj_list_file", type=str, default=None,
+                        help="Object list file (default: src/grasp_generation/obj_list.txt)")
     args = parser.parse_args()
 
     if args.obj:
         obj_list = [args.obj]
     else:
-        obj_list_file = os.path.join(REPO_ROOT, "src", "grasp_generation", "obj_list.txt")
+        obj_list_file = args.obj_list_file or os.path.join(
+            REPO_ROOT, "src", "grasp_generation", "obj_list.txt"
+        )
         with open(obj_list_file) as f:
             obj_list = [l.strip() for l in f if l.strip() and not l.startswith("#")]
 
@@ -388,7 +434,8 @@ if __name__ == "__main__":
         print("\n=== Stage 1: Collision check (all objects) ===")
         for obj_name in obj_list:
             run_sim_filter(args.hand, args.version, obj_name,
-                           bodex_root, candidate_root, coll_only=True)
+                           bodex_root, candidate_root, coll_only=True,
+                           obj_root_dir=args.obj_root_dir)
 
         # Stage 2: MuJoCo sim eval (CPU, parallel)
         print(f"\n=== Stage 2: MuJoCo sim eval ({args.workers} workers) ===")
@@ -396,7 +443,8 @@ if __name__ == "__main__":
 
         def _run_mujoco(obj_name):
             total, succ = run_sim_filter(args.hand, args.version, obj_name,
-                                          bodex_root, candidate_root, sim_only=True)
+                                          bodex_root, candidate_root, sim_only=True,
+                                          obj_root_dir=args.obj_root_dir)
             print(f"  {obj_name}: {succ}/{total} passed")
             return obj_name, total, succ
 
@@ -409,5 +457,6 @@ if __name__ == "__main__":
         for obj_name in obj_list:
             print(f"\n{obj_name}:")
             total, succ = run_sim_filter(args.hand, args.version, obj_name,
-                                          bodex_root, candidate_root, viewer=args.viewer)
+                                          bodex_root, candidate_root, viewer=args.viewer,
+                                          obj_root_dir=args.obj_root_dir)
             print(f"  {succ}/{total} passed")

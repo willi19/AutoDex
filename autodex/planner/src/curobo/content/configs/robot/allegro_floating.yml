@@ -1,0 +1,112 @@
+robot_cfg:
+    kinematics:
+        use_usd_kinematics: False
+        usd_path: "" 
+        usd_robot_root: ""
+        isaac_usd_path: ""
+        usd_flip_joints: {}
+        usd_flip_joint_limits: []
+
+        urdf_path: "robot/allegro_description/allegro_floating.urdf"
+        asset_root_path: "robot/allegro_description"
+
+        base_link: "world"  
+        ee_link: "base_link"
+        link_names: [
+            "allegro_root0", "allegro_root1", "allegro_root2", "allegro_root3", "allegro_root4", "allegro_root5",
+            "base_link",
+            "link_0.0", "link_1.0", "link_2.0", "link_3.0","link_3.0_tip",
+            "link_4.0", "link_5.0", "link_6.0", "link_7.0","link_7.0_tip",
+            "link_8.0", "link_9.0", "link_10.0", "link_11.0","link_11.0_tip",
+            "link_12.0", "link_13.0", "link_14.0", "link_15.0","link_15.0_tip"
+        ]
+
+        collision_link_names: ["base_link", 
+          "link_1.0", "link_2.0", "link_3.0", "link_3.0_tip", 
+          "link_5.0", "link_6.0", "link_7.0", "link_7.0_tip", 
+          "link_9.0", "link_10.0", "link_11.0", "link_11.0_tip",
+          "link_13.0", "link_14.0", "link_15.0", "link_15.0_tip"
+        ]
+
+        collision_spheres: "spheres/allegro.yml"  
+        collision_sphere_buffer: 0.0
+        self_collision_ignore: {
+          base_link: [link_1.0, link_5.0, link_9.0, link_12.0],
+          link_1.0: [link_2.0],
+          link_2.0: [link_3.0],
+          link_3.0: [link_3.0_tip],
+          link_5.0: [link_6.0],
+          link_6.0: [link_7.0],
+          link_7.0: [link_7.0_tip],
+          link_9.0: [link_10.0],
+          link_10.0: [link_11.0],
+          link_11.0: [link_11.0_tip],
+          link_12.0: [link_13.0, link_14.0],
+          link_13.0: [link_14.0],
+          link_14.0: [link_15.0],
+          link_15.0: [link_15.0_tip]
+        } 
+        self_collision_buffer: {
+          "base_link": 0.0,
+          "link_1.0": 0.0,
+          "link_2.0": 0.0,
+          "link_3.0": 0.002,
+          "link_3.0_tip": 0.0,
+          "link_5.0": 0.0,
+          "link_6.0": 0.0,
+          "link_7.0": 0.002,
+          "link_7.0_tip": 0.0,
+          "link_9.0": 0.0,
+          "link_10.0": 0.0,
+          "link_11.0": 0.002,
+          "link_11.0_tip": 0.0,
+          "link_13.0": 0.0,
+          "link_14.0": 0.0,
+          "link_15.0": 0.002,
+          "link_15.0_tip": 0.0
+        }
+
+        use_global_cumul: True
+        mesh_link_names: [
+          "base_link",
+          "link_0.0", "link_1.0", "link_2.0", "link_3.0", "link_3.0_tip",
+          "link_4.0", "link_5.0", "link_6.0", "link_7.0", "link_7.0_tip",
+          "link_8.0", "link_9.0", "link_10.0", "link_11.0", "link_11.0_tip",
+          "link_12.0", "link_13.0", "link_14.0", "link_15.0", "link_15.0_tip"
+        ]
+        
+        cspace:
+          joint_names: [
+            'x_joint', 'y_joint', 'z_joint',  # floating base position
+            'x_rotation_joint', 'y_rotation_joint', 'z_rotation_joint',  # floating base rotation
+            'joint_0.0', 'joint_1.0', 'joint_2.0', 'joint_3.0',  # allegro hand
+            'joint_4.0', 'joint_5.0', 'joint_6.0', 'joint_7.0',
+            'joint_8.0', 'joint_9.0', 'joint_10.0', 'joint_11.0',
+            'joint_12.0', 'joint_13.0', 'joint_14.0', 'joint_15.0'
+          ]
+          retract_config: [
+            0.0, 0.0, 0.0,  # base position
+            0.0, 0.0, 0.0,  # base rotation
+            0., 0., 0., 0.,  # allegro
+            0., 0., 0., 0.,
+            0., 0., 0., 0.,
+            0., 0., 0., 0.
+          ]
+          cspace_distance_weight: [
+            1, 1, 1,  # base position
+            1, 1, 1,  # base rotation
+            1, 1, 1, 1,
+            1, 1, 1, 1,
+            1, 1, 1, 1,
+            1, 1, 1, 1
+          ]
+          null_space_weight: [
+            0, 0, 0,  # base
+            0, 0, 0,
+            0, 0, 0, 0,
+            0, 0, 0, 0,
+            0, 0, 0, 0,
+            0, 0, 0, 0
+          ]
+          max_jerk: 500.0
+          max_acceleration: 15.0

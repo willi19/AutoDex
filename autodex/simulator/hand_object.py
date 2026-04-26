@@ -31,7 +31,9 @@ class MjHO:
         friction_coef=(0.6, 0.02),
         has_floor=False,
         debug_viewer=False,
+        obj_root_dir=None,
     ):
+        self._obj_root_dir = obj_root_dir or obj_path
         self.hand_mocap = True
         self._is_urdf = False
         self.spec = mujoco.MjSpec()
@@ -85,11 +87,18 @@ class MjHO:
         self.data = mujoco.MjData(self.model)
 
         if self._is_urdf:
-            # Disable base_link collision (raw STL convex hull too large)
+            # Disable collision on links that BODex treats as non-colliding.
+            # base_link: raw STL convex hull too large.
+            # inspire_f1 specific: plam_1 / plam_force_sensor / *_tip not in BODex collision set
+            #   (BODex uses plam_2, plam_3, *_force_sensor instead). If left enabled, palm/tip
+            #   collision prevents the hand from closing as BODex intended.
+            disable_substrings = ('base_link', 'plam_1', 'plam_force_sensor',
+                                  'thumb_tip', 'index_tip', 'middle_tip',
+                                  'ring_tip', 'little_tip')
             for i in range(self.model.ngeom):
                 body_id = self.model.geom_bodyid[i]
                 body_name = self.model.body(body_id).name
-                if 'base_link' in body_name:
+                if any(s in body_name for s in disable_substrings):
                     self.model.geom_contype[i] = 0
                     self.model.geom_conaffinity[i] = 0
             # Add joint damping (URDF has 0 damping → unstable with position actuators)
@@ -167,7 +176,7 @@ class MjHO:
                 pos=[0, 0, 0], size=[0, 0, 1.0],
             )
 
-        obj_dir = os.path.join(obj_path, obj_name, "processed_data")
+        obj_dir = os.path.join(self._obj_root_dir, obj_name, "processed_data")
         mesh_dir = os.path.join(obj_dir, "urdf", "meshes")
 
         import json

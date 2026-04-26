@@ -101,6 +101,8 @@ if __name__ == "__main__":
                         help="Output directory (default: bodex_outputs/{exp_name})")
     parser.add_argument("--obj_list_file", type=str, default=None,
                         help="Text file with object names (one per line). Overrides config obj_list.")
+    parser.add_argument("--obj_root_dir", type=str, default=None,
+                        help="Override object root dir (default: ~/shared_data/RSS2026_Mingi/object/paradex)")
 
     setup_logger("warn")
 
@@ -133,6 +135,7 @@ if __name__ == "__main__":
         manip_config_data["world"], args.parallel_world,
         manip_config_data["seed_num"], exp_name,
         output_dir=save_dir_parent,
+        obj_root_dir=args.obj_root_dir,
     )
 
     logger.info(f"START config={args.manip_cfg_file} exp={exp_name} parallel={args.parallel_world} output={save_dir}")

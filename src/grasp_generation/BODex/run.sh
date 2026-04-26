@@ -14,3 +14,8 @@ CUDA_VISIBLE_DEVICES=0 $PYTHON generate.py -c sim_allegro/paradex_wall.yml -w 20
 CUDA_VISIBLE_DEVICES=0 $PYTHON generate.py -c sim_inspire/paradex_box.yml -w 20 --obj_list_file "$OBJ_LIST"
 CUDA_VISIBLE_DEVICES=0 $PYTHON generate.py -c sim_inspire/paradex_shelf.yml -w 20 --obj_list_file "$OBJ_LIST"
 CUDA_VISIBLE_DEVICES=0 $PYTHON generate.py -c sim_inspire/paradex_wall.yml -w 20 --obj_list_file "$OBJ_LIST"
+
+# Inspire F1
+CUDA_VISIBLE_DEVICES=0 $PYTHON generate.py -c sim_inspire_f1/paradex_box.yml -w 20 --obj_list_file "$OBJ_LIST"
+CUDA_VISIBLE_DEVICES=0 $PYTHON generate.py -c sim_inspire_f1/paradex_shelf.yml -w 20 --obj_list_file "$OBJ_LIST"
+CUDA_VISIBLE_DEVICES=0 $PYTHON generate.py -c sim_inspire_f1/paradex_wall.yml -w 20 --obj_list_file "$OBJ_LIST"

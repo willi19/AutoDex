@@ -1,3 +1,4 @@
+import argparse
 import os
 import json
 import glob
@@ -7,6 +8,14 @@ from scipy.spatial.transform import Rotation as Rot
 
 from paradex.visualization.visualizer.viser import ViserViewer
 from autodex.utils.path import obj_path
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--obj_path", default=obj_path,
+    help="Root dir of object subdirs (default: paradex from autodex.utils.path).",
+)
+cli_args = parser.parse_args()
+obj_path = cli_args.obj_path
 
 # ── Colors (0-1 float, matching recorder_scene.py style) ─────────────────────
 COLOR_TABLE    = (0.94, 0.94, 0.96)
@@ -24,7 +33,7 @@ LINE_WIDTH_AXIS  = 3.0
 
 available_objects = sorted([
     d for d in os.listdir(obj_path)
-    if os.path.isdir(os.path.join(obj_path, d, "scene"))
+    if os.path.isdir(os.path.join(obj_path, d, "scene", "table"))
 ])
 
 print(f"Found {len(available_objects)} objects with scenes")
@@ -139,8 +148,10 @@ def load_scene():
     # Render meshes
     for mesh_name, mesh_info in scene.get("mesh", {}).items():
         if mesh_name == "target":
-            raw_path = os.path.join(obj_path, obj_name, "raw_mesh", f"{obj_name}.obj")
-            mesh = load_mesh(raw_path)
+            mesh_path = os.path.join(
+                obj_path, obj_name, "processed_data", "mesh", "simplified.obj"
+            )
+            mesh = load_mesh(mesh_path)
         else:
             mesh = trimesh.load(mesh_info["file_path"], force="mesh")
 

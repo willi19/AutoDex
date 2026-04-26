@@ -1,12 +1,22 @@
+import argparse
 import numpy as np
 import os
 import json
 import glob
+import trimesh
 
 from paradex.utils.path import shared_dir
 from paradex.visualization.visualizer.viser import ViserViewer
 
 from autodex.utils.path import robot_configs_path, get_object_mesh
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--obj_path",
+    default=os.path.join(shared_dir, "RSS2026_Mingi", "object", "paradex"),
+    help="Root dir holding object subdirs (paradex layout).",
+)
+cli_args = parser.parse_args()
 
 # ── Color palette ──────────────────────────────────────────────────────────────
 COLOR_OBB     = (0.27, 0.51, 1.00)   # Cyan
@@ -19,10 +29,10 @@ LINE_WIDTH_AXIS   = 3.0
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Find available objects
-obj_base_dir = os.path.join(shared_dir, "RSS2026_Mingi", "object", "paradex")
+obj_base_dir = cli_args.obj_path
 available_objects = sorted([
     d for d in os.listdir(obj_base_dir)
-    if os.path.isdir(os.path.join(obj_base_dir, d))
+    if os.path.isdir(os.path.join(obj_base_dir, d, "processed_data", "info", "tabletop"))
 ])
 
 vis = ViserViewer()
@@ -48,12 +58,14 @@ def clear_scene():
 def load_object(obj_name):
     clear_scene()
 
-    mesh = get_object_mesh(obj_name)
+    mesh_path = os.path.join(
+        obj_base_dir, obj_name, "processed_data", "mesh", "simplified.obj"
+    )
+    mesh = trimesh.load(mesh_path, force="mesh")
 
     # Load OBB from simplified.json
     simplified_json_path = os.path.join(
-        shared_dir, "RSS2026_Mingi", "object", "paradex", obj_name,
-        "processed_data", "info", "simplified.json"
+        obj_base_dir, obj_name, "processed_data", "info", "simplified.json"
     )
     with open(simplified_json_path, 'r') as f:
         simplified_data = json.load(f)
@@ -62,8 +74,7 @@ def load_object(obj_name):
 
     # Tabletop poses (each file is a 4x4 matrix)
     tabletop_dir = os.path.join(
-        shared_dir, "RSS2026_Mingi", "object", "paradex", obj_name,
-        "processed_data", "info", "tabletop"
+        obj_base_dir, obj_name, "processed_data", "info", "tabletop"
     )
     if not os.path.isdir(tabletop_dir):
         print(f"No tabletop directory for {obj_name}")

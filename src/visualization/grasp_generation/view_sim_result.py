@@ -11,7 +11,9 @@ import numpy as np
 import trimesh
 
 from paradex.visualization.visualizer.viser import ViserViewer
-from autodex.utils.path import obj_path
+from autodex.utils.path import obj_path as DEFAULT_OBJ_PATH
+
+obj_path = DEFAULT_OBJ_PATH  # rebound from CLI in __main__
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 BODEX_OUTPUT_ROOT = os.path.join(REPO_ROOT, "bodex_outputs")
@@ -23,6 +25,12 @@ HAND_URDFS = {
     "inspire": os.path.join(REPO_ROOT, "src", "grasp_generation", "BODex", "src",
                              "curobo", "content", "assets", "robot",
                              "inspire_description", "inspire_hand_right.urdf"),
+    "inspire_left": os.path.join(REPO_ROOT, "src", "grasp_generation", "BODex", "src",
+                                  "curobo", "content", "assets", "robot",
+                                  "inspire_description", "inspire_hand_left.urdf"),
+    "inspire_f1": os.path.join(REPO_ROOT, "src", "grasp_generation", "BODex", "src",
+                                "curobo", "content", "assets", "robot",
+                                "inspire_f1_description", "inspire_f1_hand_right.urdf"),
 }
 
 CONTACT_ARROW_SCALE = 0.08
@@ -58,7 +66,7 @@ class SimResultViewer(ViserViewer):
                 initial_value="All",
             )
             self.gui_grasp = self.server.gui.add_slider(
-                "Grasp Index", min=0, max=0, step=1, initial_value=0,
+                "Grasp Index", min=0, max=1, step=1, initial_value=0,
             )
             self.gui_show_contacts = self.server.gui.add_checkbox(
                 "Show Contacts", initial_value=True,
@@ -157,9 +165,12 @@ class SimResultViewer(ViserViewer):
             self.gui_info.value = f"No grasps ({self.gui_filter.value})"
             return
 
-        self.gui_grasp.disabled = False
-        self.gui_grasp.max = len(self.all_grasp_dirs) - 1
-        self.gui_grasp.value = 0
+        n = len(self.all_grasp_dirs)
+        with self.server.atomic():
+            self.gui_grasp.value = 0
+            self.gui_grasp.max = max(n - 1, 1)  # Mantine slider needs max > min to avoid NaN
+        self.gui_grasp.disabled = (n <= 1)
+        self.gui_info.value = f"{n} grasps ({self.gui_filter.value})"
         self._load_grasp()
 
     # --- load grasp (no scene, just hand + object) ---
@@ -168,6 +179,8 @@ class SimResultViewer(ViserViewer):
         if not hasattr(self, 'all_grasp_dirs') or not self.all_grasp_dirs:
             return
 
+        was_playing = self.gui_playing.value
+        self.gui_playing.value = False
         self._clear_all()
 
         idx = int(self.gui_grasp.value)
@@ -181,14 +194,18 @@ class SimResultViewer(ViserViewer):
         success = eval_result.get("success", False)
         reason = eval_result.get("reason", "")
 
-        # Load object mesh at origin
+        # Load object mesh at origin (prefer simplified for speed)
         obj_name = self.gui_obj.value
-        mesh_path = os.path.join(obj_path, obj_name, "raw_mesh", f"{obj_name}.obj")
-        if os.path.exists(mesh_path):
-            obj_mesh = trimesh.load(mesh_path)
-            if isinstance(obj_mesh, trimesh.Scene):
-                obj_mesh = obj_mesh.dump(concatenate=True)
+        candidates = [
+            os.path.join(obj_path, obj_name, "processed_data", "mesh", "simplified.obj"),
+            os.path.join(obj_path, obj_name, "raw_mesh", f"{obj_name}.obj"),
+        ]
+        mesh_path = next((p for p in candidates if os.path.exists(p)), None)
+        if mesh_path:
+            obj_mesh = trimesh.load(mesh_path, force="mesh")
             self.add_object("target", obj_mesh, obj_T=np.eye(4))
+        else:
+            print(f"[warning] no mesh found for {obj_name}")
 
         # Load hand
         wrist_se3 = np.load(os.path.join(seed_path, "wrist_se3.npy"))
@@ -201,6 +218,9 @@ class SimResultViewer(ViserViewer):
             self.sim_traj = json.load(open(traj_path))
             robot_qpos = np.array(self.sim_traj["robot_qpos"])
             hand_joints = robot_qpos[:, 7:] if robot_qpos.shape[1] > 16 else robot_qpos
+            if self.hand in ("inspire", "inspire_left", "inspire_f1") and hand_joints.shape[1] == 12:
+                # sim_traj stores mimic-expanded 12 joints; URDF expects 6 actuated
+                hand_joints = hand_joints[:, [0, 1, 4, 6, 8, 10]]
 
             # Object pose trajectory: convert 7D [x,y,z,qw,qx,qy,qz] to 4x4
             obj_traj = {}
@@ -227,6 +247,9 @@ class SimResultViewer(ViserViewer):
         if self.sim_traj and "contacts" in self.sim_traj:
             n_contacts_total = sum(len(c) for c in self.sim_traj["contacts"])
         self.gui_info.value = f"{self.hand} | Seed {grasp_dir} | {status} | {n_contacts_total} contacts"
+
+        if self.num_frames > 0:
+            self.gui_playing.value = was_playing
 
     # --- update scene with contact arrows ---
 
@@ -303,7 +326,11 @@ if __name__ == "__main__":
     parser.add_argument("--hand", default="allegro")
     parser.add_argument("--version", default="v3")
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--obj_path", default=DEFAULT_OBJ_PATH,
+                        help="Object root dir (default: paradex)")
     args = parser.parse_args()
+
+    globals()["obj_path"] = args.obj_path  # _load_grasp reads module-level obj_path
 
     vis = SimResultViewer(args.hand, args.version)
     vis.start_viewer()

@@ -24,6 +24,10 @@ HAND_CONFIGS = {
         "urdf": os.path.join(BODEX_ASSETS, "assets", "robot", "inspire_description", "inspire_hand_right.urdf"),
         "spheres": os.path.join(BODEX_ASSETS, "configs", "robot", "spheres", "inspire.yml"),
     },
+    "inspire_f1": {
+        "urdf": os.path.join(BODEX_ASSETS, "assets", "robot", "inspire_f1_description", "inspire_f1_hand_right.urdf"),
+        "spheres": os.path.join(BODEX_ASSETS, "configs", "robot", "spheres", "inspire_f1.yml"),
+    },
 }
 
 # Distinct colors per link group
@@ -141,4 +145,7 @@ if __name__ == "__main__":
         color = LINK_COLORS[li % len(LINK_COLORS)]
         print(f"  {link_name}: {n} spheres (color: {color})")
 
-    input("Press Enter to exit...")
+    print("Ctrl-C to exit...")
+    import time
+    while True:
+        time.sleep(1)

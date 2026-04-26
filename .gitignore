@@ -51,3 +51,5 @@ logging/*
 order/*
 rebuttal/cache/*
 rebuttal/scenes/*
+
+data/*

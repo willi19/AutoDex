@@ -18,6 +18,7 @@ import transforms3d
 import tqdm
 
 obj_path = "/home/mingi/shared_data/AutoDex/object/paradex"
+# Override via --obj_path CLI flag (set in __main__).
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +495,14 @@ if __name__ == "__main__":
         default=["table", "wall", "shelf", "float", "box"],
         help="Scene types to generate (default: all)",
     )
+    parser.add_argument(
+        "--obj_path", default=obj_path,
+        help="Root dir containing object subdirs (default: paradex)",
+    )
     args = parser.parse_args()
+    obj_path = args.obj_path
+    # Helpers reference obj_path at module scope; rebind it.
+    globals()["obj_path"] = obj_path
 
     if args.objects is None:
         obj_list = sorted([

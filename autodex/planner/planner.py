@@ -192,7 +192,6 @@ class GraspPlanner:
         d_world, d_self = rw.get_world_self_collision_distance_from_joints(q_t)
         world_coll = (d_world > 0).cpu().numpy()
         self_coll = (d_self > 0).cpu().numpy()
-        print(f"[collision] world={world_coll.sum()} self={self_coll.sum()} / {len(world_coll)}")
         return world_coll | self_coll
 
     # ── IK solver ─────────────────────────────────────────────────────────────
@@ -381,12 +380,16 @@ class GraspPlanner:
             kin = self._motion_gen.kinematics
             spheres = kin.get_robot_as_spheres(q)
 
-            # Save spheres as mesh
+            # Save spheres as mesh. spheres is List[List[Sphere]] (per-batch, per-link).
             sphere_meshes = []
             for sphere_batch in spheres:
                 for s in sphere_batch:
-                    pos = s[:3].cpu().numpy()
-                    rad = s[3].item()
+                    if hasattr(s, "position"):
+                        pos = np.asarray(s.position)
+                        rad = float(s.radius)
+                    else:
+                        pos = np.asarray(s[:3])
+                        rad = float(s[3])
                     if rad > 0:
                         m = trimesh.creation.icosphere(radius=rad)
                         m.apply_translation(pos)
@@ -397,19 +400,48 @@ class GraspPlanner:
                 combined.export(out)
                 print(f"    [debug] Hand spheres -> {out}")
 
-            # Save world meshes
+            # Save world meshes + cuboids
             if self._motion_gen.world_model is not None:
                 wm = self._motion_gen.world_model
-                if hasattr(wm, 'mesh') and wm.mesh:
-                    for mesh_name in wm.mesh:
-                        m = wm.mesh[mesh_name]
-                        if hasattr(m, 'vertices') and hasattr(m, 'faces'):
-                            tm = trimesh.Trimesh(vertices=m.vertices.cpu().numpy(),
-                                                 faces=m.faces.cpu().numpy())
-                            out = os.path.join(debug_dir, f"world_{mesh_name}.obj")
-                            tm.export(out)
-                            print(f"    [debug] World mesh -> {out}")
+                # Mesh primitives. cuRobo Mesh may store file_path instead of verts/faces.
+                meshes = getattr(wm, "mesh", None) or []
+                for m in meshes:
+                    name = getattr(m, "name", "mesh")
+                    pose = np.asarray(getattr(m, "pose", [0, 0, 0, 1, 0, 0, 0]) or [0, 0, 0, 1, 0, 0, 0])
+                    file_path = getattr(m, "file_path", None)
+                    verts, faces = m.vertices, m.faces
+                    if (verts is None or faces is None) and file_path:
+                        tm = trimesh.load(file_path, force="mesh")
+                    else:
+                        if hasattr(verts, "cpu"): verts = verts.cpu().numpy()
+                        if hasattr(faces, "cpu"): faces = faces.cpu().numpy()
+                        tm = trimesh.Trimesh(vertices=np.asarray(verts), faces=np.asarray(faces))
+                    # Apply mesh pose
+                    T = np.eye(4)
+                    T[:3, 3] = pose[:3]
+                    from scipy.spatial.transform import Rotation as Rot
+                    T[:3, :3] = Rot.from_quat(pose[[4, 5, 6, 3]]).as_matrix()
+                    tm.apply_transform(T)
+                    out = os.path.join(debug_dir, f"world_mesh_{name}.obj")
+                    tm.export(out)
+                    print(f"    [debug] World mesh -> {out}")
+                # Cuboid primitives (table, shelf walls)
+                cubes = getattr(wm, "cuboid", None) or []
+                for c in cubes:
+                    name = getattr(c, "name", "cube")
+                    dims = np.asarray(c.dims)
+                    pose = np.asarray(c.pose)  # [x,y,z,qw,qx,qy,qz]
+                    box = trimesh.creation.box(extents=dims)
+                    T = np.eye(4)
+                    T[:3, 3] = pose[:3]
+                    from scipy.spatial.transform import Rotation as Rot
+                    T[:3, :3] = Rot.from_quat(pose[[4, 5, 6, 3]]).as_matrix()
+                    box.apply_transform(T)
+                    out = os.path.join(debug_dir, f"world_cube_{name}.obj")
+                    box.export(out)
+                    print(f"    [debug] World cube -> {out}")
         except Exception as e:
+            import traceback; traceback.print_exc()
             print(f"    [debug] Export failed: {e}")
 
     # ── internal pipeline ─────────────────────────────────────────────────────

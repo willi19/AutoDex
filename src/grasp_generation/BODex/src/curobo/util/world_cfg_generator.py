@@ -74,9 +74,9 @@ class WorldConfigDataset(Dataset):
         }
 
 class ParadexDataset(Dataset):
-    def __init__(self, obj_list=[], scene_type_list=[], batch_size=1, version="", seed_offset=0, output_dir=None):
+    def __init__(self, obj_list=[], scene_type_list=[], batch_size=1, version="", seed_offset=0, output_dir=None, obj_root_dir=None):
         home_dir = os.path.expanduser("~")
-        self.obj_root_dir = os.path.join(home_dir, "shared_data", "RSS2026_Mingi", "object", "paradex")
+        self.obj_root_dir = obj_root_dir or os.path.join(home_dir, "shared_data", "RSS2026_Mingi", "object", "paradex")
         self.output_dir = output_dir
 
         self.obj_list = obj_list if len(obj_list) != 0 else os.listdir(self.obj_root_dir)
@@ -144,12 +144,12 @@ def _world_config_collate_fn(list_data):
     return ret_data
 
 
-def get_world_config_dataloader(configs, batch_size, seed_num, version="", seed_offset=0, output_dir=None):
+def get_world_config_dataloader(configs, batch_size, seed_num, version="", seed_offset=0, output_dir=None, obj_root_dir=None):
     if configs["type"] == "scene_cfg":
         dataset = WorldConfigDataset(**configs)
 
     elif configs["type"] == "paradex":
-        dataset = ParadexDataset(configs.get("obj_list", []), configs.get("scene_type", []), seed_num, version, seed_offset, output_dir=output_dir)
+        dataset = ParadexDataset(configs.get("obj_list", []), configs.get("scene_type", []), seed_num, version, seed_offset, output_dir=output_dir, obj_root_dir=obj_root_dir)
 
     dataloader = DataLoader(
         dataset, batch_size=batch_size, shuffle=False, collate_fn=_world_config_collate_fn
