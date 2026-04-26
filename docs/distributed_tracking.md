@@ -47,14 +47,57 @@ Goal: replace `src/execution/daemon/perception_pipeline.py` (SAM3 + DA3 + FPose 
 ## Setup steps
 
 ### 1. MV-GoTrack repo
-The fork lives at `autodex/perception/thirdparty/MV-GoTrack/`. Initial install (already done on robot PC):
-```
-git clone <fork-url> autodex/perception/thirdparty/MV-GoTrack
+The fork lives at `autodex/perception/thirdparty/MV-GoTrack/` as a submodule of the AutoDex repo. Initial install (replicate on each PC):
+
+```bash
+cd ~/AutoDex
+git submodule update --init --recursive autodex/perception/thirdparty/MV-GoTrack
 cd autodex/perception/thirdparty/MV-GoTrack
-conda env create -n gotrack -f environment.yml
+
+# (a) Submodules of the fork itself (bop_toolkit + dinov2)
+git submodule update --init --recursive
+
+# (b) Conda env
+conda create -n gotrack python=3.10 -y
 conda activate gotrack
+
+# (c) torch must match the system CUDA driver. Our PCs have CUDA 12.8.
+pip install --force-reinstall torch torchvision xformers \
+    --index-url https://download.pytorch.org/whl/cu128 --no-deps
+
+# (d) Editable installs of the GoTrack fork's submodules
+pip install -e external/bop_toolkit
+cd external/dinov2 && python setup.py install && cd -
+
+# (e) Python deps that environment.yml does not fully cover
+pip install matplotlib distinctipy faiss-gpu-cu12 kornia pyrender pyglet \
+    pyopengl imageio scikit-learn
+
+# (f) nvdiffrast (CRITICAL — without this, the renderer silently falls back
+#     to pyrender CPU and runs 25× slower, see Anti-patterns)
 pip install git+https://github.com/NVlabs/nvdiffrast.git --no-build-isolation
-pip install psutil pandas open3d transformations ruamel.yaml  # for FoundationPose Utils import
+
+# (g) Extras needed by FoundationPose Utils import (silhouette + cross-view IoU)
+pip install psutil pandas open3d transformations ruamel.yaml
+
+# (h) GoTrack checkpoint (1.6 GB). Pulled via LFS from upstream, then copied
+#     into the working tree (the fork stores a non-LFS pointer file).
+git remote add upstream https://github.com/facebookresearch/gotrack.git || true
+git lfs install --local
+git lfs fetch upstream main --include="gotrack_checkpoint.pt"
+cp .git/lfs/objects/f7/d1/f7d127abe2b8e37b1322a19115343286a6560700c6e02fc6080b4e2426a01086 \
+    gotrack_checkpoint.pt
+sha256sum gotrack_checkpoint.pt    # expect f7d127abe2b8...
+```
+
+After this, sanity-check that the env can import GoTrack and create a CUDA
+context:
+
+```bash
+~/miniconda3/envs/gotrack/bin/python -c "
+import nvdiffrast.torch as dr
+print('nvdiffrast OK, ctx:', dr.RasterizeCudaContext())
+"
 ```
 
 ### 2. Per-object onboarding
@@ -83,11 +126,22 @@ pip install psutil pandas open3d transformations ruamel.yaml  # for FoundationPo
 
 ### 3. Daemon setup per capture PC
 Each capture PC (capture1-6) needs:
-- Same repo synced: `git fetch origin && git reset --hard origin/main`
-- `gotrack` env (replicate from robot PC: `conda env export -n gotrack > env.yml` then create on capture)
-- nvdiffrast installed in env
-- GoTrack checkpoint synced: `cp ~/AutoDex/autodex/perception/thirdparty/MV-GoTrack/gotrack_checkpoint.pt /home/mingi/AutoDex/autodex/perception/thirdparty/MV-GoTrack/`
-- Anchor bank for the target object synced (or symlinked to NAS): `~/AutoDex/autodex/perception/thirdparty/MV-GoTrack/anchor_banks/{obj}.npz`
+- AutoDex repo synced: `cd ~/AutoDex && git fetch origin && git reset --hard origin/main && git submodule update --init --recursive`
+- Same `gotrack` env built from steps **(a)-(g)** above. Don't `conda env export`/import — it pins exact builds and breaks across machines. Just rerun the install steps; they're idempotent.
+- GoTrack checkpoint: easiest is to NFS-mount the checkpoint or `rsync` it from robot PC; alternatively re-run step **(h)** on each capture PC. Verify sha256 matches.
+- Anchor bank for the target object: same — `rsync` from robot PC or regenerate via step 2 (a few seconds per object).
+
+Quick verification (run on each capture PC after sync):
+```bash
+~/miniconda3/envs/gotrack/bin/python -c "
+import sys; sys.path.insert(0, '/home/mingi/AutoDex/autodex/perception/thirdparty/MV-GoTrack')
+from utils import renderer_nvdiffrast  # must import cleanly (no pyrender side effect)
+import nvdiffrast.torch as dr
+import torch
+ctx = dr.RasterizeCudaContext()
+print('OK', torch.cuda.get_device_name(0))
+"
+```
 
 Daemon launch (per capture PC):
 ```
@@ -190,3 +244,6 @@ lost (no recovery without re-init via FoundPose).
 - Initially I subprocess-called `run_foundpose_first_frame_init.py` (CLI script) instead of importing FoundPose in-process. User pointed out this was unnecessary indirection: that CLI script writes `summary.json` + 1-frame .avi files just to round-trip data through disk. The right pattern is `FoundPoseInit` wrapper.
 - Same mistake almost made for GoTrack — script-based wrapper at `gotrack_pipeline_debug.py` does subprocess for batch validation, but production tracker should call `_process_group_for_timestep_anchor` directly in-process (this is what `gotrack_engine.py` does).
 - pyrender fallback in MV-GoTrack's `utils/renderer_nvdiffrast.py` was silently making everything 25× slower. Removed (see `project_object_6d_tracking.md`). nvdiffrast must be installed in `gotrack` env or it fails fast.
+  - Symptoms of the silent fallback (in case it ever resurfaces): `summary.json` shows `template_renderer_backend_resolved: pyrender_rasterizer` (instead of `nvdiffrast`), and `template_render_runtime_sec` stays roughly constant (~0.25 s) regardless of camera count instead of scaling near-linearly. 24 cam wall time is ~16 s/frame instead of ~0.76 s/frame.
+  - The silent fallback also triggered a separate symptom: process tries to load OSMesa at import time even when we asked for nvdiffrast, because `renderer_nvdiffrast` used to `import` pyrender unconditionally. The fix removed the `is_fallback` / `_delegate` path and the pyrender import.
+- `git stash` in the MV-GoTrack working tree silently deletes `gotrack_checkpoint.pt` (the file is committed as a non-LFS placeholder). After any stash/pop, restore via `cp .git/lfs/objects/f7/d1/<sha> gotrack_checkpoint.pt` and verify the sha256.
