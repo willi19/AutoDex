@@ -200,6 +200,12 @@ def main():
         "fp_compute_sec", "fp_n_views_ok",
         "ref_perception_total_s", "ref_sam3_s", "ref_depth_s",
         "ref_fpose_s", "ref_select_s", "ref_sil_s",
+        # New metrics for direct apples-to-apples comparison.
+        "iou_pre_mean", "iou_pre_max",
+        "iou_post_mean", "iou_post_max",
+        "sil_loss_pre",
+        "ref_iou_mean", "ref_iou_max",
+        "ref_sil_loss",
     ]
     done: set = set()
     if csv_path.exists():
@@ -312,6 +318,12 @@ def main():
                 )
                 sil_sec = time.perf_counter() - t_sil0
                 t_err_post, r_err_post = _pose_errors(p_ref, p_post)
+
+                # Persist poses for future backfill (avoids re-running FoundPose+sil
+                # just to add new metrics).
+                pose_dir = output_dir / "poses" / obj_name
+                pose_dir.mkdir(parents=True, exist_ok=True)
+                np.savez(pose_dir / f"{ep.name}.npz", pre=p_pre, post=p_post)
 
                 print(f"  [{ep.name}] iou_best={best_iou_serial} mean_iou={mean_iou:.3f} "
                       f"pre t={t_err_pre:.1f}mm r={r_err_pre:.2f}° -> "

@@ -272,6 +272,11 @@ Key reference files:
 
 ## Daemon Setup (Perception Pipeline)
 
+> **Distributed tracking pipeline (FoundPose init + GoTrack tracking)**
+> See [docs/distributed_tracking.md](docs/distributed_tracking.md). Replaces
+> the daemon setup below with: FoundPose centralized on robot PC for init,
+> GoTrack mask-free distributed across capture1-6 for per-frame tracking.
+
 ### Architecture
 
 - **Main PC** (mingi, RTX 3090): DA3/stereo depth + silhouette matching + planning
