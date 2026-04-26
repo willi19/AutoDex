@@ -261,8 +261,17 @@ def run_single_trial(
     timing["perception_s"] = round(time.time() - t0, 1)
 
     if pose_world is None:
-        print("    Perception failed.")
-        fail_result = {"dir_idx": dir_idx, "scene_type": scene_type, "success": False, "reason": "perception_failed", "timing": timing}
+        reason = "perception_failed"
+        if perc_timing:
+            timing["perception_detail"] = perc_timing
+            if perc_timing.get("sil_reject"):
+                reason = f"sil_loss_too_high ({perc_timing['sil_loss']:.6f})"
+                print(f"    Perception failed: sil_loss={perc_timing['sil_loss']:.6f} > 0.003")
+            else:
+                print("    Perception failed.")
+        else:
+            print("    Perception failed.")
+        fail_result = {"dir_idx": dir_idx, "scene_type": scene_type, "success": False, "reason": reason, "timing": timing}
         with open(os.path.join(img_dir, "result.json"), "w") as f:
             json.dump(fail_result, f, indent=2)
         return fail_result

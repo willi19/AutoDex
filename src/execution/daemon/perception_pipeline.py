@@ -92,9 +92,12 @@ class PerceptionPipeline:
         self.sam3_clients = [ZMQClient(h, p) for h, p in sam3_hosts]
         self.fpose_clients = [ZMQClient(h, p) for h, p in fpose_hosts]
         self.obj_name = obj_name
-        self.mesh_path = _find_mesh(obj_name)
-        if not self.mesh_path:
-            raise FileNotFoundError(f"Mesh not found for {obj_name} in {MESH_ROOT}")
+        if obj_name:
+            self.mesh_path = _find_mesh(obj_name)
+            if not self.mesh_path:
+                raise FileNotFoundError(f"Mesh not found for {obj_name} in {MESH_ROOT}")
+        else:
+            self.mesh_path = None
         self.depth_method = depth_method
         self.device = device
 
