@@ -27,7 +27,7 @@ seeder_cfg:
   jitter_dist: [[0.0, -0.03, -0.03], [0.03, 0.03, 0.03]]
 
 grasp_contact_strategy:
-  contact_points_name: ['thumb_force_sensor/11', 'index_force_sensor/14', 'middle_force_sensor/14', 'ring_force_sensor/14', 'little_force_sensor/14']
+  contact_points_name: ['thumb_force_sensor/12', 'index_force_sensor/14', 'middle_force_sensor/14', 'ring_force_sensor/14', 'little_force_sensor/14']
   opt_progress: [0.0, 0.3, 0.95]
   distance: [0.01, 0.01, 0.0]
   contact_query_mode: [-1, 0, 0]
