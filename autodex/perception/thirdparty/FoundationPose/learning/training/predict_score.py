@@ -66,7 +66,7 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
   B = len(ob_in_cams)
   poseAs = torch.as_tensor(ob_in_cams, dtype=torch.float, device='cuda')
 
-  bs = 512
+  bs = 64  # was 512; reduce to avoid OOM
   rgb_rs = []
   depth_rs = []
   xyz_map_rs = []
