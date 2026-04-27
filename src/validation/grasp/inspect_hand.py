@@ -107,6 +107,8 @@ def main():
     ap.add_argument("--rainbow_links", default="",
                     help="Comma-separated link names whose spheres should be colored by index "
                          "(rainbow), with each sphere labeled. Useful for picking contact idx.")
+    ap.add_argument("--show_axes_for", default="",
+                    help="Comma-separated link names to draw coordinate axes (XYZ frame).")
     ap.add_argument("--port", type=int, default=8081)
     args = ap.parse_args()
 
@@ -135,6 +137,13 @@ def main():
         tok = tok.strip()
         if tok:
             rainbow_links.add(tok)
+
+    axis_links = set()
+    for tok in (args.show_axes_for or "").split(","):
+        tok = tok.strip()
+        if tok:
+            axis_links.add(tok)
+    axis_handles = {}
 
     spheres = {}
     ignore_pairs = set()
@@ -218,6 +227,21 @@ def main():
 
     def update():
         cfg = np.array([float(sliders[n].value) for n in actuated], dtype=np.float64)
+
+        for axlink in axis_links:
+            try:
+                T = robot.get_transform(frame_to=axlink, frame_from=base_link)
+            except Exception:
+                continue
+            key = f"/axes/{axlink}"
+            if key in axis_handles:
+                axis_handles[key].position = T[:3, 3]
+                axis_handles[key].wxyz = _R_to_wxyz(T[:3, :3])
+            else:
+                axis_handles[key] = server.scene.add_frame(
+                    key, position=T[:3, 3], wxyz=_R_to_wxyz(T[:3, :3]),
+                    show_axes=True, axes_length=0.025, axes_radius=0.0015,
+                )
 
         for link_name, items in link_meshes.items():
             T_link = robot.get_transform(frame_to=link_name, frame_from=base_link)

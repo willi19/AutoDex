@@ -58,6 +58,9 @@ def compute_cross_view_iou(
 ) -> Tuple[float, Dict[str, float]]:
     """Mean IoU of rendered mesh vs SAM mask across all views.
 
+    Stays on GPU per-view (boolean ops, intersection/union, division), only
+    transfers the final per-view scalars to CPU once at the end.
+
     Args:
         pose_world: 4x4 object pose in world frame.
         masks: serial -> bool (H, W) mask. Skip serials missing here.
@@ -69,18 +72,33 @@ def compute_cross_view_iou(
     Returns:
         mean_iou, per_view_iou (serial -> float).
     """
-    per_view = {}
+    from Utils import nvdiffrast_render
+
+    iou_tensors: list = []
+    serials: list = []
     for s, mask in masks.items():
         if s not in intrinsics or s not in extrinsics:
             continue
-        sil = _render_silhouette(
-            pose_world, intrinsics[s], extrinsics[s], H, W, glctx, mesh_tensors,
+        K = np.asarray(intrinsics[s], dtype=np.float32)
+        pose_cam = extrinsics[s] @ pose_world
+        pt = torch.as_tensor(pose_cam, device="cuda", dtype=torch.float32).reshape(1, 4, 4)
+        rc, _, _ = nvdiffrast_render(
+            K=K, H=H, W=W, ob_in_cams=pt, glctx=glctx,
+            mesh_tensors=mesh_tensors, use_light=False,
         )
-        inter = (sil & mask).sum()
-        union = (sil | mask).sum()
-        per_view[s] = float(inter / union) if union > 0 else 0.0
-    mean_iou = float(np.mean(list(per_view.values()))) if per_view else 0.0
-    return mean_iou, per_view
+        sil_bool = rc[0].sum(dim=2) > 0
+        m_b = torch.as_tensor(mask, device="cuda")
+        inter = (sil_bool & m_b).sum().float()
+        union = (sil_bool | m_b).sum().float()
+        iou_tensors.append(torch.where(union > 0, inter / union,
+                                        torch.zeros_like(inter)))
+        serials.append(s)
+
+    if not iou_tensors:
+        return 0.0, {}
+    iou_arr = torch.stack(iou_tensors).cpu().tolist()
+    per_view = dict(zip(serials, iou_arr))
+    return float(np.mean(iou_arr)), per_view
 
 
 def select_best_pose_by_iou(

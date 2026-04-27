@@ -8,6 +8,7 @@ GUI:
 """
 import argparse
 import json
+import math
 import re
 import threading
 import time
@@ -20,14 +21,18 @@ import trimesh
 import viser
 import yourdfpy
 from scipy.spatial.transform import Rotation as R
+from tqdm import tqdm
 
+from curobo.geom.sdf.world import CollisionQueryBuffer
 from curobo.geom.types import Mesh as CuroboMesh
 from curobo.geom.types import WorldConfig
 from curobo.types.base import TensorDeviceType
 from curobo.types.math import Pose as CuroboPose
 from curobo.util_file import get_robot_configs_path, join_path, load_yaml
 from curobo.wrap.model.robot_world import RobotWorld, RobotWorldConfig
+from curobo.types.state import JointState
 from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
+from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig, MotionGenPlanConfig
 
 
 HERE = Path(__file__).resolve().parent
@@ -45,6 +50,11 @@ OBJECT_DIRS = [
 ]
 ROBOT_CFG_NAME = "fr3_inspire_left.yml"
 SCENE_MESH_KEY = "scene_collision"
+HAND_NAME = "inspire_left"
+CANDIDATE_VERSION = "selected_100"
+CANDIDATE_ROOT = Path(f"/home/mingi/AutoDex/candidates/{HAND_NAME}/{CANDIDATE_VERSION}")
+FLOATING_HAND_URDF = (Path("/home/mingi/AutoDex/autodex/planner/src/curobo/content/assets")
+                      / "robot/inspire_description/inspire_left_floating.urdf")
 
 
 def _camel(name: str) -> str:
@@ -63,29 +73,68 @@ def parse_tracking_key(key: str):
     return after.strip(), 1
 
 
-def find_mesh_dir(base_name: str):
-    """Resolve `'paper cup'` -> Path to mesh dir under OBJECT_DIRS.
+def load_candidates_for_obj(obj_name: str):
+    """Load all BODex grasp candidates for the given object across all scenes.
 
-    Tries: camelCase form, raw, first-word, case-insensitive substring.
+    Returns list of dicts: {scene, scene_id, grasp_id, wrist_obj (4,4),
+    pregrasp (6,), grasp (6,)}. wrist_obj is in object-local frame.
     """
-    candidates = [_camel(base_name), base_name.replace(" ", "_"),
-                  base_name.replace(" ", ""), base_name.split()[0] if base_name else ""]
+    obj_dir = CANDIDATE_ROOT / obj_name
+    out = []
+    if not obj_dir.is_dir():
+        return out
+    for scene in sorted(obj_dir.iterdir()):
+        if not scene.is_dir():
+            continue
+        for scene_id in sorted(scene.iterdir()):
+            if not scene_id.is_dir():
+                continue
+            for grasp in sorted(scene_id.iterdir()):
+                if not grasp.is_dir():
+                    continue
+                wp = grasp / "wrist_se3.npy"
+                pp = grasp / "pregrasp_pose.npy"
+                gp = grasp / "grasp_pose.npy"
+                if not (wp.exists() and pp.exists()):
+                    continue
+                wrist = np.load(wp)
+                pre = np.load(pp)
+                g = np.load(gp) if gp.exists() else pre
+                out.append({
+                    "scene": scene.name,
+                    "scene_id": scene_id.name,
+                    "grasp_id": grasp.name,
+                    "wrist_obj": np.asarray(wrist, dtype=float),
+                    "pregrasp": np.asarray(pre, dtype=float),
+                    "grasp": np.asarray(g, dtype=float),
+                })
+    return out
+
+
+def find_mesh_dir(base_name: str):
+    """Resolve `'paper cup'` / `'jp_water'` -> Path to mesh dir under OBJECT_DIRS.
+
+    Tries (in order, across both roots): camelCase, underscore-joined, and
+    no-space forms — each compared **case-insensitively** against actual
+    directory names. Falls back to a case-insensitive whole-name match. We do
+    *not* substring-match because that's what was incorrectly picking
+    `Jp_WaterCrush2` for `jp_water`.
+    """
+    forms = [
+        _camel(base_name),
+        base_name.replace(" ", "_"),
+        base_name.replace(" ", ""),
+    ]
+    forms_lower = {f.lower() for f in forms if f}
     for root in OBJECT_DIRS:
         if not root.exists():
             continue
-        # Exact-name try
-        for cand in candidates:
-            if not cand:
+        # Build a single case-insensitive index of subdir names.
+        for sub in root.iterdir():
+            if not sub.is_dir():
                 continue
-            p = root / cand
-            if p.is_dir():
-                return p
-        # Case-insensitive contains (first word)
-        first = base_name.split()[0].lower() if base_name else ""
-        if first:
-            for sub in root.iterdir():
-                if sub.is_dir() and first in sub.name.lower():
-                    return sub
+            if sub.name.lower() in forms_lower:
+                return sub
     return None
 
 EEF_LINK = "hand_tcp"
@@ -96,6 +145,8 @@ HAND_ACTUATED = [
     "left_ring_1_joint", "left_little_1_joint",
 ]
 ARM_HOME = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])
+DROP_RELEASE_QPOS_RIGHT = np.array([-1.53, 0.0, 0.0, -2.82, -0.01, 3.2, -0.91])
+DROP_RELEASE_QPOS_LEFT  = np.array([+1.53, 0.0, 0.0, -2.82, -0.01, 3.2, -0.91])
 
 
 def mat_to_pos_wxyz(T):
@@ -126,7 +177,9 @@ class CuroboChecker:
         # query is fine for small clean meshes); the static scene uses the SDF
         # grid below instead.
         self._world_proxy = {}
-        self._lock = threading.Lock()
+        # Re-entrant: query() holds the lock and then calls world_collide()
+        # which also wants it; a plain Lock would deadlock there.
+        self._lock = threading.RLock()
 
         # Static scene SDF (preferred when available — direct, no mesh needed).
         # Robot region is masked out so the robot's own scan doesn't collide.
@@ -191,6 +244,48 @@ class CuroboChecker:
         )
         self.ik_solver = IKSolver(ik_cfg)
         self.ee_link = self.cfg_dict["robot_cfg"]["kinematics"]["ee_link"]
+        # Reusable buffer + tensors for per-sphere world collision queries.
+        self._sphere_buf = None
+        self._sphere_buf_shape = None
+        self._sphere_weight = torch.tensor([1.0], device=self.tensor_args.device,
+                                            dtype=self.tensor_args.dtype)
+        self._sphere_act = torch.tensor([0.0], device=self.tensor_args.device,
+                                         dtype=self.tensor_args.dtype)
+        # MotionGen is heavy (~7s warmup); only built on first plan_js() call.
+        self._motion_gen = None
+        self._plan_cfg = None
+        self._motion_gen_world = wc
+
+    def _ensure_motion_gen(self):
+        if self._motion_gen is not None:
+            return
+        print("[curobo] initializing MotionGen (one-time, ~7s)...")
+        cfg = MotionGenConfig.load_from_robot_config(
+            self.cfg_dict, self._motion_gen_world, self.tensor_args,
+            num_trajopt_seeds=32,
+            num_graph_seeds=1,
+            num_ik_seeds=32,
+            use_cuda_graph=False,  # same threading reason as IKSolver
+            interpolation_dt=0.01,
+            ik_opt_iters=200,
+            grad_trajopt_iters=200,
+            trajopt_tsteps=64,
+            collision_activation_distance=0.005,
+        )
+        self._motion_gen = MotionGen(cfg)
+        self._motion_gen.warmup(enable_graph=True, warmup_js_trajopt=False)
+        self._plan_cfg = MotionGenPlanConfig(
+            enable_graph=True,
+            enable_opt=True,
+            enable_graph_attempt=4,
+            max_attempts=20,
+            enable_finetune_trajopt=True,
+            num_trajopt_seeds=32,
+            num_ik_seeds=32,
+            timeout=60.0,
+            parallel_finetune=True,
+        )
+        print("[curobo] MotionGen ready")
 
     def _set_proxy_mesh(self, name: str, mesh_path: Path, T: np.ndarray):
         m = trimesh.load(str(mesh_path), force="mesh", process=False)
@@ -284,33 +379,57 @@ class CuroboChecker:
             del self._world_proxy[name]
         self._rebuild_world()
 
-    def world_collide(self, x_sph: np.ndarray) -> np.ndarray:
-        """Per-sphere world collision (N,) using *unsigned* distance to mesh
-        surfaces. A sphere collides if its center is within `radius` of any
-        env mesh surface.
+    def world_collide_from_q(self, q: np.ndarray) -> np.ndarray:
+        """Per-sphere world collision using cuRobo's WorldCollision directly.
 
-        Why unsigned: the static scene mesh (extracted from a truncated SDF)
-        is not watertight, so trimesh `signed_distance` gives wrong signs and
-        was producing false-positive 'inside' hits far from any surface.
-        Distance-to-surface is reliable regardless of watertightness.
+        Returns (N,) bool array. Uses `get_sphere_distance(sum_collisions=False)`
+        which is ~1300× faster than the previous trimesh closest-point path.
         """
-        n = x_sph.shape[0]
-        coll = np.zeros(n, dtype=bool)
-        if not self._world_proxy:
-            return coll
-        centers = x_sph[:, :3]
-        radii = x_sph[:, 3]
-        valid = radii > 0
-        if not valid.any():
-            return coll
+        q_t = torch.tensor(q.reshape(1, -1), dtype=self.tensor_args.dtype,
+                           device=self.tensor_args.device)
+        with self._lock:
+            state = self.rw.get_kinematics(q_t)
+            x_sph = state.link_spheres_tensor.unsqueeze(1)  # (B=1, H=1, N, 4)
+            wc = self.rw.collision_cost.world_coll_checker
+            if (self._sphere_buf is None
+                    or tuple(self._sphere_buf_shape) != tuple(x_sph.shape)):
+                self._sphere_buf = CollisionQueryBuffer.initialize_from_shape(
+                    x_sph.shape, self.tensor_args, wc.collision_types,
+                )
+                self._sphere_buf_shape = x_sph.shape
+            d = wc.get_sphere_distance(
+                x_sph, self._sphere_buf,
+                self._sphere_weight, self._sphere_act,
+                sum_collisions=False,
+            )
+        # d > 0 means colliding (cuRobo convention)
+        return (d.view(-1).detach().cpu().numpy() > 0)
 
-        for _, pq in self._world_proxy.values():
-            # closest_point returns (closest_pts, distances, triangle_ids).
-            _, dist, _ = pq.on_surface(centers[valid])
-            r_v = radii[valid]
-            hit = dist < r_v
-            coll[np.where(valid)[0][hit]] = True
-        return coll
+    def world_collide(self, x_sph: np.ndarray) -> np.ndarray:
+        """Compatibility wrapper: callers that already have x_sph but only need
+        a per-sphere collision flag still work, but we recompute from q for
+        speed. Prefer `world_collide_from_q`.
+        """
+        # If only x_sph is given we don't have q, but x_sph[:, :3] are world
+        # positions and we can reuse cuRobo if we treat x_sph as the kinematic
+        # output directly.
+        x_sph_t = torch.tensor(x_sph.reshape(1, 1, -1, 4),
+                               dtype=self.tensor_args.dtype,
+                               device=self.tensor_args.device)
+        with self._lock:
+            wc = self.rw.collision_cost.world_coll_checker
+            if (self._sphere_buf is None
+                    or tuple(self._sphere_buf_shape) != tuple(x_sph_t.shape)):
+                self._sphere_buf = CollisionQueryBuffer.initialize_from_shape(
+                    x_sph_t.shape, self.tensor_args, wc.collision_types,
+                )
+                self._sphere_buf_shape = x_sph_t.shape
+            d = wc.get_sphere_distance(
+                x_sph_t, self._sphere_buf,
+                self._sphere_weight, self._sphere_act,
+                sum_collisions=False,
+            )
+        return (d.view(-1).detach().cpu().numpy() > 0)
 
     def self_collide(self, x_sph: np.ndarray) -> np.ndarray:
         """Per-sphere self-collision flags using pairwise sphere overlap +
@@ -348,9 +467,16 @@ class CuroboChecker:
 
     def _rebuild_world(self):
         wc = WorldConfig(mesh=list(self._world_meshes.values()))
+        self._motion_gen_world = wc
         with self._lock:
             self.rw.update_world(wc)
             self.ik_solver.update_world(wc)
+            if self._motion_gen is not None:
+                self._motion_gen.clear_world_cache()
+                self._motion_gen.update_world(wc)
+            # New world → buffer may need to grow (different collision types).
+            self._sphere_buf = None
+            self._sphere_buf_shape = None
 
     def solve_ik(self, target_T: np.ndarray, retract_q: np.ndarray | None = None):
         """Run cuRobo IK to a 4x4 SE(3) target pose for the EE link.
@@ -379,6 +505,99 @@ class CuroboChecker:
         q = result.solution.view(-1).detach().cpu().numpy()
         return succ, q
 
+    GRASP_IK_BATCH = 50
+
+    def _ensure_grasp_ik_solver(self):
+        """Lazy-build a separate IK solver for grasp reachability checks.
+
+        Uses scene mesh ONLY (no dynamic object meshes), matching the working
+        pattern in autodex/planner/planner.py: when checking if a wrist pose
+        is reachable, the hand is supposed to be ON the object, so including
+        the object in the IK world makes every grasp fail. Collision against
+        the full world (with object) is handled separately after IK.
+
+        cuda_graph is enabled because this solver is only ever called from
+        the main `_tick` thread, so cross-thread graph sharing isn't an
+        issue. Without the graph the same call took ~22s; with it, ~0.6s.
+        """
+        if getattr(self, "_grasp_ik_solver", None) is not None:
+            return
+        scene_only = {SCENE_MESH_KEY: self._world_meshes[SCENE_MESH_KEY]} \
+            if SCENE_MESH_KEY in self._world_meshes else {}
+        wc = WorldConfig(mesh=list(scene_only.values()))
+        ik_cfg = IKSolverConfig.load_from_robot_config(
+            self.cfg_dict, wc, tensor_args=self.tensor_args,
+            num_seeds=32,
+            collision_activation_distance=0.005,
+            use_cuda_graph=True,
+        )
+        self._grasp_ik_solver = IKSolver(ik_cfg)
+
+    def solve_ik_batch(self, target_Ts: np.ndarray, batch_size: int | None = None):
+        """Batched IK for B target poses, chunked + padded.
+
+        Mirrors GraspPlanner.solve_ik in autodex/planner/planner.py:
+        - separate IK solver without dynamic object meshes
+        - no retract_config (default seeds, broader sampling)
+        - chunks padded to fixed batch_size for consistent solver shape
+        target_Ts: (B, 4, 4). Returns (success (B,) bool, q (B, n_dof)).
+        """
+        self._ensure_grasp_ik_solver()
+        if batch_size is None:
+            batch_size = self.GRASP_IK_BATCH
+        target_Ts = np.asarray(target_Ts, dtype=np.float32)
+        N = target_Ts.shape[0]
+        n_dof = len(self.curobo_joint_names)
+        succ_all = np.zeros(N, dtype=bool)
+        q_all = np.zeros((N, n_dof), dtype=np.float32)
+        for s in range(0, N, batch_size):
+            e = min(s + batch_size, N)
+            chunk = target_Ts[s:e]
+            B = chunk.shape[0]
+            if B < batch_size:
+                pad = np.tile(chunk[:1], (batch_size - B, 1, 1))
+                chunk = np.concatenate([chunk, pad], axis=0)
+            pos = torch.tensor(chunk[:, :3, 3],
+                               device=self.tensor_args.device,
+                               dtype=self.tensor_args.dtype).contiguous()
+            qxyzw = R.from_matrix(chunk[:, :3, :3]).as_quat()
+            quat = torch.tensor(qxyzw[:, [3, 0, 1, 2]],
+                                device=self.tensor_args.device,
+                                dtype=self.tensor_args.dtype).contiguous()
+            goal = CuroboPose(position=pos, quaternion=quat)
+            with self._lock:
+                result = self._grasp_ik_solver.solve_batch(goal)
+            # Match planner.py exactly: success is (B_padded,) or (B_padded, 1);
+            # solution is (B_padded, return_seeds, dof) or (B_padded, dof).
+            s_chunk = result.success.cpu().numpy()[:B]
+            q_chunk = result.solution.cpu().numpy()[:B]
+            if q_chunk.ndim == 3:
+                q_chunk = q_chunk[:, 0, :]
+            succ_all[s:e] = np.asarray(s_chunk).astype(bool).reshape(-1)[:B]
+            q_all[s:e] = q_chunk
+        return succ_all, q_all
+
+    def plan_js(self, q_start: np.ndarray, q_goal: np.ndarray):
+        """Joint-space motion plan from q_start → q_goal (curobo joint order).
+
+        Returns interpolated trajectory (T, n_dof) in curobo joint order, or
+        None on failure.
+        """
+        self._ensure_motion_gen()
+        start_t = torch.tensor(q_start.reshape(1, -1), dtype=self.tensor_args.dtype,
+                               device=self.tensor_args.device)
+        goal_t = torch.tensor(q_goal.reshape(1, -1), dtype=self.tensor_args.dtype,
+                              device=self.tensor_args.device)
+        start = JointState.from_position(start_t)
+        goal = JointState.from_position(goal_t)
+        with self._lock:
+            result = self._motion_gen.plan_single_js(
+                start_state=start, goal_state=goal, plan_config=self._plan_cfg,
+            )
+        if not bool(result.success.item()):
+            return None
+        return result.get_interpolated_plan().position.cpu().numpy()
+
     def fk_ee(self, q: np.ndarray) -> np.ndarray:
         """Return 4x4 SE(3) of EE link for the given (curobo-ordered) joint config."""
         q_t = torch.tensor(q.reshape(1, -1), dtype=self.tensor_args.dtype,
@@ -400,6 +619,98 @@ class CuroboChecker:
             state = self.rw.get_kinematics(q_t)
             x_sph = state.link_spheres_tensor.view(-1, 4).detach().cpu().numpy()
         return x_sph
+
+
+# ----- Floating hand viewer (single instance, recolored per candidate) -----
+class FloatingHand:
+    """Renders inspire_left floating hand (6-DOF base + 12 joints) at a given
+    wrist 4x4 SE(3) and 6-actuated finger qpos. Used to visualize candidate grasps.
+    """
+    # cspace order in floating yml expects 6 actuated finger joints in this order.
+    HAND_ACTUATED = [
+        "left_thumb_1_joint", "left_thumb_2_joint",
+        "left_index_1_joint", "left_middle_1_joint",
+        "left_ring_1_joint", "left_little_1_joint",
+    ]
+    BASE_JOINTS = ["x_joint", "y_joint", "z_joint",
+                   "x_rotation_joint", "y_rotation_joint", "z_rotation_joint"]
+
+    def __init__(self, server: viser.ViserServer, urdf_path: Path,
+                 root: str = "/floating_hand"):
+        self.server = server
+        self.root = root
+        self.urdf = yourdfpy.URDF.load(
+            str(urdf_path), mesh_dir=str(urdf_path.parent),
+            build_collision_scene_graph=False, load_collision_meshes=False,
+        )
+        self._joint_frames = {}
+        self._mesh_handles = []
+        scene = self.urdf.scene
+        server.scene.add_frame(root, show_axes=False, visible=False)
+        for joint in self.urdf.joint_map.values():
+            self._joint_frames[joint.child] = server.scene.add_frame(
+                self._frame_path(joint.child), show_axes=False,
+            )
+        for link_name, mesh in scene.geometry.items():
+            T_link = self.urdf.get_transform(
+                link_name, scene.graph.transforms.parents[link_name])
+            m = mesh.copy()
+            m.apply_transform(T_link)
+            handle = server.scene.add_mesh_simple(
+                name=self._frame_path(link_name) + f"/{link_name}_mesh",
+                vertices=m.vertices, faces=m.faces,
+                color=(120, 200, 120),
+            )
+            self._mesh_handles.append(handle)
+        self._root_handle = server.scene.add_frame(root, show_axes=False, visible=False)
+
+    def _frame_path(self, link_name: str) -> str:
+        scene = self.urdf.scene
+        parts = []
+        cur = link_name
+        while cur != scene.graph.base_frame:
+            parts.append(cur)
+            cur = scene.graph.transforms.parents[cur]
+        return self.root + "/" + "/".join(reversed(parts))
+
+    def set_visible(self, visible: bool):
+        # Root frame at /floating_hand is created with visible=False; viser
+        # cascades visibility, so toggling only the mesh handles isn't
+        # enough — the root must also be flipped.
+        self._root_handle.visible = visible
+        for h in self._mesh_handles:
+            h.visible = visible
+
+    def set_color(self, color):
+        for h in self._mesh_handles:
+            h.color = tuple(int(c) for c in color)
+
+    def set_pose_and_finger(self, T_world: np.ndarray, finger_qpos: np.ndarray):
+        # Build full URDF cfg: 6-DOF base + 12 hand joints (with mimics).
+        # actuated joint order from yourdfpy:
+        actuated = list(self.urdf.actuated_joint_names)
+        q = np.zeros(len(actuated))
+        # Decompose T into xyz + rpy (xyz / xyz_rotation joints sequentially apply)
+        x, y, z = T_world[:3, 3]
+        # Intrinsic XYZ: matches URDF base chain x_rot → y_rot → z_rot which
+        # composes as Rx(α)·Ry(β)·Rz(γ) in the moving frame. Lowercase "xyz"
+        # is extrinsic and gives angles for Rz·Ry·Rx — wrong for this chain.
+        rx, ry, rz = R.from_matrix(T_world[:3, :3]).as_euler("XYZ")
+        base = {"x_joint": x, "y_joint": y, "z_joint": z,
+                "x_rotation_joint": rx, "y_rotation_joint": ry, "z_rotation_joint": rz}
+        for i, jn in enumerate(actuated):
+            if jn in base:
+                q[i] = float(base[jn])
+            elif jn in self.HAND_ACTUATED:
+                k = self.HAND_ACTUATED.index(jn)
+                q[i] = float(finger_qpos[k])
+        self.urdf.update_cfg(q)
+        for joint in self.urdf.joint_map.values():
+            T = self.urdf.get_transform(joint.child, joint.parent)
+            pos, wxyz = mat_to_pos_wxyz(T)
+            handle = self._joint_frames[joint.child]
+            handle.position = pos
+            handle.wxyz = wxyz
 
 
 # ----- URDF -> viser -----
@@ -512,6 +823,8 @@ class App:
         self._dirty_lock = threading.Lock()
         self._pending_ik_target = None  # 4x4 SE(3) when EEF mode requests IK
         self._world_jobs: list = []  # (action, *args) for cuRobo world updates
+        self._pending_seq_traj = None  # dict for sequential trajectory job
+        self._pending_grasp_check = False  # set True to queue a grasp check
         self._ik_failed = False  # last IK attempt failed → tint all spheres red
         # actuated -> curobo joint index map (curobo order may differ from URDF actuated order)
         self.act_to_curobo_idx = [
@@ -556,10 +869,22 @@ class App:
                 seen.add(n)
                 self.object_names.append(n)
 
-        # Tracking JSON files in this dir
-        self.tracking_files = sorted([p.name for p in HERE.glob("tracking_*.json")])
+        # Latest tracking JSON in this dir (we only keep one).
+        tracking_jsons = sorted(HERE.glob("tracking_*.json"))
+        self.tracking_files = [tracking_jsons[-1].name] if tracking_jsons else []
+
+        # Floating hand for grasp candidate visualization (hidden by default).
+        self.floating_hand = FloatingHand(self.server, FLOATING_HAND_URDF)
+        self.floating_hand.set_visible(False)
+
+        # Candidate state: list of dicts (after Check), filled by _check_grasps.
+        # Each dict adds: 'wrist_world' (4,4), 'ik_success' (bool), 'ik_q' (curobo-order or None).
+        self._candidates = []
+        self._traj = None  # (T, n_dof) or None
+        self._traj_q_curobo_init = None
 
         self._build_gui()
+        self._refresh_grasp_objects()
         self._refresh_robot()
 
     # actuated <-> curobo joint order
@@ -593,6 +918,7 @@ class App:
         )
 
     def _add_handeye_frame(self):
+        self.handeye_Z = None  # 4x4 robot_T_camera
         if not HANDEYE_PATH.exists():
             return
         try:
@@ -602,6 +928,7 @@ class App:
         if "Z" not in data:
             return
         Z = np.asarray(data["Z"])
+        self.handeye_Z = Z.astype(float)
         pos, wxyz = mat_to_pos_wxyz(Z)
         self.server.scene.add_frame(
             "/handeye/Z_camera", position=pos, wxyz=wxyz,
@@ -670,9 +997,62 @@ class App:
             self.show_spheres.on_update(lambda _: self._update_sphere_visibility())
             self.coll_status = srv.add_text("Status", "—", disabled=True)
 
+        with srv.add_folder("Grasp"):
+            self.grasp_obj_dropdown = srv.add_dropdown(
+                "object", ("(none)",), initial_value="(none)",
+            )
+            srv.add_button("Refresh objects").on_click(lambda _: self._refresh_grasp_objects())
+            srv.add_button("Check grasps").on_click(lambda _: self._queue_grasp_check())
+            self.grasp_stats = srv.add_text("Stats", "—", disabled=True)
+            # max=1 (not 0) to avoid degenerate min==max sliders, which make
+            # the client compute a NaN position and send NaN back to the int
+            # handle (viser then raises ValueError on int(NaN)).
+            self.grasp_slider = srv.add_slider(
+                "Candidate #", min=0, max=1, step=1, initial_value=0,
+            )
+            self.grasp_slider.on_update(lambda _: self._on_grasp_slider())
+            self.grasp_status = srv.add_text("This candidate", "—", disabled=True)
+            srv.add_button("Plan to this grasp").on_click(lambda _: self._plan_to_grasp())
+            self.plan_status = srv.add_text("Plan status", "—", disabled=True)
+            self.traj_slider = srv.add_slider(
+                "Trajectory frame", min=0, max=1, step=1, initial_value=0,
+            )
+            self.traj_slider.on_update(lambda _: self._on_traj_slider())
+
         with srv.add_folder("Utilities"):
             srv.add_button("Arm → home").on_click(lambda _: self._reset_arm_home())
             srv.add_button("Hand → zero").on_click(lambda _: self._reset_hand_zero())
+            srv.add_button("Drop release (right)").on_click(
+                lambda _: self._set_arm_qpos(DROP_RELEASE_QPOS_RIGHT))
+            srv.add_button("Drop release (left)").on_click(
+                lambda _: self._set_arm_qpos(DROP_RELEASE_QPOS_LEFT))
+
+        with srv.add_folder("Waypoint"):
+            self.waypoint_name = srv.add_text("Name", initial_value="wp")
+            srv.add_button("Save current qpos").on_click(lambda _: self._save_waypoint())
+            self.waypoint_status = srv.add_text("Last save", "—", disabled=True)
+
+            wp_choices = self._list_waypoints() or ["(none)"]
+            self.wp_start_dropdown = srv.add_dropdown(
+                "Start waypoint", tuple(wp_choices),
+                initial_value=wp_choices[0],
+            )
+            self.wp_goal_dropdown = srv.add_dropdown(
+                "Goal waypoint", tuple(wp_choices),
+                initial_value=wp_choices[-1] if len(wp_choices) > 1 else wp_choices[0],
+            )
+            srv.add_button("Refresh waypoints").on_click(lambda _: self._refresh_waypoints())
+            srv.add_button("Move to start").on_click(
+                lambda _: self._jump_to_waypoint(self.wp_start_dropdown.value))
+            srv.add_button("Move to goal").on_click(
+                lambda _: self._jump_to_waypoint(self.wp_goal_dropdown.value))
+            srv.add_button("Sequential start→goal").on_click(
+                lambda _: self._build_sequential_trajectory_wp())
+            self.seq_status = srv.add_text("Sequential plan", "—", disabled=True)
+            self.seq_traj_slider = srv.add_slider(
+                "Seq frame", min=0, max=1, step=1, initial_value=0,
+            )
+            self.seq_traj_slider.on_update(lambda _: self._on_traj_slider())
 
     def _update_sphere_visibility(self):
         v = bool(self.show_spheres.value)
@@ -724,11 +1104,184 @@ class App:
         self.eef_rz.value = float(rz)
 
     def _reset_arm_home(self):
-        for jn, val in zip(ARM_JOINTS, ARM_HOME):
+        self._set_arm_qpos(ARM_HOME)
+
+    def _set_arm_qpos(self, qpos):
+        for jn, val in zip(ARM_JOINTS, qpos):
             self.q_actuated[self.actuated.index(jn)] = float(val)
             self.arm_sliders[jn].value = float(val)
         with self._dirty_lock:
             self._dirty = True
+
+    def _list_waypoints(self):
+        wp_dir = HERE / "waypoints"
+        if not wp_dir.is_dir():
+            return []
+        return sorted([p.stem for p in wp_dir.glob("*.npz")])
+
+    def _refresh_waypoints(self):
+        names = self._list_waypoints()
+        choices = tuple(names) if names else ("(none)",)
+        for dd in (self.wp_start_dropdown, self.wp_goal_dropdown):
+            try:
+                cur = dd.value
+                dd.options = choices
+                dd.value = cur if cur in choices else choices[0]
+            except Exception:
+                pass
+        print(f"[waypoint] available: {names}")
+
+    def _jump_to_waypoint(self, name: str):
+        if name == "(none)":
+            return
+        wp = self._load_waypoint(name)
+        if wp is None:
+            print(f"[waypoint] missing: {name}")
+            return
+        for jn, v in zip(wp["actuated"], wp["q_actuated"]):
+            if jn in self.actuated:
+                self.q_actuated[self.actuated.index(jn)] = float(v)
+        for jn in ARM_JOINTS:
+            self.arm_sliders[jn].value = float(self.q_actuated[self.actuated.index(jn)])
+        for jn in HAND_ACTUATED:
+            self.hand_sliders[jn].value = float(self.q_actuated[self.actuated.index(jn)])
+        with self._dirty_lock:
+            self._dirty = True
+
+    def _build_sequential_trajectory_wp(self):
+        """Queue a sequential trajectory job; the main tick consumes it."""
+        start_name = self.wp_start_dropdown.value
+        goal_name = self.wp_goal_dropdown.value
+        if start_name == "(none)" or goal_name == "(none)":
+            self.seq_status.value = "select start + goal waypoints"
+            return
+        wp_g = self._load_waypoint(goal_name)
+        if wp_g is None:
+            self.seq_status.value = f"can't load {goal_name}"
+            return
+        arm_goal = np.zeros(len(ARM_JOINTS))
+        for jn, v in zip(wp_g["actuated"], wp_g["q_actuated"]):
+            if jn in ARM_JOINTS:
+                arm_goal[ARM_JOINTS.index(jn)] = float(v)
+        with self._dirty_lock:
+            self._pending_seq_traj = {
+                "arm_goal": arm_goal,
+                "start_wp_name": start_name,
+                "goal_label": goal_name,
+            }
+            self._dirty = True
+        self.seq_status.value = f"queued {start_name} → {goal_name}"
+
+    def _load_waypoint(self, name: str):
+        path = HERE / "waypoints" / f"{name}.npz"
+        if not path.exists():
+            return None
+        d = np.load(path, allow_pickle=True)
+        return {
+            "actuated": list(d["actuated_joint_names"]),
+            "q_actuated": d["q_actuated"],
+            "curobo": list(d["curobo_joint_names"]),
+            "q_curobo": d["q_curobo"],
+        }
+
+    def _build_sequential_trajectory(self, arm_goal: np.ndarray,
+                                     start_wp_name: str | None = None,
+                                     goal_label: str = "drop_right",
+                                     steps_per_joint: int = 30):
+        """From `start_wp_name` (or the start dropdown), move FR3 joints 0→6
+        one at a time to `arm_goal` (length-7). Hand joints stay at start
+        values. Each frame is collision-checked.
+        """
+        wp_name = start_wp_name or self.wp_start_dropdown.value
+        if wp_name == "(none)":
+            self.seq_status.value = "no start waypoint"
+            return
+        wp = self._load_waypoint(wp_name)
+        if wp is None:
+            self.seq_status.value = f"can't load {wp_name}"
+            return
+        # Map waypoint actuated -> our actuated order
+        q_start_act = np.zeros(len(self.actuated))
+        for jn, val in zip(wp["actuated"], wp["q_actuated"]):
+            if jn in self.actuated:
+                q_start_act[self.actuated.index(jn)] = float(val)
+
+        # Goal: same as start except arm joints 0..6 set to arm_goal.
+        q_goal_act = q_start_act.copy()
+        for i, jn in enumerate(ARM_JOINTS):
+            q_goal_act[self.actuated.index(jn)] = float(arm_goal[i])
+
+        # Build sequential trajectory in CURobo joint order.
+        n_curobo = len(self.curobo.curobo_joint_names)
+        # actuated -> curobo conversion fn
+        def to_curobo(q_act):
+            qc = np.zeros(n_curobo)
+            for i, jn in enumerate(self.actuated):
+                qc[self.act_to_curobo_idx[i]] = float(q_act[i])
+            return qc
+
+        q_start_curobo = to_curobo(q_start_act)
+        traj = [q_start_curobo.copy()]
+        q_cur_act = q_start_act.copy()
+        for ji, jn in enumerate(ARM_JOINTS):
+            ai = self.actuated.index(jn)
+            v0 = float(q_cur_act[ai])
+            v1 = float(q_goal_act[ai])
+            if abs(v1 - v0) < 1e-6:
+                continue
+            for s in range(1, steps_per_joint + 1):
+                alpha = s / steps_per_joint
+                q_cur_act[ai] = v0 + alpha * (v1 - v0)
+                traj.append(to_curobo(q_cur_act))
+        traj = np.asarray(traj)
+
+        # Batch collision-check all frames at once via cuRobo (very fast).
+        n_frames = len(traj)
+        try:
+            coll_flags = self.curobo.batch_world_collide_any(traj)
+        except Exception as e:
+            print(f"[seq] batch collide failed, fallback per-frame: {e}")
+            coll_flags = np.zeros(n_frames, dtype=bool)
+            for i, q in enumerate(traj):
+                x_sph = self.curobo.query(q)
+                w = self.curobo.world_collide(x_sph)
+                s = self.curobo.self_collide(x_sph)
+                coll_flags[i] = bool(w.any() or s.any())
+        n_coll = int(coll_flags.sum())
+        self._traj = traj
+        self._traj_coll = coll_flags
+        new_max = max(1, len(traj) - 1)
+        self.traj_slider.max = new_max
+        self.traj_slider.value = 0
+        if hasattr(self, "seq_traj_slider"):
+            self.seq_traj_slider.max = new_max
+            self.seq_traj_slider.value = 0
+        self.seq_status.value = f"frames={n_frames}  collides={n_coll}"
+        print(f"[seq] {n_frames} frames, {n_coll} colliding")
+        # Save trajectory next to waypoints for re-use.
+        out = HERE / "waypoints" / f"{wp_name}__to_{goal_label}.npz"
+        np.savez(out, traj_curobo=traj, coll_flags=coll_flags,
+                 curobo_joint_names=np.array(self.curobo.curobo_joint_names, dtype=object))
+        print(f"[seq] saved {out}")
+        self._on_traj_slider()
+
+    def _save_waypoint(self):
+        name = (self.waypoint_name.value or "wp").strip()
+        # sanitize file name
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in name) or "wp"
+        out_dir = HERE / "waypoints"
+        out_dir.mkdir(exist_ok=True)
+        path = out_dir / f"{safe}.npz"
+        # Save both actuated (URDF order) and curobo-ordered for convenience.
+        np.savez(
+            path,
+            actuated_joint_names=np.array(self.actuated, dtype=object),
+            q_actuated=self.q_actuated.copy(),
+            curobo_joint_names=np.array(self.curobo.curobo_joint_names, dtype=object),
+            q_curobo=self._q_curobo(),
+        )
+        self.waypoint_status.value = f"saved → {path.name}"
+        print(f"[waypoint] saved {path}")
 
     def _reset_hand_zero(self):
         for jn in HAND_ACTUATED:
@@ -836,17 +1389,19 @@ class App:
         return cb
 
     def _resolve_mesh_file(self, obj_name: str):
-        """Look for raw_mesh/{obj_name}.obj under any OBJECT_DIRS root."""
+        """Find an obj for `obj_name`, preferring `visual_mesh/` over
+        `raw_mesh/` (raw meshes are huge — >1M faces each)."""
         for root in OBJECT_DIRS:
-            mesh_dir = root / obj_name / "raw_mesh"
-            if not mesh_dir.is_dir():
-                continue
-            preferred = mesh_dir / f"{obj_name}.obj"
-            if preferred.exists():
-                return preferred
-            cands = list(mesh_dir.glob("*.obj"))
-            if cands:
-                return cands[0]
+            for sub in ("visual_mesh", "raw_mesh"):
+                mesh_dir = root / obj_name / sub
+                if not mesh_dir.is_dir():
+                    continue
+                preferred = mesh_dir / f"{obj_name}.obj"
+                if preferred.exists():
+                    return preferred
+                cands = list(mesh_dir.glob("*.obj"))
+                if cands:
+                    return cands[0]
         return None
 
     # tracking JSON
@@ -867,8 +1422,35 @@ class App:
             instance = self._add_object(mesh_dir.name)
             if instance is None:
                 continue
-            T = np.asarray(mat, dtype=float).reshape(4, 4)
-            self._set_object_pose(instance, T)
+            T_world_orig = np.asarray(mat, dtype=float).reshape(4, 4)
+            # 1) world→base: pkl's Z is base->world, so apply Z^-1.
+            if self.handeye_Z is not None:
+                T_base_orig = np.linalg.inv(self.handeye_Z) @ T_world_orig
+            else:
+                T_base_orig = T_world_orig
+            # 2) DEBUG: cylindrical-symmetric meshes make the orig→autodex
+            # rotation ambiguous around the symmetry axis, so we can't recover
+            # M reliably. As a debug fallback we keep the perception translation
+            # but force a known lying tabletop orientation for the object so we
+            # can sanity-check the rest of the pipeline (handeye, mesh frame).
+            T_obj = T_base_orig.copy()
+            tt_dir = mesh_dir / "processed_data" / "info" / "tabletop"
+            tt_files = sorted(tt_dir.glob("*.npy")) if tt_dir.is_dir() else []
+            chosen = None
+            # Pick a lying pose: |R[2,1]| small (sym axis ~ horizontal).
+            for tf in tt_files:
+                T_tt = np.load(tf)
+                if abs(T_tt[2, 1]) < 0.2:
+                    chosen = T_tt; break
+            if chosen is None and tt_files:
+                chosen = np.load(tt_files[0])  # last-resort: any tabletop
+            if chosen is not None:
+                T_obj[:3, :3] = chosen[:3, :3]
+                # Small fixed lift so the mesh isn't intersecting the table.
+                T_obj[2, 3] += 0.01
+            else:
+                print(f"[tracking] no tabletop pose for '{base}'")
+            self._set_object_pose(instance, T_obj)
             added += 1
         print(f"[tracking] loaded {added}/{len(poses)} objects from {filename}")
 
@@ -889,6 +1471,207 @@ class App:
         pos, wxyz = mat_to_pos_wxyz(T)
         entry["frame"].position = pos
         entry["frame"].wxyz = wxyz
+
+    # ---------------- Grasp candidate check + plan ----------------
+    def _refresh_grasp_objects(self):
+        names = sorted(self.objects.keys())
+        choices = tuple(names) if names else ("(none)",)
+        # Re-create dropdown isn't supported; just update the options list when
+        # viser allows. Fallback: keep a stale list (user can re-add to refresh).
+        try:
+            self.grasp_obj_dropdown.options = choices
+            self.grasp_obj_dropdown.value = choices[0]
+        except Exception:
+            print(f"[grasp] active objects: {names}")
+
+    def _queue_grasp_check(self):
+        """Worker-thread callback: only flips a flag. The actual cuRobo work
+        runs from the main tick (per the threading model in HANDOFF.md)."""
+        with self._dirty_lock:
+            self._pending_grasp_check = True
+            self._dirty = True
+        self.grasp_stats.value = "queued — running on main thread..."
+
+    def _check_grasps(self):
+        instance = self.grasp_obj_dropdown.value
+        entry = self.objects.get(instance)
+        if entry is None:
+            self.grasp_stats.value = "no object selected"
+            return
+        # Resolve base object name (instance may be "name_2" for duplicates)
+        base = instance
+        while base not in self.object_names and "_" in base:
+            base = base.rsplit("_", 1)[0]
+        cands = load_candidates_for_obj(base)
+        if not cands:
+            self.grasp_stats.value = f"no candidates for '{base}'"
+            return
+
+        # Y-axis sweep: cylindrical symmetry around object Y means perception
+        # can't recover the spin angle, so generate 6 copies of every grasp
+        # at 0/60/120/180/240/300° around the object's local Y axis. IK and
+        # collision are then checked on all 6×N candidates.
+        expanded = []
+        for c in cands:
+            for k in range(6):
+                ang = math.radians(60.0 * k)
+                cy, sy = math.cos(ang), math.sin(ang)
+                Ry = np.array([
+                    [ cy, 0.0,  sy, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [-sy, 0.0,  cy, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ])
+                cc = dict(c)
+                cc["wrist_obj"] = Ry @ c["wrist_obj"]
+                cc["y_rot_deg"] = 60 * k
+                cc["grasp_id"] = f"{c['grasp_id']}_y{60 * k:03d}"
+                expanded.append(cc)
+        cands = expanded
+
+        T_obj = entry["T"]
+
+        # Stack target wrist poses for batched IK.
+        target_Ts = np.empty((len(cands), 4, 4), dtype=np.float64)
+        for i, c in enumerate(cands):
+            T_world = T_obj @ c["wrist_obj"]
+            c["wrist_world"] = T_world
+            target_Ts[i] = T_world
+
+        # Batched IK against scene-only world (matches planner.py reference).
+        t0 = time.perf_counter()
+        try:
+            succ_arr, q_arr = self.curobo.solve_ik_batch(target_Ts)
+        except Exception as e:
+            print(f"[grasp] batch IK error: {e}")
+            succ_arr = np.zeros(len(cands), dtype=bool)
+            q_arr = np.zeros((len(cands), len(self.curobo.curobo_joint_names)),
+                             dtype=np.float32)
+        print(f"[grasp] batch IK ({len(cands)} poses) "
+              f"ok={int(succ_arr.sum())} in {time.perf_counter() - t0:.2f}s")
+
+        # Per-candidate collision against the FULL world (with object meshes).
+        for i, c in enumerate(tqdm(cands, desc=f"[grasp] coll {base}", unit="grasp")):
+            ok = bool(succ_arr[i])
+            c["ik_success"] = ok
+            c["ik_q"] = np.asarray(q_arr[i]) if ok else None
+            in_coll = False
+            if ok:
+                try:
+                    w_coll = self.curobo.world_collide_from_q(c["ik_q"])
+                    x_sph = self.curobo.query(c["ik_q"])
+                    s_coll = self.curobo.self_collide(x_sph)
+                    in_coll = bool(w_coll.any() or s_coll.any())
+                except Exception as e:
+                    print(f"[grasp] collision error: {e}")
+            c["in_collision"] = in_coll
+            if not ok:
+                c["status"] = "ik_fail"
+            elif in_coll:
+                c["status"] = "collision"
+            else:
+                c["status"] = "success"
+
+        # Sort: success first, then collision, then ik_fail
+        order = {"success": 0, "collision": 1, "ik_fail": 2}
+        cands.sort(key=lambda c: order[c["status"]])
+        self._candidates = cands
+        n_succ = sum(1 for c in cands if c["status"] == "success")
+        n_coll = sum(1 for c in cands if c["status"] == "collision")
+        n_fail = sum(1 for c in cands if c["status"] == "ik_fail")
+        self.grasp_stats.value = (
+            f"object={base}  total={len(cands)}  "
+            f"success={n_succ}  collision={n_coll}  ik_fail={n_fail}"
+        )
+        self.grasp_slider.max = max(1, len(cands) - 1)
+        self.grasp_slider.value = 0
+        self._show_candidate(0)
+
+    def _on_grasp_slider(self):
+        i = int(self.grasp_slider.value)
+        self._show_candidate(i)
+
+    def _show_candidate(self, idx: int):
+        if not self._candidates:
+            self.floating_hand.set_visible(False)
+            self.grasp_status.value = "—"
+            return
+        idx = max(0, min(idx, len(self._candidates) - 1))
+        c = self._candidates[idx]
+        self.floating_hand.set_visible(True)
+        # Use pregrasp finger qpos for visualization (open hand pose).
+        self.floating_hand.set_pose_and_finger(c["wrist_world"], c["pregrasp"])
+        # green = reachable + collision-free, yellow = reachable but collides,
+        # red = IK failed.
+        status = c.get("status", "ik_fail")
+        color = {
+            "success":   (40, 200, 90),
+            "collision": (230, 170, 40),
+            "ik_fail":   (220, 40, 40),
+        }[status]
+        self.floating_hand.set_color(color)
+        self.grasp_status.value = (
+            f"#{idx} {c['scene']}/{c['scene_id']}/{c['grasp_id']} {status.upper()}"
+        )
+
+    def _plan_to_grasp(self):
+        if not self._candidates:
+            self.plan_status.value = "no candidates"
+            return
+        idx = int(self.grasp_slider.value)
+        c = self._candidates[idx]
+        if not c["ik_success"]:
+            self.plan_status.value = "selected candidate has no IK solution"
+            return
+        # Goal qpos (curobo joint order)
+        q_goal_curobo = c["ik_q"].copy()
+        # Override hand joints with pregrasp (so we keep arm IK + open hand)
+        for k, jn in enumerate(FloatingHand.HAND_ACTUATED):
+            ci = self.curobo.curobo_joint_names.index(jn)
+            q_goal_curobo[ci] = float(c["pregrasp"][k])
+
+        # Start from ARM_HOME + zero hand
+        q_start_act = np.zeros(len(self.actuated))
+        for jn, val in zip(ARM_JOINTS, ARM_HOME):
+            q_start_act[self.actuated.index(jn)] = float(val)
+        q_start_curobo = np.zeros(len(self.curobo.curobo_joint_names))
+        for i, jn in enumerate(self.actuated):
+            q_start_curobo[self.act_to_curobo_idx[i]] = float(q_start_act[i])
+
+        try:
+            traj = self.curobo.plan_js(q_start_curobo, q_goal_curobo)
+        except Exception as e:
+            self.plan_status.value = f"plan error: {e}"
+            print(f"[plan] {e}")
+            return
+        if traj is None:
+            self.plan_status.value = "plan FAIL"
+            return
+        self._traj = traj  # (T, n_dof) curobo order
+        self.plan_status.value = f"plan OK: {len(traj)} frames"
+        self.traj_slider.max = max(1, len(traj) - 1)
+        self.traj_slider.value = 0
+        self._on_traj_slider()
+
+    def _on_traj_slider(self):
+        if self._traj is None:
+            return
+        # Either slider can drive playback; pick whichever just changed by
+        # taking the larger raw value (sliders share state).
+        idx = int(self.traj_slider.value)
+        if hasattr(self, "seq_traj_slider"):
+            idx = max(idx, int(self.seq_traj_slider.value))
+        idx = max(0, min(idx, len(self._traj) - 1))
+        q_curobo = self._traj[idx]
+        # Sync to actuated array and arm/hand sliders, then refresh robot.
+        for i, jn in enumerate(self.actuated):
+            self.q_actuated[i] = float(q_curobo[self.act_to_curobo_idx[i]])
+        for jn in ARM_JOINTS:
+            self.arm_sliders[jn].value = float(self.q_actuated[self.actuated.index(jn)])
+        for jn in HAND_ACTUATED:
+            self.hand_sliders[jn].value = float(self.q_actuated[self.actuated.index(jn)])
+        with self._dirty_lock:
+            self._dirty = True
 
     # viz
     def _refresh_robot(self):
@@ -933,6 +1716,10 @@ class App:
             self._world_jobs = []
             ik_target = self._pending_ik_target
             self._pending_ik_target = None
+            seq_job = self._pending_seq_traj
+            self._pending_seq_traj = None
+            grasp_check = self._pending_grasp_check
+            self._pending_grasp_check = False
             self._dirty = False
 
         # 1) world updates (each rebuild reloads RobotWorld + IKSolver)
@@ -975,6 +1762,33 @@ class App:
             # Non-IK update path (joint mode, world change) — clear stale IK
             # failure state so spheres aren't stuck red.
             self._ik_failed = False
+
+        # 2.4) Grasp check (IK + collision over all candidates × Y rotations).
+        # Long-running; runs here on the main thread per the threading model.
+        if grasp_check:
+            try:
+                self._check_grasps()
+            except Exception as e:
+                print(f"[grasp] check failed: {e}")
+                self.grasp_stats.value = f"err: {e}"
+
+        # 2.5) Sequential trajectory build (collision-checks every frame).
+        if seq_job is not None:
+            try:
+                self._build_sequential_trajectory(
+                    seq_job["arm_goal"],
+                    start_wp_name=seq_job["start_wp_name"],
+                    goal_label=seq_job["goal_label"],
+                )
+            except Exception as e:
+                print(f"[seq] build failed: {e}")
+                self.seq_status.value = f"err: {e}"
+            # _build_sequential_trajectory ends with _on_traj_slider(), which
+            # sets q_actuated + arm_sliders. Mark dirty so the joint-mode
+            # post-step (FK eef sync) doesn't fight the new pose, and so the
+            # next tick re-publishes the robot.
+            with self._dirty_lock:
+                self._dirty = True
 
         # 3) viser URDF + sphere/collision viz
         self.viser_urdf.update_cfg(self.q_actuated)
