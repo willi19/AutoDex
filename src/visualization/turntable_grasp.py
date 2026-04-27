@@ -41,12 +41,21 @@ COLOR_OBJECT = np.array([180, 180, 180]) / 255.0
 HAND_URDF = {
     "allegro": os.path.join(urdf_path, "allegro_hand_description_right.urdf"),
     "inspire": os.path.join(urdf_path, "..", "inspire_description", "inspire_hand_right.urdf"),
+    "inspire_f1": os.path.join(
+        repo_dir, "autodex", "planner", "src", "curobo", "content", "assets",
+        "robot", "inspire_f1_description", "inspire_f1_hand_right.urdf",
+    ),
+    "inspire_left": os.path.join(
+        repo_dir, "autodex", "planner", "src", "curobo", "content", "assets",
+        "robot", "inspire_description", "inspire_hand_left.urdf",
+    ),
 }
 
 # These globals are set in main() based on --hand
 SELECTED_DIR = None
 ORDER_ROOT = None
 CURRENT_HAND = "allegro"
+OBJ_ROOT = None  # set in main() — overrides default obj_path
 
 
 def get_all_objects() -> list:
@@ -158,17 +167,30 @@ def trimesh_to_o3d(mesh: trimesh.Trimesh, color=None) -> o3d.geometry.TriangleMe
     return o3d_mesh
 
 
+def _pick_standing_pose(obj_name: str, root: str) -> np.ndarray:
+    """Pick the scene/table/*.json with the highest z translation (standing pose)."""
+    table_dir = os.path.join(root, obj_name, "scene", "table")
+    if not os.path.isdir(table_dir):
+        return np.eye(4)
+    best_z = -np.inf
+    best_pose = np.eye(4)
+    for fn in os.listdir(table_dir):
+        if not fn.endswith(".json"):
+            continue
+        with open(os.path.join(table_dir, fn)) as f:
+            cfg = json.load(f)
+        pose = cfg['scene']['mesh']['target']['pose']
+        if pose[2] > best_z:
+            best_z = pose[2]
+            best_pose = cart2se3(pose)
+    return best_pose
+
+
 def load_object_mesh(obj_name: str) -> tuple:
     """Load object mesh and its pose from scene JSON. Returns (trimesh, 4x4 pose)."""
-    scene_json_path = os.path.join(obj_path, obj_name, "scene", "table", "4.json")
-    if os.path.exists(scene_json_path):
-        with open(scene_json_path, "r") as f:
-            cfg = json.load(f)
-        obj_pose = cart2se3(cfg['scene']['mesh']['target']['pose'])
-    else:
-        obj_pose = np.eye(4)
-
-    mesh_path = os.path.join(obj_path, obj_name, "raw_mesh", f"{obj_name}.obj")
+    root = OBJ_ROOT if OBJ_ROOT is not None else obj_path
+    obj_pose = _pick_standing_pose(obj_name, root)
+    mesh_path = os.path.join(root, obj_name, "raw_mesh", f"{obj_name}.obj")
     mesh = trimesh.load(mesh_path, force="mesh")
     return mesh, obj_pose
 
@@ -337,10 +359,52 @@ def render_single_grasp(obj_name, scene_type, scene_id, grasp_name,
         return False
 
 
+def render_object_only(obj_name, output_path, args):
+    """Render a turntable of the object alone (no robot). Returns True on success."""
+    try:
+        obj_mesh, obj_pose = load_object_mesh(obj_name)
+        obj_mesh_world = obj_mesh.copy()
+        obj_mesh_world.apply_transform(obj_pose)
+        obj_mesh_o3d = trimesh_to_o3d(obj_mesh_world)
+
+        aspect_ratio = args.width / args.height
+        center, cam_dist, elevation_deg = compute_auto_camera(
+            obj_mesh_world, fov_deg=args.fov, aspect_ratio=aspect_ratio,
+            elevation_deg=args.elevation, padding=args.padding,
+        )
+
+        renderer = get_renderer(args.width, args.height)
+        renderer.scene.clear_geometry()
+        mat = o3d.visualization.rendering.MaterialRecord()
+        mat.shader = "defaultLit"
+        renderer.scene.add_geometry("object", obj_mesh_o3d, mat)
+        renderer.scene.scene.set_sun_light([0.5, -0.5, -1.0], [1.0, 1.0, 1.0], 60000)
+        renderer.scene.scene.enable_sun_light(True)
+        renderer.scene.set_background([1.0, 1.0, 1.0, 1.0])
+
+        temp_dir = tempfile.mkdtemp(prefix="turntable_obj_")
+        angles = np.linspace(0, 2 * np.pi, args.frames, endpoint=False)
+        for i, angle in enumerate(angles):
+            eye, lookat, up = compute_turntable_camera(center, cam_dist, elevation_deg, angle)
+            renderer.setup_camera(args.fov, lookat, eye, up)
+            img = renderer.render_to_image()
+            o3d.io.write_image(os.path.join(temp_dir, f"frame_{i:04d}.png"), img)
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        frames_to_video(temp_dir, output_path, args.fps)
+        shutil.rmtree(temp_dir)
+        return True
+    except Exception as e:
+        print(f"  Error: {e}")
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Turntable rendering of grasp candidates")
-    parser.add_argument("--hand", type=str, default="allegro", choices=["allegro", "inspire"],
+    parser.add_argument("--hand", type=str, default="allegro", choices=["allegro", "inspire", "inspire_f1", "inspire_left"],
                         help="Hand type (default: allegro)")
+    parser.add_argument("--obj-root", type=str, default=None,
+                        help="Override object mesh root (default: autodex.utils.path.obj_path)")
     parser.add_argument("--version", type=str, default="v3", help="Candidate version (default: v3)")
     parser.add_argument("--obj", type=str, default=None, help="Object name (e.g., soap_dispenser)")
     parser.add_argument("--scene", type=str, default=None,
@@ -360,16 +424,38 @@ def main():
     parser.add_argument("--padding", type=float, default=1.3, help="Camera padding multiplier (default: 1.3)")
     parser.add_argument("--output", type=str, default=None, help="Output video path (single grasp mode)")
     parser.add_argument("--parallel", type=int, default=1, help="Number of parallel workers for batch-all (default: 1)")
+    parser.add_argument("--object-only", action="store_true",
+                        help="Render object-only turntable (no robot). Requires --obj. Output: {output-dir}/{obj}/000/turntable.mp4")
     args = parser.parse_args()
 
     # Set globals based on --hand
-    global SELECTED_DIR, ORDER_ROOT, CURRENT_HAND
+    global SELECTED_DIR, ORDER_ROOT, CURRENT_HAND, OBJ_ROOT
     CURRENT_HAND = args.hand
+    OBJ_ROOT = args.obj_root
     if args.output_dir is None:
         args.output_dir = os.path.join("data", args.hand)
     candidate_root = os.path.join(repo_dir, "candidates", args.hand)
-    SELECTED_DIR = os.path.join(candidate_root, "selected_100")
+    selected_dir = os.path.join(candidate_root, "selected_100")
+    # Fall back to candidates/{hand}/{version} when selected_100 doesn't exist
+    SELECTED_DIR = selected_dir if os.path.isdir(selected_dir) else os.path.join(candidate_root, args.version)
     ORDER_ROOT = os.path.join(repo_dir, "order", args.hand, args.version)
+
+    # ---- Object-only mode ----
+    if args.object_only:
+        if args.obj is None:
+            print("Error: --object-only requires --obj")
+            sys.exit(1)
+        output_dir = os.path.abspath(args.output_dir)
+        video_path = os.path.join(output_dir, args.obj, "000", "turntable.mp4")
+        if os.path.exists(video_path):
+            print(f"Already exists: {video_path}")
+            return
+        ok = render_object_only(args.obj, video_path, args)
+        if ok:
+            print(f"Saved: {video_path}")
+        else:
+            sys.exit(1)
+        return
 
     # ---- Batch all objects ----
     if args.batch_all:

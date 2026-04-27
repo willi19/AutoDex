@@ -38,6 +38,24 @@ from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig, MotionGen
 HERE = Path(__file__).resolve().parent
 URDF_PATH = HERE / "fr3_inspire_left.urdf"
 SCENE_MESH_PATH = HERE / "scene_mesh.obj"
+TRAJ_DIR = HERE / "traj"
+
+# Fixed waypoint→waypoint trajectories to pre-compute and cache. These are
+# scene-only (no manipulated object) and reusable across pick-and-trash runs.
+# mode: "plan" → cuRobo plan_js; "sequential" → joint-by-joint interpolation.
+FIXED_TRAJ_PAIRS = [
+    ("home", "pick_start", "plan"),
+    ("pick_start", "place_start", "sequential"),
+    ("place_start", "drop_left", "sequential"),
+    ("place_start", "drop_right", "sequential"),
+]
+
+# Objects that are roughly y-axis cylindrical-symmetric in their AutoDex mesh
+# frame. For these we sweep grasp candidates 6× around object-Y so perception
+# can't tell us the spin angle. Anything else (crushed cans, irregular
+# shapes) gets a single orientation — Y-rotated copies would be physically
+# wrong grasps.
+Y_SYMMETRIC_OBJECTS = {"paperCup", "Jp_Water"}
 SCENE_VOXEL_PATH = Path("/home/mingi/Downloads/scene_voxel.npz")
 HANDEYE_PATH = HERE / "hand_eye_result.pkl"
 # Robot region (in world frame) to mask out from the scene SDF — same region
@@ -271,6 +289,11 @@ class CuroboChecker:
             grad_trajopt_iters=200,
             trajopt_tsteps=64,
             collision_activation_distance=0.005,
+            # Pre-allocate the world collision cache. Without this, cuRobo's
+            # WorldMeshCollision.cache stays None, and clear_world_cache()
+            # crashes on `self.cache["mesh"]` when objects are added/removed
+            # later. planner.py ships the same fix.
+            collision_cache={"obb": 30, "mesh": 10},
         )
         self._motion_gen = MotionGen(cfg)
         self._motion_gen.warmup(enable_graph=True, warmup_js_trajopt=False)
@@ -516,35 +539,59 @@ class CuroboChecker:
         the object in the IK world makes every grasp fail. Collision against
         the full world (with object) is handled separately after IK.
 
+        Arm null_space_weight is overridden to non-zero values so the
+        retract_config (= pick_start qpos) actually pulls solutions toward
+        the close-range start pose. The shipped fr3_inspire_left.yml has
+        null_space_weight = all zeros which makes retract_config a no-op
+        and lets IK pick joint configs on the far side of joint limits
+        (especially fr3_joint5, range ±2.876, can't 2π-wrap).
+
         cuda_graph is enabled because this solver is only ever called from
-        the main `_tick` thread, so cross-thread graph sharing isn't an
-        issue. Without the graph the same call took ~22s; with it, ~0.6s.
+        the main `_tick` thread.
         """
         if getattr(self, "_grasp_ik_solver", None) is not None:
             return
         scene_only = {SCENE_MESH_KEY: self._world_meshes[SCENE_MESH_KEY]} \
             if SCENE_MESH_KEY in self._world_meshes else {}
         wc = WorldConfig(mesh=list(scene_only.values()))
+        # Deep-copy cfg_dict so we don't mutate the shared config (the main
+        # ik_solver / motion_gen still use the original null_space=0 defaults).
+        import copy
+        grasp_cfg = copy.deepcopy(self.cfg_dict)
+        cspace = grasp_cfg["robot_cfg"]["kinematics"]["cspace"]
+        # Arm: 7 joints — strong pull toward pick_start.
+        # Hand: 6 joints — leave at 0 (we overwrite hand q from pregrasp anyway).
+        cspace["null_space_weight"] = [1.0] * 7 + [0.0] * 6
         ik_cfg = IKSolverConfig.load_from_robot_config(
-            self.cfg_dict, wc, tensor_args=self.tensor_args,
+            grasp_cfg, wc, tensor_args=self.tensor_args,
             num_seeds=32,
             collision_activation_distance=0.005,
             use_cuda_graph=True,
         )
         self._grasp_ik_solver = IKSolver(ik_cfg)
 
-    def solve_ik_batch(self, target_Ts: np.ndarray, batch_size: int | None = None):
+    def solve_ik_batch(self, target_Ts: np.ndarray,
+                       retract_q: np.ndarray | None = None,
+                       batch_size: int | None = None):
         """Batched IK for B target poses, chunked + padded.
 
-        Mirrors GraspPlanner.solve_ik in autodex/planner/planner.py:
         - separate IK solver without dynamic object meshes
-        - no retract_config (default seeds, broader sampling)
+        - retract_config + non-zero arm null_space_weight (set in
+          _ensure_grasp_ik_solver) bias solutions toward retract_q so plans
+          don't wrap around through joint limits (esp. fr3_joint5 ±2.876)
         - chunks padded to fixed batch_size for consistent solver shape
         target_Ts: (B, 4, 4). Returns (success (B,) bool, q (B, n_dof)).
         """
         self._ensure_grasp_ik_solver()
         if batch_size is None:
             batch_size = self.GRASP_IK_BATCH
+        retract_t = None
+        if retract_q is not None:
+            retract_t = torch.tensor(
+                np.broadcast_to(np.asarray(retract_q, dtype=np.float32),
+                                (batch_size, len(retract_q))).copy(),
+                device=self.tensor_args.device, dtype=self.tensor_args.dtype,
+            ).contiguous()
         target_Ts = np.asarray(target_Ts, dtype=np.float32)
         N = target_Ts.shape[0]
         n_dof = len(self.curobo_joint_names)
@@ -566,7 +613,9 @@ class CuroboChecker:
                                 dtype=self.tensor_args.dtype).contiguous()
             goal = CuroboPose(position=pos, quaternion=quat)
             with self._lock:
-                result = self._grasp_ik_solver.solve_batch(goal)
+                result = self._grasp_ik_solver.solve_batch(
+                    goal, retract_config=retract_t,
+                )
             # Match planner.py exactly: success is (B_padded,) or (B_padded, 1);
             # solution is (B_padded, return_seeds, dof) or (B_padded, dof).
             s_chunk = result.success.cpu().numpy()[:B]
@@ -825,6 +874,7 @@ class App:
         self._world_jobs: list = []  # (action, *args) for cuRobo world updates
         self._pending_seq_traj = None  # dict for sequential trajectory job
         self._pending_grasp_check = False  # set True to queue a grasp check
+        self._pending_precompute_traj = False  # queue fixed-pair traj precompute
         self._ik_failed = False  # last IK attempt failed → tint all spheres red
         # actuated -> curobo joint index map (curobo order may differ from URDF actuated order)
         self.act_to_curobo_idx = [
@@ -979,6 +1029,8 @@ class App:
                 initial_value=self.object_names[0] if self.object_names else "(none)",
             )
             srv.add_button("Add object").on_click(lambda _: self._add_object(self.obj_dropdown.value))
+            srv.add_button("Save object poses").on_click(lambda _: self._save_object_poses())
+            self.object_poses_status = srv.add_text("Object poses", "—", disabled=True)
             self.objects_folder_parent = srv.add_folder("Active objects", expand_by_default=True)
 
         with srv.add_folder("Tracking JSON"):
@@ -987,6 +1039,10 @@ class App:
                 "file", tracking_choices,
                 initial_value=tracking_choices[0],
             )
+            self.tracking_pose_field = srv.add_dropdown(
+                "pose field", ("mesh_poses", "poses"), initial_value="mesh_poses",
+            )
+            self.tracking_apply_zinv = srv.add_checkbox("Apply handeye Z^-1", True)
             srv.add_button("Load (add objects)").on_click(
                 lambda _: self._on_load_tracking()
             )
@@ -1053,6 +1109,10 @@ class App:
                 "Seq frame", min=0, max=1, step=1, initial_value=0,
             )
             self.seq_traj_slider.on_update(lambda _: self._on_traj_slider())
+
+            srv.add_button("Precompute fixed traj").on_click(
+                lambda _: self._queue_precompute_traj())
+            self.precompute_status = srv.add_text("Precompute", "—", disabled=True)
 
     def _update_sphere_visibility(self):
         v = bool(self.show_spheres.value)
@@ -1265,6 +1325,35 @@ class App:
         print(f"[seq] saved {out}")
         self._on_traj_slider()
 
+    def _save_object_poses(self):
+        """Dump every active object's instance name, base name, mesh path,
+        and 4×4 pose to traj/object_poses.npz so the replay script can
+        restore the scene before the trajectory starts.
+        """
+        if not self.objects:
+            self.object_poses_status.value = "no active objects"
+            return
+        instances, bases, mesh_paths, Ts = [], [], [], []
+        for inst, entry in self.objects.items():
+            base = inst
+            while base not in self.object_names and "_" in base:
+                base = base.rsplit("_", 1)[0]
+            instances.append(inst)
+            bases.append(base)
+            mesh_paths.append(str(entry["mesh_path"]))
+            Ts.append(np.asarray(entry["T"], dtype=np.float64))
+        TRAJ_DIR.mkdir(exist_ok=True)
+        out = TRAJ_DIR / "object_poses.npz"
+        np.savez(
+            out,
+            instances=np.array(instances, dtype=object),
+            base_names=np.array(bases, dtype=object),
+            mesh_paths=np.array(mesh_paths, dtype=object),
+            T=np.stack(Ts, axis=0),
+        )
+        self.object_poses_status.value = f"saved {len(instances)} → {out.name}"
+        print(f"[objects] saved {len(instances)} poses → {out}")
+
     def _save_waypoint(self):
         name = (self.waypoint_name.value or "wp").strip()
         # sanitize file name
@@ -1411,7 +1500,10 @@ class App:
             print(f"[tracking] file not found: {path}")
             return
         data = json.loads(path.read_text())
-        poses = data.get("object", {}).get("poses", {})
+        # User-selectable: poses (raw tracker) vs mesh_poses (silhouette-refined)
+        field = self.tracking_pose_field.value
+        apply_zinv = bool(self.tracking_apply_zinv.value)
+        poses = data.get("object", {}).get(field, {})
         added = 0
         for key, mat in poses.items():
             base, _ = parse_tracking_key(key)
@@ -1422,34 +1514,14 @@ class App:
             instance = self._add_object(mesh_dir.name)
             if instance is None:
                 continue
-            T_world_orig = np.asarray(mat, dtype=float).reshape(4, 4)
-            # 1) world→base: pkl's Z is base->world, so apply Z^-1.
-            if self.handeye_Z is not None:
-                T_base_orig = np.linalg.inv(self.handeye_Z) @ T_world_orig
+            T_raw = np.asarray(mat, dtype=float).reshape(4, 4)
+            # Match the reference grasp_planner_gui.py: just `Z^-1 @ T_world`,
+            # no orig_to_autodex remap. The tracking JSON's `poses` /
+            # `mesh_poses` are already in the AutoDex mesh frame.
+            if apply_zinv and self.handeye_Z is not None:
+                T_obj = np.linalg.inv(self.handeye_Z) @ T_raw
             else:
-                T_base_orig = T_world_orig
-            # 2) DEBUG: cylindrical-symmetric meshes make the orig→autodex
-            # rotation ambiguous around the symmetry axis, so we can't recover
-            # M reliably. As a debug fallback we keep the perception translation
-            # but force a known lying tabletop orientation for the object so we
-            # can sanity-check the rest of the pipeline (handeye, mesh frame).
-            T_obj = T_base_orig.copy()
-            tt_dir = mesh_dir / "processed_data" / "info" / "tabletop"
-            tt_files = sorted(tt_dir.glob("*.npy")) if tt_dir.is_dir() else []
-            chosen = None
-            # Pick a lying pose: |R[2,1]| small (sym axis ~ horizontal).
-            for tf in tt_files:
-                T_tt = np.load(tf)
-                if abs(T_tt[2, 1]) < 0.2:
-                    chosen = T_tt; break
-            if chosen is None and tt_files:
-                chosen = np.load(tt_files[0])  # last-resort: any tabletop
-            if chosen is not None:
-                T_obj[:3, :3] = chosen[:3, :3]
-                # Small fixed lift so the mesh isn't intersecting the table.
-                T_obj[2, 3] += 0.01
-            else:
-                print(f"[tracking] no tabletop pose for '{base}'")
+                T_obj = T_raw
             self._set_object_pose(instance, T_obj)
             added += 1
         print(f"[tracking] loaded {added}/{len(poses)} objects from {filename}")
@@ -1484,6 +1556,107 @@ class App:
         except Exception:
             print(f"[grasp] active objects: {names}")
 
+    def _queue_precompute_traj(self):
+        """Worker-thread callback: only flips the precompute flag. The
+        actual cuRobo plan / sequential build runs from the main tick."""
+        with self._dirty_lock:
+            self._pending_precompute_traj = True
+            self._dirty = True
+        self.precompute_status.value = "queued — running on main thread..."
+
+    def _build_traj_between_waypoints(self, start_name: str, goal_name: str,
+                                      mode: str):
+        """Build a trajectory from waypoint `start_name` to `goal_name` and
+        save it to traj/{start}__to_{goal}.npz.
+
+        mode = "plan"       → cuRobo plan_js (collision-aware planning)
+        mode = "sequential" → joint-by-joint interpolation (FR3 joints 0→6),
+                              hand joints kept from start. May contain
+                              collisions; flagged in coll_flags.
+        """
+        TRAJ_DIR.mkdir(exist_ok=True)
+        wp_s = self._load_waypoint(start_name)
+        wp_g = self._load_waypoint(goal_name)
+        if wp_s is None or wp_g is None:
+            print(f"[traj] missing waypoint(s): {start_name} / {goal_name}")
+            return None
+        # actuated -> curobo
+        n_curobo = len(self.curobo.curobo_joint_names)
+
+        def to_curobo(wp):
+            qc = np.zeros(n_curobo)
+            for jn, v in zip(wp["actuated"], wp["q_actuated"]):
+                if jn in self.curobo.curobo_joint_names:
+                    qc[self.curobo.curobo_joint_names.index(jn)] = float(v)
+            return qc
+
+        q_start_curobo = to_curobo(wp_s)
+        q_goal_curobo = to_curobo(wp_g)
+
+        if mode == "plan":
+            traj = self.curobo.plan_js(q_start_curobo, q_goal_curobo)
+            if traj is None:
+                print(f"[traj] plan FAIL: {start_name} → {goal_name}")
+                return None
+        elif mode == "sequential":
+            traj = [q_start_curobo.copy()]
+            steps_per_joint = 30
+            q_cur = q_start_curobo.copy()
+            for jn in ARM_JOINTS:
+                ci = self.curobo.curobo_joint_names.index(jn)
+                v0, v1 = float(q_cur[ci]), float(q_goal_curobo[ci])
+                if abs(v1 - v0) < 1e-6:
+                    continue
+                for s in range(1, steps_per_joint + 1):
+                    a = s / steps_per_joint
+                    q_cur[ci] = v0 + a * (v1 - v0)
+                    traj.append(q_cur.copy())
+            traj = np.asarray(traj)
+        else:
+            raise ValueError(f"unknown mode: {mode}")
+
+        # Per-frame collision flags (informational; sequential may include
+        # colliding frames — the user said that's OK for some segments).
+        try:
+            coll_flags = self.curobo.batch_world_collide_any(traj)
+        except Exception:
+            coll_flags = np.zeros(len(traj), dtype=bool)
+            for i, q in enumerate(traj):
+                x = self.curobo.query(q)
+                w = self.curobo.world_collide(x)
+                s_ = self.curobo.self_collide(x)
+                coll_flags[i] = bool(w.any() or s_.any())
+
+        out = TRAJ_DIR / f"{start_name}__to_{goal_name}.npz"
+        np.savez(
+            out,
+            traj_curobo=traj,
+            coll_flags=coll_flags,
+            curobo_joint_names=np.array(self.curobo.curobo_joint_names, dtype=object),
+            mode=np.array(mode, dtype=object),
+            start_waypoint=np.array(start_name, dtype=object),
+            goal_waypoint=np.array(goal_name, dtype=object),
+        )
+        n_coll = int(coll_flags.sum())
+        print(f"[traj] {mode}: {start_name} → {goal_name}  "
+              f"frames={len(traj)}  collides={n_coll}  → {out.name}")
+        return {"path": out, "frames": len(traj), "collides": n_coll, "mode": mode}
+
+    def _precompute_fixed_trajectories(self):
+        """Walk FIXED_TRAJ_PAIRS, build + save each. Called from main tick."""
+        results = []
+        for start, goal, mode in FIXED_TRAJ_PAIRS:
+            r = self._build_traj_between_waypoints(start, goal, mode)
+            if r is not None:
+                results.append((start, goal, r))
+        ok = len(results)
+        total = len(FIXED_TRAJ_PAIRS)
+        self.precompute_status.value = (
+            f"done {ok}/{total}: " +
+            ", ".join(f"{s}→{g}({r['frames']}f,{r['collides']}c)"
+                      for s, g, r in results)
+        )
+
     def _queue_grasp_check(self):
         """Worker-thread callback: only flips a flag. The actual cuRobo work
         runs from the main tick (per the threading model in HANDOFF.md)."""
@@ -1507,41 +1680,59 @@ class App:
             self.grasp_stats.value = f"no candidates for '{base}'"
             return
 
-        # Y-axis sweep: cylindrical symmetry around object Y means perception
-        # can't recover the spin angle, so generate 6 copies of every grasp
-        # at 0/60/120/180/240/300° around the object's local Y axis. IK and
-        # collision are then checked on all 6×N candidates.
-        expanded = []
-        for c in cands:
-            for k in range(6):
-                ang = math.radians(60.0 * k)
-                cy, sy = math.cos(ang), math.sin(ang)
-                Ry = np.array([
-                    [ cy, 0.0,  sy, 0.0],
-                    [0.0, 1.0, 0.0, 0.0],
-                    [-sy, 0.0,  cy, 0.0],
-                    [0.0, 0.0, 0.0, 1.0],
-                ])
-                cc = dict(c)
-                cc["wrist_obj"] = Ry @ c["wrist_obj"]
-                cc["y_rot_deg"] = 60 * k
-                cc["grasp_id"] = f"{c['grasp_id']}_y{60 * k:03d}"
-                expanded.append(cc)
-        cands = expanded
+        # Y-axis sweep: cylindrical-symmetric objects (paperCup, Jp_Water,
+        # ...) hide the spin angle from perception, so generate 6 copies of
+        # every grasp at 0/60/120/180/240/300° around the object's local Y.
+        # Asymmetric objects (crushed cans, etc.) keep one orientation —
+        # Y-rotated copies would be physically wrong grasps for them.
+        if base in Y_SYMMETRIC_OBJECTS:
+            expanded = []
+            for c in cands:
+                for k in range(6):
+                    ang = math.radians(60.0 * k)
+                    cy, sy = math.cos(ang), math.sin(ang)
+                    Ry = np.array([
+                        [ cy, 0.0,  sy, 0.0],
+                        [0.0, 1.0, 0.0, 0.0],
+                        [-sy, 0.0,  cy, 0.0],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ])
+                    cc = dict(c)
+                    cc["wrist_obj"] = Ry @ c["wrist_obj"]
+                    cc["y_rot_deg"] = 60 * k
+                    cc["grasp_id"] = f"{c['grasp_id']}_y{60 * k:03d}"
+                    expanded.append(cc)
+            cands = expanded
 
         T_obj = entry["T"]
 
-        # Stack target wrist poses for batched IK.
+        # IK target is the wrist pose directly (cuRobo's ee_link is "wrist").
         target_Ts = np.empty((len(cands), 4, 4), dtype=np.float64)
         for i, c in enumerate(cands):
-            T_world = T_obj @ c["wrist_obj"]
-            c["wrist_world"] = T_world
-            target_Ts[i] = T_world
+            T_wrist_world = T_obj @ c["wrist_obj"]
+            c["wrist_world"] = T_wrist_world
+            target_Ts[i] = T_wrist_world
+
+        # Bias IK toward pick_start qpos so solutions don't end up on the
+        # far side of joint limits (esp. fr3_joint5 which has range ±2.876
+        # and can't wrap by 2π). pick_start is the close-range pre-pick
+        # waypoint so its qpos is the right regularization target.
+        retract_q = None
+        wp_ps = self._load_waypoint("pick_start")
+        if wp_ps is not None:
+            retract_q = np.zeros(len(self.curobo.curobo_joint_names),
+                                 dtype=np.float32)
+            for jn, v in zip(wp_ps["actuated"], wp_ps["q_actuated"]):
+                if jn in self.curobo.curobo_joint_names:
+                    ci = self.curobo.curobo_joint_names.index(jn)
+                    retract_q[ci] = float(v)
 
         # Batched IK against scene-only world (matches planner.py reference).
         t0 = time.perf_counter()
         try:
-            succ_arr, q_arr = self.curobo.solve_ik_batch(target_Ts)
+            succ_arr, q_arr = self.curobo.solve_ik_batch(
+                target_Ts, retract_q=retract_q,
+            )
         except Exception as e:
             print(f"[grasp] batch IK error: {e}")
             succ_arr = np.zeros(len(cands), dtype=bool)
@@ -1550,7 +1741,10 @@ class App:
         print(f"[grasp] batch IK ({len(cands)} poses) "
               f"ok={int(succ_arr.sum())} in {time.perf_counter() - t0:.2f}s")
 
-        # Per-candidate collision against the FULL world (with object meshes).
+        # Per-candidate self-collision check on the IK solution. Object
+        # meshes are intentionally NOT checked — the wrist target is on the
+        # object so any sphere overlap with it is expected; scene-mesh
+        # collisions are already ruled out inside the IK solver.
         for i, c in enumerate(tqdm(cands, desc=f"[grasp] coll {base}", unit="grasp")):
             ok = bool(succ_arr[i])
             c["ik_success"] = ok
@@ -1558,10 +1752,9 @@ class App:
             in_coll = False
             if ok:
                 try:
-                    w_coll = self.curobo.world_collide_from_q(c["ik_q"])
                     x_sph = self.curobo.query(c["ik_q"])
                     s_coll = self.curobo.self_collide(x_sph)
-                    in_coll = bool(w_coll.any() or s_coll.any())
+                    in_coll = bool(s_coll.any())
                 except Exception as e:
                     print(f"[grasp] collision error: {e}")
             c["in_collision"] = in_coll
@@ -1630,13 +1823,16 @@ class App:
             ci = self.curobo.curobo_joint_names.index(jn)
             q_goal_curobo[ci] = float(c["pregrasp"][k])
 
-        # Start from ARM_HOME + zero hand
-        q_start_act = np.zeros(len(self.actuated))
-        for jn, val in zip(ARM_JOINTS, ARM_HOME):
-            q_start_act[self.actuated.index(jn)] = float(val)
+        # Start from `pick_start` waypoint — fixed pre-pick pose so the plan
+        # is always close-range (planning from far away tends to fail).
+        wp = self._load_waypoint("pick_start")
+        if wp is None:
+            self.plan_status.value = "missing pick_start waypoint"
+            return
         q_start_curobo = np.zeros(len(self.curobo.curobo_joint_names))
-        for i, jn in enumerate(self.actuated):
-            q_start_curobo[self.act_to_curobo_idx[i]] = float(q_start_act[i])
+        for jn, v in zip(wp["actuated"], wp["q_actuated"]):
+            if jn in self.curobo.curobo_joint_names:
+                q_start_curobo[self.curobo.curobo_joint_names.index(jn)] = float(v)
 
         try:
             traj = self.curobo.plan_js(q_start_curobo, q_goal_curobo)
@@ -1652,6 +1848,32 @@ class App:
         self.traj_slider.max = max(1, len(traj) - 1)
         self.traj_slider.value = 0
         self._on_traj_slider()
+
+        # Multi-object trash flow: each "Plan to this grasp" click is one
+        # pick segment in the sequence. The npz carries `instance` so we
+        # don't lose paperCup_1 vs paperCup_2 (the filename only has the
+        # base name, which is shared across same-class instances).
+        instance = self.grasp_obj_dropdown.value
+        base = instance
+        while base not in self.object_names and "_" in base:
+            base = base.rsplit("_", 1)[0]
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        TRAJ_DIR.mkdir(exist_ok=True)
+        out = TRAJ_DIR / (
+            f"{ts}_pick_start__to_grasp_{base}_"
+            f"{c['scene']}_{c['scene_id']}_{c['grasp_id']}.npz"
+        )
+        np.savez(
+            out,
+            traj_curobo=traj,
+            curobo_joint_names=np.array(self.curobo.curobo_joint_names, dtype=object),
+            instance=np.array(instance, dtype=object),
+            base_name=np.array(base, dtype=object),
+            scene=np.array(c["scene"], dtype=object),
+            scene_id=np.array(c["scene_id"], dtype=object),
+            grasp_id=np.array(c["grasp_id"], dtype=object),
+        )
+        print(f"[plan] saved {out.name}  instance={instance}  ({len(traj)} frames)")
 
     def _on_traj_slider(self):
         if self._traj is None:
@@ -1720,6 +1942,8 @@ class App:
             self._pending_seq_traj = None
             grasp_check = self._pending_grasp_check
             self._pending_grasp_check = False
+            precompute_traj = self._pending_precompute_traj
+            self._pending_precompute_traj = False
             self._dirty = False
 
         # 1) world updates (each rebuild reloads RobotWorld + IKSolver)
@@ -1735,7 +1959,9 @@ class App:
                     _, name = job
                     self.curobo.remove_object_mesh(f"obj::{name}")
             except Exception as e:
+                import traceback
                 print(f"[world] job {job[0]} failed: {e}")
+                traceback.print_exc()
 
         # 2) IK if requested
         if ik_target is not None:
@@ -1762,6 +1988,15 @@ class App:
             # Non-IK update path (joint mode, world change) — clear stale IK
             # failure state so spheres aren't stuck red.
             self._ik_failed = False
+
+        # 2.3) Pre-compute fixed waypoint trajectories (cuRobo plan or
+        # sequential, saved under traj/). Long-running; main thread.
+        if precompute_traj:
+            try:
+                self._precompute_fixed_trajectories()
+            except Exception as e:
+                print(f"[traj] precompute failed: {e}")
+                self.precompute_status.value = f"err: {e}"
 
         # 2.4) Grasp check (IK + collision over all candidates × Y rotations).
         # Long-running; runs here on the main thread per the threading model.

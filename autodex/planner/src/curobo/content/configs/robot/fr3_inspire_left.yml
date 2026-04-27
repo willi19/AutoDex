@@ -13,7 +13,7 @@ robot_cfg:
         asset_root_path: "robot/fr3_inspire_left_description"
 
         base_link: "base"
-        ee_link: "hand_tcp"
+        ee_link: "base_link"
         link_names: [
             "fr3_link0", "fr3_link1", "fr3_link2", "fr3_link3",
             "fr3_link4", "fr3_link5", "fr3_link6", "fr3_link7",
