@@ -168,7 +168,7 @@ def main():
         port_mask=args.port_mask, port_pose=args.port_pose, port_cmd=args.port_cmd,
     )
     try:
-        print("\n[init] sending init to capture PCs (first time loads SAM3+FoundPose, slow)...")
+        print("\n[init] sending init to capture PCs (FoundPose load ~3s/PC for new object)...")
         t0 = time.perf_counter()
         orch.init_object(
             obj_name=args.obj,

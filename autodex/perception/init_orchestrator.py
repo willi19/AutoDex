@@ -393,8 +393,13 @@ class InitOrchestrator:
         return np.asarray(refined, dtype=np.float64), timing
 
     def close(self) -> None:
+        # Stop our SUB threads. Do NOT call self.cmd.end() — that broadcasts
+        # "exit" and kills the daemons, which we want to keep alive across
+        # interactive sessions. Just close the local sockets.
         self._mask_thread.stop(); self._pose_thread.stop()
         try:
-            self.cmd.end()
+            for s in self.cmd.sockets.values():
+                s.close()
+            self.cmd.context.term()
         except Exception:
             pass
