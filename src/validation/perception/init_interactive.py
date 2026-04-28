@@ -27,7 +27,7 @@ import statistics
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -48,18 +48,27 @@ EXP_OUT = Path.home() / "shared_data/AutoDex/experiment/object6d_test_foundpose"
 DEFAULT_PC_LIST = ["capture1", "capture2", "capture3", "capture4", "capture5", "capture6"]
 
 
-def _list_episodes(obj: str) -> List[Path]:
-    obj_dir = EXP_SRC / obj
-    if not obj_dir.exists():
-        return []
-    out = []
-    for ep in sorted(obj_dir.iterdir()):
-        if not ep.is_dir():
+EXP_SRC_ALT = Path.home() / "shared_data/AutoDex/experiment/allegro/selected_100_prev"
+
+
+def _list_episodes(obj: str, exp_root: Optional[Path] = None) -> List[Path]:
+    roots = [exp_root] if exp_root else [EXP_SRC, EXP_SRC_ALT]
+    for root in roots:
+        if root is None:
             continue
-        if (ep / "images").exists() and (ep / "cam_param/intrinsics.json").exists() \
-                and (ep / "cam_param/extrinsics.json").exists():
-            out.append(ep)
-    return out
+        obj_dir = root / obj
+        if not obj_dir.exists():
+            continue
+        out = []
+        for ep in sorted(obj_dir.iterdir()):
+            if not ep.is_dir():
+                continue
+            if (ep / "images").exists() and (ep / "cam_param/intrinsics.json").exists() \
+                    and (ep / "cam_param/extrinsics.json").exists():
+                out.append(ep)
+        if out:
+            return out
+    return []
 
 
 def _load_calib(ep: Path):
@@ -121,8 +130,17 @@ def _render_overlay(pose, ep, intr_undist, extr, H, W, glctx, mesh_tensors, out_
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--obj", type=str, required=True)
+    parser.add_argument("--mode", choices=["live", "disk"], default="live",
+                        help="live: read from capture-PC SHM (cameras must be running). "
+                             "disk: read images from saved episode dir.")
     parser.add_argument("--ep", type=str, default=None,
-                        help="Episode dir under selected_100/allegro/{obj}/. Default: first found.")
+                        help="(disk only) Episode dir name under {exp_root}/{obj}/.")
+    parser.add_argument("--exp-root", type=str, default=None,
+                        help="(disk only) Experiment root. Default: tries selected_100/allegro then "
+                             "allegro/selected_100_prev.")
+    parser.add_argument("--calib-dir", type=str, default=None,
+                        help="(live only) cam_param dir. Default: latest under "
+                             "~/shared_data/cam_param/.")
     parser.add_argument("--prompt", type=str, default="object on the checkerboard")
     parser.add_argument("--pc-list", type=str, nargs="+", default=DEFAULT_PC_LIST)
     parser.add_argument("--port-mask", type=int, default=5006)
@@ -137,17 +155,6 @@ def main():
     from paradex.utils.system import get_pc_ip, get_camera_list
     from autodex.perception.init_orchestrator import InitOrchestrator
 
-    eps = _list_episodes(args.obj)
-    if not eps:
-        sys.exit(f"No episodes for {args.obj} under {EXP_SRC}")
-    if args.ep:
-        ep = EXP_SRC / args.obj / args.ep
-        if not ep.exists():
-            sys.exit(f"episode not found: {ep}")
-    else:
-        ep = eps[0]
-    print(f"obj={args.obj}  episode={ep.name}")
-
     mesh_path = MESH_BASE / args.obj / "raw_mesh" / f"{args.obj}.obj"
     assets_root = ASSETS_BASE / args.obj
     if not mesh_path.exists():
@@ -160,7 +167,30 @@ def main():
     out_root = Path(args.out) / args.obj
     out_root.mkdir(parents=True, exist_ok=True)
 
-    intrinsics_full, extrinsics_full, H, W = _load_calib(ep)
+    ep: Optional[Path] = None
+    if args.mode == "disk":
+        exp_root = Path(args.exp_root).expanduser() if args.exp_root else None
+        eps = _list_episodes(args.obj, exp_root=exp_root)
+        if not eps:
+            searched = [exp_root] if exp_root else [EXP_SRC, EXP_SRC_ALT]
+            sys.exit(f"No episodes for {args.obj} under any of: {searched}")
+        if args.ep:
+            ep = eps[0].parent / args.ep
+            if not ep.exists():
+                sys.exit(f"episode not found: {ep}")
+        else:
+            ep = eps[0]
+        print(f"mode=disk  obj={args.obj}  episode={ep.name}")
+        intrinsics_full, extrinsics_full, H, W = _load_calib(ep)
+    else:
+        # live: latest cam_param/<ts>/
+        if args.calib_dir:
+            calib = Path(args.calib_dir).expanduser()
+        else:
+            cam_root = Path.home() / "shared_data/cam_param"
+            calib = sorted(cam_root.iterdir())[-1]
+        print(f"mode=live  obj={args.obj}  calib={calib.name}")
+        intrinsics_full, extrinsics_full, H, W = _load_calib(calib)
     print(f"calib: {len(intrinsics_full)} cams  {H}x{W}")
 
     orch = InitOrchestrator(
@@ -175,7 +205,7 @@ def main():
             mesh_path=str(mesh_path), assets_root=str(assets_root),
             intrinsics_full=intrinsics_full, extrinsics_full=extrinsics_full,
             image_hw=(H, W),
-            mode="disk", pc_serials=pc_serials,
+            mode=args.mode, pc_serials=pc_serials,
         )
         print(f"[init] dispatched in {time.perf_counter()-t0:.1f}s "
               f"(daemons may still be loading models — first trial will reflect that)")
@@ -191,7 +221,8 @@ def main():
 
             t_start = time.perf_counter()
             pose, timing = orch.trigger_init(
-                prompt=args.prompt, capture_dir=str(ep),
+                prompt=args.prompt,
+                capture_dir=str(ep) if (args.mode == "disk" and ep is not None) else None,
                 sil_iters=args.sil_iters, sil_lr=args.sil_lr,
                 timeout_s=args.timeout_s,
             )
@@ -199,8 +230,11 @@ def main():
 
             trial_dir = out_root / f"{trial:02d}"
             trial_dir.mkdir(parents=True, exist_ok=True)
-            rec: Dict[str, Any] = {"obj": args.obj, "trial": trial, "episode": ep.name,
-                                    "wall_s": wall, **timing}
+            rec: Dict[str, Any] = {
+                "obj": args.obj, "trial": trial,
+                "episode": ep.name if ep is not None else None,
+                "mode": args.mode, "wall_s": wall, **timing,
+            }
 
             if pose is None:
                 rec["ok"] = False
@@ -208,11 +242,14 @@ def main():
             else:
                 rec["ok"] = True
                 np.save(trial_dir / "pose_world.npy", pose)
-                t_ov0 = time.perf_counter()
-                _render_overlay(pose, ep, intr_undist, extrinsics_full, H, W,
-                                orch._sil.glctx, orch._sil.mesh_tensors,
-                                trial_dir / "overlay")
-                rec["overlay_s"] = time.perf_counter() - t_ov0
+                if args.mode == "disk" and ep is not None:
+                    t_ov0 = time.perf_counter()
+                    _render_overlay(pose, ep, intr_undist, extrinsics_full, H, W,
+                                    orch._sil.glctx, orch._sil.mesh_tensors,
+                                    trial_dir / "overlay")
+                    rec["overlay_s"] = time.perf_counter() - t_ov0
+                else:
+                    rec["overlay_s"] = 0.0  # live mode: no saved frames available
                 rec["total_s"] = float(timing["total_s"]) + rec["overlay_s"]
                 print(f"  OK   total {rec['total_s']:.2f}s "
                       f"(collect {timing['dispatch_to_collected_s']:.2f} "
