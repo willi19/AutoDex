@@ -150,6 +150,14 @@ def load_pick_segments(known_bases):
         scene = str(d["scene"]) if "scene" in keys else parsed["scene"]
         scene_id = str(d["scene_id"]) if "scene_id" in keys else parsed["scene_id"]
         grasp_id = str(d["grasp_id"]) if "grasp_id" in keys else parsed["grasp_id"]
+        traj_full = np.asarray(d["traj_curobo"])
+        # New saves bundle pick→grasp + lift + lift→place into one segment
+        # and tag the grasp moment via `grasp_frame`. Legacy saves (no
+        # grasp_frame) end at the grasp itself, so grasp_frame = last frame.
+        grasp_frame_local = int(d["grasp_frame"]) if "grasp_frame" in keys \
+            else len(traj_full) - 1
+        # Did this segment already include the lift+place stages?
+        bundled = "grasp_frame" in keys
         out.append({
             "path": p,
             "ts": parsed["ts"],
@@ -158,7 +166,9 @@ def load_pick_segments(known_bases):
             "scene": scene,
             "scene_id": scene_id,
             "grasp_id": grasp_id,
-            "traj": np.asarray(d["traj_curobo"]),
+            "traj": traj_full,
+            "grasp_frame_local": grasp_frame_local,
+            "bundled_to_place": bundled,
             "joint_names": list(d["curobo_joint_names"]),
         })
     out.sort(key=lambda r: r["ts"])
@@ -308,27 +318,26 @@ def build_full_plan(picks):
             cursor += len(seg_b)
             last_q = seg_b[-1].copy()
 
-        # 2) pick_start → grasp_qpos (loaded)
-        # Stitch first frame to previous tail to avoid jumps in case of
-        # waypoint qpos mismatch.
+        # 2) pick_start → grasp → (lift → place_start) — bundled in npz.
+        # `grasp_frame_local` is the index inside the loaded segment where
+        # the hand first reaches grasp_qpos (before the lift).
         seg = traj_pg
         chunks.append(seg)
-        grasp_frame = cursor + len(seg) - 1  # frame at which hand reaches grasp
+        grasp_frame = cursor + pick["grasp_frame_local"]
         cursor += len(seg)
         last_q = seg[-1].copy()
 
-        # 3) grasp → place_start (joint-by-joint sequential, hand carries)
-        # Linear all-joint interp swings the wrist up when endpoints sit
-        # near opposite joint limits; sequential moves one arm joint at
-        # a time so the hand path stays roughly straight.
-        q_place_with_carry = q_place_start.copy()
-        for jn in HAND_ACTUATED:
-            ci = joint_names.index(jn)
-            q_place_with_carry[ci] = last_q[ci]
-        seg = sequential_arm_interp(last_q, q_place_with_carry, joint_names)
-        chunks.append(seg)
-        cursor += len(seg)
-        last_q = seg[-1].copy()
+        # 3) grasp → place_start: only build a fallback if the bundled
+        # segment didn't already carry us all the way to place_start.
+        if not pick.get("bundled_to_place"):
+            q_place_with_carry = q_place_start.copy()
+            for jn in HAND_ACTUATED:
+                ci = joint_names.index(jn)
+                q_place_with_carry[ci] = last_q[ci]
+            seg = sequential_arm_interp(last_q, q_place_with_carry, joint_names)
+            chunks.append(seg)
+            cursor += len(seg)
+            last_q = seg[-1].copy()
 
         # 4) place_start → drop (cached sequential)
         drop_name = TRASH_DROP.get(pick["obj"], DEFAULT_DROP)

@@ -10,6 +10,7 @@ import argparse
 import json
 import math
 import re
+import sys
 import threading
 import time
 from pathlib import Path
@@ -23,6 +24,14 @@ import yourdfpy
 from scipy.spatial.transform import Rotation as R
 from tqdm import tqdm
 
+# cuRobo JIT-compiles CUDA kernels on first import in a fresh env, which
+# can take 1–5 minutes with no console output. Print before/after each
+# heavy import so the user sees something is happening.
+def _t(msg):
+    print(msg, flush=True, file=sys.stderr)
+
+_t0 = time.perf_counter()
+_t(f"[import 0.00s] cuRobo... (first run JIT-compiles CUDA kernels, can take minutes)")
 from curobo.geom.sdf.world import CollisionQueryBuffer
 from curobo.geom.types import Mesh as CuroboMesh
 from curobo.geom.types import WorldConfig
@@ -33,6 +42,7 @@ from curobo.wrap.model.robot_world import RobotWorld, RobotWorldConfig
 from curobo.types.state import JointState
 from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
 from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig, MotionGenPlanConfig
+_t(f"[import {time.perf_counter() - _t0:.2f}s] cuRobo done")
 
 
 HERE = Path(__file__).resolve().parent
@@ -63,8 +73,8 @@ HANDEYE_PATH = HERE / "hand_eye_result.pkl"
 ROBOT_MASK_X_MAX = 0.2
 ROBOT_MASK_Z_MIN = 0.0
 OBJECT_DIRS = [
-    Path("/home/mingi/shared_data/AutoDex/object/robothome"),
     Path("/home/mingi/shared_data/AutoDex/object/paradex"),
+    Path("/home/mingi/shared_data/AutoDex/object/robothome"),
 ]
 ROBOT_CFG_NAME = "fr3_inspire_left.yml"
 SCENE_MESH_KEY = "scene_collision"
@@ -97,9 +107,23 @@ def load_candidates_for_obj(obj_name: str):
     Returns list of dicts: {scene, scene_id, grasp_id, wrist_obj (4,4),
     pregrasp (6,), grasp (6,)}. wrist_obj is in object-local frame.
     """
-    obj_dir = CANDIDATE_ROOT / obj_name
+    # Candidate dirs use mixed naming (camelCase like `paperCup`, underscore
+    # like `pepper_tuna`). Tracking keys feed in the underscore form, and
+    # `_camel` only collapses spaces — so `_camel("paper_cup") == "paper_cup"`.
+    # Adding the no-separator form makes `paper_cup` match `paperCup` via lower.
+    forms_lower = {f.lower() for f in [
+        obj_name,
+        obj_name.replace("_", ""),
+        obj_name.replace(" ", ""),
+    ] if f}
+    obj_dir = None
+    if CANDIDATE_ROOT.is_dir():
+        for sub in CANDIDATE_ROOT.iterdir():
+            if sub.is_dir() and sub.name.lower() in forms_lower:
+                obj_dir = sub
+                break
     out = []
-    if not obj_dir.is_dir():
+    if obj_dir is None or not obj_dir.is_dir():
         return out
     for scene in sorted(obj_dir.iterdir()):
         if not scene.is_dir():
@@ -230,6 +254,10 @@ class CuroboChecker:
             for b in bs:
                 self._self_ignore_pairs.add((a, b))
                 self._self_ignore_pairs.add((b, a))
+        # Pre-warm MotionGen now (scene mesh is loaded; dynamic objects come
+        # later but motion_gen's world is scene-only by design). Pays the ~7s
+        # warmup at startup so the first plan-button click is instant.
+        self._ensure_motion_gen()
 
     def _make_curobo_mesh(self, name: str, mesh_path: Path, T: np.ndarray) -> CuroboMesh:
         rot = T[:3, :3]
@@ -265,6 +293,10 @@ class CuroboChecker:
         # Reusable buffer + tensors for per-sphere world collision queries.
         self._sphere_buf = None
         self._sphere_buf_shape = None
+        # Separate buffer for grasp_world_collide: queries the grasp IK solver's
+        # scene-only world checker, whose collision_types may differ from main.
+        self._grasp_sphere_buf = None
+        self._grasp_sphere_buf_shape = None
         self._sphere_weight = torch.tensor([1.0], device=self.tensor_args.device,
                                             dtype=self.tensor_args.dtype)
         self._sphere_act = torch.tensor([0.0], device=self.tensor_args.device,
@@ -288,7 +320,9 @@ class CuroboChecker:
             ik_opt_iters=200,
             grad_trajopt_iters=200,
             trajopt_tsteps=64,
-            collision_activation_distance=0.005,
+            # 0.0 — penetration only. Anything > 0 is a buffer that flags
+            # valid pre-grasps near the target surface as collision.
+            collision_activation_distance=0.0,
             # Pre-allocate the world collision cache. Without this, cuRobo's
             # WorldMeshCollision.cache stays None, and clear_world_cache()
             # crashes on `self.cache["mesh"]` when objects are added/removed
@@ -298,15 +332,19 @@ class CuroboChecker:
         self._motion_gen = MotionGen(cfg)
         self._motion_gen.warmup(enable_graph=True, warmup_js_trajopt=False)
         self._plan_cfg = MotionGenPlanConfig(
-            enable_graph=True,
+            # Graph search (PRM) does its own start/goal feasibility check
+            # via rollout_constraint that disagrees with raw sphere distance.
+            # We've verified start/goal collision-free with 4 sphere checks,
+            # so skip graph entirely and let trajopt drive the plan.
+            enable_graph=False,
             enable_opt=True,
-            enable_graph_attempt=4,
             max_attempts=20,
             enable_finetune_trajopt=True,
             num_trajopt_seeds=32,
             num_ik_seeds=32,
             timeout=60.0,
             parallel_finetune=True,
+            check_start_validity=False,
         )
         print("[curobo] MotionGen ready")
 
@@ -500,6 +538,16 @@ class CuroboChecker:
             # New world → buffer may need to grow (different collision types).
             self._sphere_buf = None
             self._sphere_buf_shape = None
+            # Invalidate the scene-only grasp checkers — they cache the scene
+            # mesh from their first build, so without this they go stale and
+            # silently pass IK solutions that clip the new scene. Symptom:
+            # `world_collide_scene_from_q` returns False for actually-colliding
+            # candidates → marked "success" → plan_js fails GRAPH_FAIL on the
+            # fresh main world.
+            self._grasp_rw = None
+            self._grasp_ik_solver = None
+            self._grasp_sphere_buf = None
+            self._grasp_sphere_buf_shape = None
 
     def solve_ik(self, target_T: np.ndarray, retract_q: np.ndarray | None = None):
         """Run cuRobo IK to a 4x4 SE(3) target pose for the EE link.
@@ -528,16 +576,68 @@ class CuroboChecker:
         q = result.solution.view(-1).detach().cpu().numpy()
         return succ, q
 
-    GRASP_IK_BATCH = 50
+    def _ensure_grasp_rw(self):
+        """Lazy RobotWorld for grasp-time collision checks.
+
+        Full world (scene + dynamic target objects). At a valid grasp the wrist
+        is at the grasp pose with PRE-GRASP (open) fingers — the hand should
+        wrap around the target without touching it. If pre-grasp fingers do
+        contact the target the candidate is bad and gets filtered.
+
+        Using the same world as motion_gen guarantees that a candidate marked
+        collision-free here is also accepted by plan_single_js's start/end
+        validity check (no more "End state in collision" surprises).
+        """
+        if getattr(self, "_grasp_rw", None) is not None:
+            return
+        wc = WorldConfig(mesh=list(self._world_meshes.values()))
+        # All three checkers (motion_gen, _grasp_ik_solver, _grasp_rw) use 0.0
+        # so they answer the same question (penetration only) on the same q.
+        rw_cfg = RobotWorldConfig.load_from_config(
+            self.cfg_dict, wc, tensor_args=self.tensor_args,
+            collision_activation_distance=0.0,
+        )
+        self._grasp_rw = RobotWorld(rw_cfg)
+        self._grasp_sphere_buf = None
+        self._grasp_sphere_weight = torch.tensor(
+            [1.0], device=self.tensor_args.device, dtype=self.tensor_args.dtype,
+        )
+        self._grasp_sphere_act = torch.tensor(
+            [0.0], device=self.tensor_args.device, dtype=self.tensor_args.dtype,
+        )
+
+    def world_collide_scene_from_q(self, q: np.ndarray) -> np.ndarray:
+        """Per-sphere world collision against the FULL world (scene + target
+        objects). Pre-grasp finger config means the hand should not touch the
+        target — if it does, this returns True for the offending sphere(s).
+        Name is kept for backwards-compat; semantics now match motion_gen.
+        """
+        self._ensure_grasp_rw()
+        q_t = torch.tensor(q.reshape(1, -1), dtype=self.tensor_args.dtype,
+                           device=self.tensor_args.device)
+        with self._lock:
+            state = self._grasp_rw.get_kinematics(q_t)
+            x_sph = state.link_spheres_tensor.unsqueeze(1)  # (1, 1, N, 4)
+            wc = self._grasp_rw.collision_cost.world_coll_checker
+            if (self._grasp_sphere_buf is None
+                    or tuple(self._grasp_sphere_buf.shape) != tuple(x_sph.shape)):
+                self._grasp_sphere_buf = CollisionQueryBuffer.initialize_from_shape(
+                    x_sph.shape, self.tensor_args, wc.collision_types,
+                )
+            d = wc.get_sphere_distance(
+                x_sph, self._grasp_sphere_buf,
+                self._grasp_sphere_weight, self._grasp_sphere_act,
+                sum_collisions=False,
+            )
+        return (d.view(-1).detach().cpu().numpy() > 0)
 
     def _ensure_grasp_ik_solver(self):
         """Lazy-build a separate IK solver for grasp reachability checks.
 
-        Uses scene mesh ONLY (no dynamic object meshes), matching the working
-        pattern in autodex/planner/planner.py: when checking if a wrist pose
-        is reachable, the hand is supposed to be ON the object, so including
-        the object in the IK world makes every grasp fail. Collision against
-        the full world (with object) is handled separately after IK.
+        Full world (scene + dynamic objects), matching motion_gen and
+        `_grasp_rw`. The IK target is the grasp wrist pose; with pre-grasp
+        (open) fingers the hand should not penetrate the target object. If
+        a candidate's pre-grasp fingers do clip the target IK will fail it.
 
         Arm null_space_weight is overridden to non-zero values so the
         retract_config (= pick_start qpos) actually pulls solutions toward
@@ -551,9 +651,7 @@ class CuroboChecker:
         """
         if getattr(self, "_grasp_ik_solver", None) is not None:
             return
-        scene_only = {SCENE_MESH_KEY: self._world_meshes[SCENE_MESH_KEY]} \
-            if SCENE_MESH_KEY in self._world_meshes else {}
-        wc = WorldConfig(mesh=list(scene_only.values()))
+        wc = WorldConfig(mesh=list(self._world_meshes.values()))
         # Deep-copy cfg_dict so we don't mutate the shared config (the main
         # ik_solver / motion_gen still use the original null_space=0 defaults).
         import copy
@@ -562,75 +660,68 @@ class CuroboChecker:
         # Arm: 7 joints — strong pull toward pick_start.
         # Hand: 6 joints — leave at 0 (we overwrite hand q from pregrasp anyway).
         cspace["null_space_weight"] = [1.0] * 7 + [0.0] * 6
+        # cuda_graph=True: solve_ik_batch already pads each chunk to fixed
+        # GRASP_IK_BATCH (=50), so the captured graph reuses across chunks
+        # and across re-clicks. With graph off the same call took tens of
+        # seconds; with it, sub-second for ~600 padded candidates.
         ik_cfg = IKSolverConfig.load_from_robot_config(
             grasp_cfg, wc, tensor_args=self.tensor_args,
             num_seeds=32,
-            collision_activation_distance=0.005,
+            collision_activation_distance=0.0,
             use_cuda_graph=True,
         )
         self._grasp_ik_solver = IKSolver(ik_cfg)
 
     def solve_ik_batch(self, target_Ts: np.ndarray,
-                       retract_q: np.ndarray | None = None,
-                       batch_size: int | None = None):
-        """Batched IK for B target poses, chunked + padded.
+                       retract_q: np.ndarray | None = None):
+        """Batched IK for N target poses in a single solve_batch call.
 
         - separate IK solver without dynamic object meshes
         - retract_config + non-zero arm null_space_weight (set in
           _ensure_grasp_ik_solver) bias solutions toward retract_q so plans
           don't wrap around through joint limits (esp. fr3_joint5 ±2.876)
-        - chunks padded to fixed batch_size for consistent solver shape
-        target_Ts: (B, 4, 4). Returns (success (B,) bool, q (B, n_dof)).
+        target_Ts: (N, 4, 4). Returns (success (N,) bool, q (N, n_dof)).
         """
         self._ensure_grasp_ik_solver()
-        if batch_size is None:
-            batch_size = self.GRASP_IK_BATCH
-        retract_t = None
-        if retract_q is not None:
-            retract_t = torch.tensor(
-                np.broadcast_to(np.asarray(retract_q, dtype=np.float32),
-                                (batch_size, len(retract_q))).copy(),
-                device=self.tensor_args.device, dtype=self.tensor_args.dtype,
-            ).contiguous()
         target_Ts = np.asarray(target_Ts, dtype=np.float32)
         N = target_Ts.shape[0]
-        n_dof = len(self.curobo_joint_names)
-        succ_all = np.zeros(N, dtype=bool)
-        q_all = np.zeros((N, n_dof), dtype=np.float32)
-        for s in range(0, N, batch_size):
-            e = min(s + batch_size, N)
-            chunk = target_Ts[s:e]
-            B = chunk.shape[0]
-            if B < batch_size:
-                pad = np.tile(chunk[:1], (batch_size - B, 1, 1))
-                chunk = np.concatenate([chunk, pad], axis=0)
-            pos = torch.tensor(chunk[:, :3, 3],
-                               device=self.tensor_args.device,
-                               dtype=self.tensor_args.dtype).contiguous()
-            qxyzw = R.from_matrix(chunk[:, :3, :3]).as_quat()
-            quat = torch.tensor(qxyzw[:, [3, 0, 1, 2]],
-                                device=self.tensor_args.device,
-                                dtype=self.tensor_args.dtype).contiguous()
-            goal = CuroboPose(position=pos, quaternion=quat)
-            with self._lock:
-                result = self._grasp_ik_solver.solve_batch(
-                    goal, retract_config=retract_t,
-                )
-            # Match planner.py exactly: success is (B_padded,) or (B_padded, 1);
-            # solution is (B_padded, return_seeds, dof) or (B_padded, dof).
-            s_chunk = result.success.cpu().numpy()[:B]
-            q_chunk = result.solution.cpu().numpy()[:B]
-            if q_chunk.ndim == 3:
-                q_chunk = q_chunk[:, 0, :]
-            succ_all[s:e] = np.asarray(s_chunk).astype(bool).reshape(-1)[:B]
-            q_all[s:e] = q_chunk
+        retract_t = None
+        if retract_q is not None and N > 0:
+            retract_t = torch.tensor(
+                np.broadcast_to(np.asarray(retract_q, dtype=np.float32),
+                                (N, len(retract_q))).copy(),
+                device=self.tensor_args.device, dtype=self.tensor_args.dtype,
+            ).contiguous()
+        pos = torch.tensor(target_Ts[:, :3, 3],
+                           device=self.tensor_args.device,
+                           dtype=self.tensor_args.dtype).contiguous()
+        qxyzw = R.from_matrix(target_Ts[:, :3, :3]).as_quat()
+        quat = torch.tensor(qxyzw[:, [3, 0, 1, 2]],
+                            device=self.tensor_args.device,
+                            dtype=self.tensor_args.dtype).contiguous()
+        goal = CuroboPose(position=pos, quaternion=quat)
+        with self._lock:
+            result = self._grasp_ik_solver.solve_batch(
+                goal, retract_config=retract_t,
+            )
+        # success: (N,) or (N, 1); solution: (N, return_seeds, dof) or (N, dof).
+        succ_all = result.success.cpu().numpy().astype(bool).reshape(-1)[:N]
+        q_all = result.solution.cpu().numpy()
+        if q_all.ndim == 3:
+            q_all = q_all[:, 0, :]
         return succ_all, q_all
 
-    def plan_js(self, q_start: np.ndarray, q_goal: np.ndarray):
+    def plan_js(self, q_start: np.ndarray, q_goal: np.ndarray,
+                exclude_obstacle: str | None = None):
         """Joint-space motion plan from q_start → q_goal (curobo joint order).
 
         Returns interpolated trajectory (T, n_dof) in curobo joint order, or
         None on failure.
+
+        `exclude_obstacle`: name of a mesh in `_world_meshes` to temporarily
+        remove from motion_gen for this call only (restored on return). Use
+        when planning AFTER a grasp — the grasped target moves with the hand,
+        so it must not be a fixed obstacle in the world during lift/place.
         """
         self._ensure_motion_gen()
         start_t = torch.tensor(q_start.reshape(1, -1), dtype=self.tensor_args.dtype,
@@ -639,12 +730,34 @@ class CuroboChecker:
                               device=self.tensor_args.device)
         start = JointState.from_position(start_t)
         goal = JointState.from_position(goal_t)
-        with self._lock:
-            result = self._motion_gen.plan_single_js(
-                start_state=start, goal_state=goal, plan_config=self._plan_cfg,
-            )
+        swap_back = (exclude_obstacle is not None
+                     and exclude_obstacle in self._world_meshes)
+        if swap_back:
+            reduced = WorldConfig(mesh=[m for k, m in self._world_meshes.items()
+                                        if k != exclude_obstacle])
+            with self._lock:
+                self._motion_gen.clear_world_cache()
+                self._motion_gen.update_world(reduced)
+        try:
+            with self._lock:
+                result = self._motion_gen.plan_single_js(
+                    start_state=start, goal_state=goal, plan_config=self._plan_cfg,
+                )
+        finally:
+            if swap_back:
+                with self._lock:
+                    self._motion_gen.clear_world_cache()
+                    self._motion_gen.update_world(self._motion_gen_world)
         if not bool(result.success.item()):
+            # Surface cuRobo's diagnostic so the user can tell whether it's
+            # a collision-at-start/goal vs a trajopt convergence failure
+            # vs IK seed problem etc.
+            status = getattr(result, "status", None)
+            valid = getattr(result, "valid_query", None)
+            print(f"[plan_js] FAIL  status={status}  valid_query={valid}")
+            self._last_plan_status = str(status)
             return None
+        self._last_plan_status = "OK"
         return result.get_interpolated_plan().position.cpu().numpy()
 
     def fk_ee(self, q: np.ndarray) -> np.ndarray:
@@ -668,6 +781,93 @@ class CuroboChecker:
             state = self.rw.get_kinematics(q_t)
             x_sph = state.link_spheres_tensor.view(-1, 4).detach().cpu().numpy()
         return x_sph
+
+    def export_collision_debug(self, q: np.ndarray, label: str,
+                               out_dir: str = str(HERE / "collision_debug")):
+        """Export robot collision spheres (at q) and ALL world meshes/cuboids
+        as OBJ files for MeshLab inspection. Three sources are dumped so the
+        user can compare what each checker sees:
+
+          {label}_spheres_main.obj      — main RobotWorld kinematics
+          {label}_spheres_motiongen.obj — motion_gen's kinematics
+          world_mesh_{name}.obj         — every mesh in motion_gen.world_model
+          world_cube_{name}.obj         — every cuboid in motion_gen.world_model
+
+        Open all together in MeshLab and look for spheres clipping any mesh.
+        """
+        import os
+        from scipy.spatial.transform import Rotation as Rot
+        os.makedirs(out_dir, exist_ok=True)
+        q_t = torch.tensor(q.reshape(1, -1), dtype=self.tensor_args.dtype,
+                           device=self.tensor_args.device)
+
+        def _save_spheres(state, path):
+            x = state.link_spheres_tensor.view(-1, 4).detach().cpu().numpy()
+            meshes = []
+            for pos, rad in zip(x[:, :3], x[:, 3]):
+                if rad <= 0:
+                    continue
+                m = trimesh.creation.icosphere(radius=float(rad), subdivisions=1)
+                m.apply_translation(pos)
+                meshes.append(m)
+            if meshes:
+                trimesh.util.concatenate(meshes).export(path)
+                print(f"[debug] {path} ({len(meshes)} spheres)")
+
+        # 1) main rw kinematics spheres
+        with self._lock:
+            try:
+                _save_spheres(self.rw.get_kinematics(q_t),
+                              os.path.join(out_dir, f"{label}_spheres_main.obj"))
+            except Exception as e:
+                print(f"[debug] main spheres export failed: {e}")
+        # 2) motion_gen kinematics spheres (the ones plan_single_js actually checks)
+        try:
+            self._ensure_motion_gen()
+            mg_kin = self._motion_gen.kinematics
+            with self._lock:
+                _save_spheres(mg_kin.compute_kinematics(JointState.from_position(q_t)),
+                              os.path.join(out_dir, f"{label}_spheres_motiongen.obj"))
+        except Exception as e:
+            print(f"[debug] motion_gen spheres export failed: {e}")
+        # 3) Dump motion_gen's world (meshes + cuboids) — once per call to refresh
+        try:
+            wm = getattr(self._motion_gen, "world_model", None)
+            if wm is not None:
+                for m in (getattr(wm, "mesh", None) or []):
+                    name = getattr(m, "name", "mesh")
+                    pose = np.asarray(getattr(m, "pose",
+                                              [0, 0, 0, 1, 0, 0, 0]) or [0, 0, 0, 1, 0, 0, 0])
+                    fp = getattr(m, "file_path", None)
+                    verts, faces = m.vertices, m.faces
+                    if (verts is None or faces is None) and fp:
+                        tm = trimesh.load(fp, force="mesh", process=False)
+                    else:
+                        if hasattr(verts, "cpu"): verts = verts.cpu().numpy()
+                        if hasattr(faces, "cpu"): faces = faces.cpu().numpy()
+                        tm = trimesh.Trimesh(vertices=np.asarray(verts),
+                                             faces=np.asarray(faces))
+                    T = np.eye(4)
+                    T[:3, 3] = pose[:3]
+                    T[:3, :3] = Rot.from_quat(pose[[4, 5, 6, 3]]).as_matrix()
+                    tm.apply_transform(T)
+                    p = os.path.join(out_dir, f"world_mesh_{name}.obj")
+                    tm.export(p)
+                    print(f"[debug] {p}")
+                for c in (getattr(wm, "cuboid", None) or []):
+                    name = getattr(c, "name", "cube")
+                    dims = np.asarray(c.dims)
+                    pose = np.asarray(c.pose)
+                    box = trimesh.creation.box(extents=dims)
+                    T = np.eye(4)
+                    T[:3, 3] = pose[:3]
+                    T[:3, :3] = Rot.from_quat(pose[[4, 5, 6, 3]]).as_matrix()
+                    box.apply_transform(T)
+                    p = os.path.join(out_dir, f"world_cube_{name}.obj")
+                    box.export(p)
+                    print(f"[debug] {p}")
+        except Exception as e:
+            print(f"[debug] world export failed: {e}")
 
 
 # ----- Floating hand viewer (single instance, recolored per candidate) -----
@@ -838,13 +1038,23 @@ class ViserURDF:
 # ----- App -----
 class App:
     def __init__(self, port: int):
+        _t0 = time.perf_counter()
+        def _step(label):
+            nonlocal _t0
+            now = time.perf_counter()
+            print(f"[init {now - _t0:5.2f}s] {label}", flush=True)
+            _t0 = now
+
+        _step("start")
         self.server = viser.ViserServer(port=port)
         self.server.gui.configure_theme(dark_mode=True)
         self.server.scene.set_up_direction((0, 0, 1))
         self.server.scene.add_grid("/floor", width=2.0, height=2.0, plane="xy",
                                    position=(0, 0, 0), cell_size=0.1)
+        _step("viser server up")
 
         self.viser_urdf = ViserURDF(self.server, URDF_PATH)
+        _step("ViserURDF loaded")
         self.actuated = list(self.viser_urdf.urdf.actuated_joint_names)
         self.q_actuated = np.zeros(len(self.actuated))
         for jn, val in zip(ARM_JOINTS, ARM_HOME):
@@ -936,6 +1146,14 @@ class App:
         self._build_gui()
         self._refresh_grasp_objects()
         self._refresh_robot()
+        # Auto-load the latest tracking JSON so objects come back after a
+        # restart without needing to click "Load Tracking" every time.
+        if self.tracking_files:
+            try:
+                self._load_tracking_json(self.tracking_files[0])
+                self._refresh_grasp_objects()
+            except Exception as e:
+                print(f"[init] auto-load tracking failed: {e}")
 
     # actuated <-> curobo joint order
     def _q_curobo(self) -> np.ndarray:
@@ -1030,6 +1248,7 @@ class App:
             )
             srv.add_button("Add object").on_click(lambda _: self._add_object(self.obj_dropdown.value))
             srv.add_button("Save object poses").on_click(lambda _: self._save_object_poses())
+            srv.add_button("Load object poses").on_click(lambda _: self._load_object_poses())
             self.object_poses_status = srv.add_text("Object poses", "—", disabled=True)
             self.objects_folder_parent = srv.add_folder("Active objects", expand_by_default=True)
 
@@ -1325,6 +1544,38 @@ class App:
         print(f"[seq] saved {out}")
         self._on_traj_slider()
 
+    def _load_object_poses(self):
+        """Restore the scene from `traj/object_poses.npz` (saved earlier
+        via "Save object poses"). Re-creates each instance via _add_object
+        and applies the stored 4×4 pose. Skips entries whose mesh dir is
+        missing.
+        """
+        path = TRAJ_DIR / "object_poses.npz"
+        if not path.exists():
+            self.object_poses_status.value = f"missing {path.name}"
+            return
+        d = np.load(path, allow_pickle=True)
+        instances = [str(x) for x in d["instances"]]
+        bases = [str(x) for x in d["base_names"]]
+        Ts = np.asarray(d["T"], dtype=np.float64)
+        added = 0
+        for inst, base, T in zip(instances, bases, Ts):
+            if base not in self.object_names:
+                print(f"[objects] skip {inst!r}: base {base!r} not in object_names")
+                continue
+            # _add_object generates a unique instance id; if the saved
+            # name was e.g. "paperCup_2", we still want that exact label
+            # so per-object planning data lines up. _add_object dedups by
+            # appending "_N", so adding twice for the same base picks up
+            # _2, _3, ... naturally if loaded in saved order.
+            new_inst = self._add_object(base)
+            if new_inst is None:
+                continue
+            self._set_object_pose(new_inst, T)
+            added += 1
+        self.object_poses_status.value = f"loaded {added}/{len(instances)} from {path.name}"
+        print(f"[objects] loaded {added}/{len(instances)} from {path}")
+
     def _save_object_poses(self):
         """Dump every active object's instance name, base name, mesh path,
         and 4×4 pose to traj/object_poses.npz so the replay script can
@@ -1441,6 +1692,7 @@ class App:
         for s in entry["sliders"]:
             s.on_update(self._make_object_cb(instance))
         btn_remove.on_click(self._make_object_remove_cb(instance))
+        self._refresh_grasp_objects()
         return instance
 
     def _make_object_cb(self, instance):
@@ -1475,6 +1727,7 @@ class App:
             with self._dirty_lock:
                 self._world_jobs.append(("remove", instance))
                 self._dirty = True
+            self._refresh_grasp_objects()
         return cb
 
     def _resolve_mesh_file(self, obj_name: str):
@@ -1675,6 +1928,9 @@ class App:
         base = instance
         while base not in self.object_names and "_" in base:
             base = base.rsplit("_", 1)[0]
+        print(f"[grasp] instance='{instance}'  base='{base}'  "
+              f"in_object_names={base in self.object_names}  "
+              f"CANDIDATE_ROOT={CANDIDATE_ROOT}  exists={CANDIDATE_ROOT.is_dir()}")
         cands = load_candidates_for_obj(base)
         if not cands:
             self.grasp_stats.value = f"no candidates for '{base}'"
@@ -1685,7 +1941,8 @@ class App:
         # every grasp at 0/60/120/180/240/300° around the object's local Y.
         # Asymmetric objects (crushed cans, etc.) keep one orientation —
         # Y-rotated copies would be physically wrong grasps for them.
-        if base in Y_SYMMETRIC_OBJECTS:
+        base_norm = base.replace("_", "").lower()
+        if any(base_norm == x.replace("_", "").lower() for x in Y_SYMMETRIC_OBJECTS):
             expanded = []
             for c in cands:
                 for k in range(6):
@@ -1741,10 +1998,15 @@ class App:
         print(f"[grasp] batch IK ({len(cands)} poses) "
               f"ok={int(succ_arr.sum())} in {time.perf_counter() - t0:.2f}s")
 
-        # Per-candidate self-collision check on the IK solution. Object
-        # meshes are intentionally NOT checked — the wrist target is on the
-        # object so any sphere overlap with it is expected; scene-mesh
-        # collisions are already ruled out inside the IK solver.
+        # Collision check against the scene-only world (table/floor) plus
+        # self-collision. Object meshes are intentionally excluded — the
+        # wrist target is on the object, so the dynamic object would
+        # always trigger a false positive there.
+        # Pre-compute curobo indices for the hand joints we override below.
+        hand_idx_in_curobo = [
+            self.curobo.curobo_joint_names.index(jn)
+            for jn in FloatingHand.HAND_ACTUATED
+        ]
         for i, c in enumerate(tqdm(cands, desc=f"[grasp] coll {base}", unit="grasp")):
             ok = bool(succ_arr[i])
             c["ik_success"] = ok
@@ -1752,9 +2014,18 @@ class App:
             in_coll = False
             if ok:
                 try:
-                    x_sph = self.curobo.query(c["ik_q"])
+                    # Check the SAME q that plan_js will see — IK keeps the
+                    # solver's hand seed (~retract qpos), but we override hand
+                    # joints with `pregrasp` before planning. Different hand
+                    # config → different sphere positions → different
+                    # collision answer. Match motion_gen by overriding here too.
+                    q_check = np.asarray(c["ik_q"], dtype=np.float64).copy()
+                    for k, ci in enumerate(hand_idx_in_curobo):
+                        q_check[ci] = float(c["pregrasp"][k])
+                    w_coll = self.curobo.world_collide_scene_from_q(q_check)
+                    x_sph = self.curobo.query(q_check)
                     s_coll = self.curobo.self_collide(x_sph)
-                    in_coll = bool(s_coll.any())
+                    in_coll = bool(w_coll.any() or s_coll.any())
                 except Exception as e:
                     print(f"[grasp] collision error: {e}")
             c["in_collision"] = in_coll
@@ -1834,25 +2105,128 @@ class App:
             if jn in self.curobo.curobo_joint_names:
                 q_start_curobo[self.curobo.curobo_joint_names.index(jn)] = float(v)
 
+        # Stage 1: pick_start → grasp_qpos
+        # Diagnostic: query the SAME q against four checkers and see which
+        # one disagrees. The fourth uses motion_gen's OWN world_coll_checker
+        # (the one plan_single_js actually uses for the validity check) so we
+        # can see whether motion_gen is looking at a different world or
+        # different spheres than our two RobotWorld instances.
         try:
-            traj = self.curobo.plan_js(q_start_curobo, q_goal_curobo)
+            self.curobo._ensure_motion_gen()
+            mg_wcc = self.curobo._motion_gen.world_coll_checker
+        except Exception as e:
+            mg_wcc = None
+            print(f"[plan] motion_gen world checker access error: {e}")
+        for label, q in [("start", q_start_curobo),
+                         ("end", q_goal_curobo)]:
+            try:
+                w_grasp = self.curobo.world_collide_scene_from_q(q)
+                x_sph = self.curobo.query(q)
+                w_main = self.curobo.world_collide(x_sph)
+                s = self.curobo.self_collide(x_sph)
+                w_mg_str = "n/a"
+                if mg_wcc is not None:
+                    x_sph_t = torch.tensor(x_sph.reshape(1, 1, -1, 4),
+                                           dtype=self.curobo.tensor_args.dtype,
+                                           device=self.curobo.tensor_args.device)
+                    buf = CollisionQueryBuffer.initialize_from_shape(
+                        x_sph_t.shape, self.curobo.tensor_args, mg_wcc.collision_types,
+                    )
+                    d = mg_wcc.get_sphere_distance(
+                        x_sph_t, buf,
+                        self.curobo._sphere_weight, self.curobo._sphere_act,
+                        sum_collisions=False,
+                    )
+                    w_mg = (d.view(-1).detach().cpu().numpy() > 0)
+                    w_mg_str = f"{int(w_mg.sum())}/{w_mg.size}"
+                print(f"[plan] {label}: "
+                      f"_grasp_rw={int(w_grasp.sum())}/{w_grasp.size}  "
+                      f"main_rw={int(w_main.sum())}/{w_main.size}  "
+                      f"motion_gen={w_mg_str}  "
+                      f"self={int(s.sum())}/{s.size}")
+            except Exception as e:
+                print(f"[plan] {label} check error: {e}")
+        try:
+            traj_pg = self.curobo.plan_js(q_start_curobo, q_goal_curobo)
         except Exception as e:
             self.plan_status.value = f"plan error: {e}"
             print(f"[plan] {e}")
             return
-        if traj is None:
-            self.plan_status.value = "plan FAIL"
+        if traj_pg is None:
+            status = getattr(self.curobo, "_last_plan_status", None) or "?"
+            self.plan_status.value = f"plan FAIL (pick→grasp): {status}"
             return
-        self._traj = traj  # (T, n_dof) curobo order
-        self.plan_status.value = f"plan OK: {len(traj)} frames"
+
+        # Stage 2: 5cm Z-up lift via IK seeded at grasp_qpos.
+        T_lift_world = c["wrist_world"].copy()
+        T_lift_world[2, 3] += 0.05
+        try:
+            ok_lift, q_lift = self.curobo.solve_ik(T_lift_world, retract_q=q_goal_curobo)
+        except Exception as e:
+            print(f"[plan] lift IK error: {e}")
+            ok_lift, q_lift = False, None
+        if not ok_lift or q_lift is None:
+            self.plan_status.value = "lift IK FAIL"
+            return
+        # Keep hand at grasp pose during lift (still carrying object).
+        q_lift = np.asarray(q_lift, dtype=np.float64).copy()
+        for jn in FloatingHand.HAND_ACTUATED:
+            ci = self.curobo.curobo_joint_names.index(jn)
+            q_lift[ci] = float(q_goal_curobo[ci])
+        # Direct interpolation grasp→lift (small motion, no obstacle to avoid).
+        n_lift = 30
+        alphas = np.linspace(0.0, 1.0, n_lift)
+        traj_lift = (1 - alphas)[:, None] * q_goal_curobo[None, :] + alphas[:, None] * q_lift[None, :]
+
+        # Stage 3: lift_qpos → place_start_qpos (cuRobo plan_js).
+        wp_ps = self._load_waypoint("place_start")
+        if wp_ps is None:
+            self.plan_status.value = "missing place_start waypoint"
+            return
+        q_place_curobo = np.zeros(len(self.curobo.curobo_joint_names))
+        for jn, v in zip(wp_ps["actuated"], wp_ps["q_actuated"]):
+            if jn in self.curobo.curobo_joint_names:
+                q_place_curobo[self.curobo.curobo_joint_names.index(jn)] = float(v)
+        # Carry the grasp hand pose into place_start (don't drop the object).
+        for jn in FloatingHand.HAND_ACTUATED:
+            ci = self.curobo.curobo_joint_names.index(jn)
+            q_place_curobo[ci] = float(q_goal_curobo[ci])
+        # Target object is now in the hand — exclude it from the world so
+        # motion_gen doesn't treat it as a fixed obstacle hand-overlapping
+        # itself.
+        instance = self.grasp_obj_dropdown.value
+        try:
+            traj_lp = self.curobo.plan_js(
+                q_lift, q_place_curobo,
+                exclude_obstacle=f"obj::{instance}",
+            )
+        except Exception as e:
+            self.plan_status.value = f"plan error (lift→place): {e}"
+            print(f"[plan] lift→place {e}")
+            return
+        if traj_lp is None:
+            status = getattr(self.curobo, "_last_plan_status", None) or "?"
+            self.plan_status.value = f"plan FAIL (lift→place): {status}"
+            return
+
+        # Concatenate. grasp_frame = index where the hand first reaches
+        # grasp_qpos (end of stage 1, before the lift).
+        grasp_frame = len(traj_pg) - 1
+        traj = np.concatenate([traj_pg, traj_lift, traj_lp], axis=0)
+
+        self._traj = traj
+        self.plan_status.value = (
+            f"plan OK: pg={len(traj_pg)} lift={len(traj_lift)} "
+            f"lp={len(traj_lp)} total={len(traj)}"
+        )
         self.traj_slider.max = max(1, len(traj) - 1)
         self.traj_slider.value = 0
         self._on_traj_slider()
 
-        # Multi-object trash flow: each "Plan to this grasp" click is one
-        # pick segment in the sequence. The npz carries `instance` so we
-        # don't lose paperCup_1 vs paperCup_2 (the filename only has the
-        # base name, which is shared across same-class instances).
+        # Multi-object trash flow save. Filename keeps the legacy
+        # `_pick_start__to_grasp_` format (replay regex matches it), but the
+        # npz now contains the concat trajectory through place_start; the
+        # `grasp_frame` index tells replay where to attach the carried object.
         instance = self.grasp_obj_dropdown.value
         base = instance
         while base not in self.object_names and "_" in base:
@@ -1867,13 +2241,15 @@ class App:
             out,
             traj_curobo=traj,
             curobo_joint_names=np.array(self.curobo.curobo_joint_names, dtype=object),
+            grasp_frame=np.array(grasp_frame, dtype=np.int64),
             instance=np.array(instance, dtype=object),
             base_name=np.array(base, dtype=object),
             scene=np.array(c["scene"], dtype=object),
             scene_id=np.array(c["scene_id"], dtype=object),
             grasp_id=np.array(c["grasp_id"], dtype=object),
         )
-        print(f"[plan] saved {out.name}  instance={instance}  ({len(traj)} frames)")
+        print(f"[plan] saved {out.name}  instance={instance}  "
+              f"frames={len(traj)} (grasp_frame={grasp_frame})")
 
     def _on_traj_slider(self):
         if self._traj is None:
@@ -2046,6 +2422,20 @@ class App:
 
 
 def main():
+    # Register SIGINT / SIGTSTP at module top-level BEFORE viser or cuRobo
+    # initialise — both spawn threads and cuRobo holds CUDA state, so if
+    # we wait until inside App.run() to install the handler something else
+    # may have already wrapped or replaced it. The handler calls
+    # `os._exit(0)` directly, skipping Python exception unwinding so
+    # bare-except clauses in third-party code can't swallow it.
+    import os
+    import signal
+    def _on_sig(sig, frame):
+        print(f"\n[viewer] signal {sig} — force exit", flush=True)
+        os._exit(0)
+    signal.signal(signal.SIGINT, _on_sig)
+    signal.signal(signal.SIGTSTP, _on_sig)
+
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=8080)
     args = p.parse_args()
