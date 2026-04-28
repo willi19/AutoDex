@@ -34,7 +34,7 @@ from typing import List
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GOTRACK_ROOT = REPO_ROOT / "autodex/perception/thirdparty/MV-GoTrack"
-MESH_BASE = Path("/home/mingi/shared_data/AutoDex/object/paradex")
+MESH_BASE = Path.home() / "shared_data/AutoDex/object/paradex"
 
 
 def _resolve_mesh(obj: str) -> Path:
@@ -124,7 +124,7 @@ def main():
     parser.add_argument("--reference-camera-id", type=str, default=None)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--python-bin", type=str,
-                        default=str(Path.home() / "miniconda3/envs/gotrack/bin/python"))
+                        default=str(Path.home() / "anaconda3/envs/gotrack_cu128/bin/python"))
     parser.add_argument("--log-dir", type=str,
                         default=str(REPO_ROOT / "outputs/foundpose_onboard_logs"))
     parser.add_argument("--overwrite", action="store_true")
@@ -140,7 +140,7 @@ def main():
     # Resolve reference intrinsics if not given.
     ref_json = Path(args.reference_intrinsics_json) if args.reference_intrinsics_json else None
     if ref_json is None:
-        exp_root = Path("/home/mingi/shared_data/AutoDex/experiment/selected_100/allegro")
+        exp_root = Path.home() / "shared_data/AutoDex/experiment/selected_100/allegro"
         for obj_dir in sorted(exp_root.iterdir()):
             if not obj_dir.is_dir():
                 continue

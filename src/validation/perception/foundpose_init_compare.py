@@ -46,7 +46,7 @@ if str(REPO_ROOT) not in sys.path:
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 os.environ.setdefault("EGL_PLATFORM", "surfaceless")
 
-MESH_ROOT = Path("/home/mingi/shared_data/AutoDex/object/paradex")
+MESH_ROOT = Path.home() / "shared_data/AutoDex/object/paradex"
 
 
 # ── data discovery ──
