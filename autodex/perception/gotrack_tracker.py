@@ -24,7 +24,7 @@ import logging
 import sys
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -193,6 +193,25 @@ class GoTrackTracker:
 
         self.prior_pub = PriorPosePublisher(port_prior)
 
+        # Live status for dashboard. Lock protects dict mutation.
+        self._status_lock = threading.Lock()
+        self._fps_window: "deque[float]" = deque(maxlen=30)
+        self.status: Dict[str, Any] = {
+            "obj_name": None,
+            "init_done": False,
+            "init_ts": None,
+            "frame_id": -1,
+            "fps": 0.0,
+            "last_fit_ok": None,
+            "fail_reason": None,
+            "n_inliers": 0,
+            "mean_residual_mm": -1.0,
+            "current_pose": None,
+            "per_pc_last_frame": {},
+            "started_ts": time.time(),
+            "capture_pc_ips": list(self.capture_pc_ips),
+        }
+
         self._stop = threading.Event()
         self._sub_thread = threading.Thread(target=self._sub_loop, daemon=True)
         self._sub_thread.start()
@@ -223,6 +242,11 @@ class GoTrackTracker:
                         continue
                     payload = _unpack_payload(item, bin_parts)
                     self.sync_buffer.add(payload["frame_id"], payload["serial"], payload)
+                    with self._status_lock:
+                        self.status["per_pc_last_frame"][ip] = {
+                            "frame_id": int(payload["frame_id"]),
+                            "ts": time.time(),
+                        }
 
     def publish_prior(self, pose_world: np.ndarray, frame_id: int) -> None:
         self.prior_pub.publish(pose_world, frame_id)
@@ -324,6 +348,10 @@ class GoTrackTracker:
         # Send initial prior so daemons can start processing.
         self.publish_prior(init_pose_world, frame_id=-1)
         prev_pose = init_pose_world.astype(np.float64).copy()
+        with self._status_lock:
+            self.status["init_done"] = True
+            self.status["init_ts"] = time.time()
+            self.status["current_pose"] = prev_pose.tolist()
 
         while not self._stop.is_set():
             ready = self.sync_buffer.pop_ready()
@@ -335,6 +363,27 @@ class GoTrackTracker:
                 # Timed-out frame with too few cams — still try; otherwise skip.
                 logger.debug(f"[track] frame {frame_id}: only {len(payloads)} cams")
             pose_world, info = self.fuse_one_frame(payloads)
+
+            now = time.time()
+            self._fps_window.append(now)
+            fps = 0.0
+            if len(self._fps_window) >= 2:
+                dt = self._fps_window[-1] - self._fps_window[0]
+                if dt > 0:
+                    fps = (len(self._fps_window) - 1) / dt
+            with self._status_lock:
+                self.status["frame_id"] = int(frame_id)
+                self.status["fps"] = float(fps)
+                self.status["last_fit_ok"] = pose_world is not None
+                self.status["fail_reason"] = info.get("reason") if pose_world is None else None
+                if pose_world is not None:
+                    self.status["n_inliers"] = int(info.get("n_inliers", 0))
+                    self.status["mean_residual_mm"] = float(info.get("mean_residual_mm", -1))
+                    self.status["current_pose"] = pose_world.tolist()
+                else:
+                    self.status["n_inliers"] = 0
+                    self.status["mean_residual_mm"] = -1.0
+
             if pose_world is None:
                 logger.warning(f"[track] frame {frame_id} fit failed: {info.get('reason')}")
                 # Republish previous prior to keep daemons moving.
@@ -343,6 +392,14 @@ class GoTrackTracker:
             self.publish_prior(pose_world, frame_id=frame_id)
             prev_pose = pose_world
             yield frame_id, pose_world, info
+
+    def start_dashboard(self, port: int = 8090) -> threading.Thread:
+        """Start a Flask dashboard thread exposing live status at http://0.0.0.0:{port}/."""
+        from autodex.dashboard.tracking_monitor import run_dashboard
+        t = threading.Thread(target=run_dashboard, args=(self, port), daemon=True)
+        t.start()
+        logger.info(f"[dashboard] http://0.0.0.0:{port}")
+        return t
 
     def close(self) -> None:
         self._stop.set()
@@ -362,6 +419,10 @@ def main():
     parser.add_argument("--init-pose-npy", type=str, required=True,
                         help="Path to .npy with 4x4 init pose_world.")
     parser.add_argument("--max-frames", type=int, default=-1)
+    parser.add_argument("--web-port", type=int, default=8090,
+                        help="Dashboard port (0 to disable).")
+    parser.add_argument("--obj-name", type=str, default="",
+                        help="Object name to show on dashboard.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -374,6 +435,11 @@ def main():
         port_prior=args.port_prior,
         min_cams_per_frame=args.min_cams_per_frame,
     )
+    if args.obj_name:
+        with tracker._status_lock:
+            tracker.status["obj_name"] = args.obj_name
+    if args.web_port > 0:
+        tracker.start_dashboard(args.web_port)
     try:
         n = 0
         for frame_id, pose, info in tracker.track(init_pose):

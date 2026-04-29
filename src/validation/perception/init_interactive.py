@@ -72,9 +72,15 @@ def _list_episodes(obj: str, exp_root: Optional[Path] = None) -> List[Path]:
 
 
 def _load_calib(ep: Path):
-    with open(ep / "cam_param/intrinsics.json") as f:
+    intr_path = ep / "cam_param/intrinsics.json"
+    extr_path = ep / "cam_param/extrinsics.json"
+    if not intr_path.exists() or not extr_path.exists():
+        # Support direct calib dir layout: <calib>/intrinsics.json, extrinsics.json
+        intr_path = ep / "intrinsics.json"
+        extr_path = ep / "extrinsics.json"
+    with open(intr_path) as f:
         intr_raw = json.load(f)
-    with open(ep / "cam_param/extrinsics.json") as f:
+    with open(extr_path) as f:
         extr_raw = json.load(f)
     intrinsics_full, extrinsics_full = {}, {}
     for s, d in intr_raw.items():
@@ -93,13 +99,13 @@ def _load_calib(ep: Path):
     return intrinsics_full, extrinsics_full, H, W
 
 
-def _render_overlay(pose, ep, intr_undist, extr, H, W, glctx, mesh_tensors, out_dir: Path):
+def _render_overlay(pose, image_root: Path, intr_undist, extr, H, W, glctx, mesh_tensors, out_dir: Path):
     import torch
     from Utils import nvdiffrast_render
     out_dir.mkdir(parents=True, exist_ok=True)
     overlays = []
     for s in sorted(intr_undist.keys()):
-        p = ep / "images" / f"{s}.png"
+        p = image_root / "images" / f"{s}.png"
         if not p.exists():
             continue
         bgr = cv2.imread(str(p))
@@ -145,11 +151,23 @@ def main():
     parser.add_argument("--pc-list", type=str, nargs="+", default=DEFAULT_PC_LIST)
     parser.add_argument("--port-mask", type=int, default=5006)
     parser.add_argument("--port-pose", type=int, default=5007)
+    parser.add_argument("--port-image", type=int, default=5008)
     parser.add_argument("--port-cmd", type=int, default=6893)
     parser.add_argument("--sil-iters", type=int, default=100)
     parser.add_argument("--sil-lr", type=float, default=0.002)
     parser.add_argument("--timeout-s", type=float, default=120.0)
     parser.add_argument("--out", type=str, default=str(EXP_OUT))
+    parser.add_argument("--auto-start-stream", action="store_true",
+                        help="(live only) Start camera stream via paradex remote_camera_controller "
+                             "before init.")
+    parser.add_argument("--stream-fps", type=int, default=10,
+                        help="(live + auto-start-stream) Stream FPS.")
+    parser.add_argument("--stream-warmup-s", type=float, default=2.0,
+                        help="(live + auto-start-stream) Seconds to wait after starting stream.")
+    parser.add_argument("--stop-stream-on-exit", action="store_true",
+                        help="(live + auto-start-stream) Stop stream when this script exits.")
+    parser.add_argument("--overlay-wait-s", type=float, default=5.0,
+                        help="(live) Wait up to this many seconds for async capture images before overlay.")
     args = parser.parse_args()
 
     from paradex.utils.system import get_pc_ip, get_camera_list
@@ -193,9 +211,19 @@ def main():
         intrinsics_full, extrinsics_full, H, W = _load_calib(calib)
     print(f"calib: {len(intrinsics_full)} cams  {H}x{W}")
 
+    rcc = None
+    if args.mode == "live" and args.auto_start_stream:
+        from paradex.io.camera_system.remote_camera_controller import remote_camera_controller
+        print(f"[stream] starting camera stream on {len(args.pc_list)} PCs @ {args.stream_fps} FPS...")
+        rcc = remote_camera_controller("init_interactive", pc_list=args.pc_list)
+        rcc.start("stream", False, fps=args.stream_fps)
+        if args.stream_warmup_s > 0:
+            time.sleep(args.stream_warmup_s)
+        print("[stream] started")
+
     orch = InitOrchestrator(
         pc_list=args.pc_list, capture_ips=pc_ips,
-        port_mask=args.port_mask, port_pose=args.port_pose, port_cmd=args.port_cmd,
+        port_mask=args.port_mask, port_pose=args.port_pose, port_image=args.port_image, port_cmd=args.port_cmd,
     )
     try:
         print("\n[init] sending init to capture PCs (FoundPose load ~3s/PC for new object)...")
@@ -219,17 +247,22 @@ def main():
             if ans == "q":
                 break
 
+            trial_dir = out_root / f"{trial:02d}"
+            trial_dir.mkdir(parents=True, exist_ok=True)
             t_start = time.perf_counter()
+            live_capture_dir = None
+            if args.mode == "live":
+                live_capture_dir = trial_dir / "capture"
+
             pose, timing = orch.trigger_init(
                 prompt=args.prompt,
                 capture_dir=str(ep) if (args.mode == "disk" and ep is not None) else None,
+                save_capture_dir=str(live_capture_dir) if live_capture_dir is not None else None,
                 sil_iters=args.sil_iters, sil_lr=args.sil_lr,
                 timeout_s=args.timeout_s,
             )
             wall = time.perf_counter() - t_start
 
-            trial_dir = out_root / f"{trial:02d}"
-            trial_dir.mkdir(parents=True, exist_ok=True)
             rec: Dict[str, Any] = {
                 "obj": args.obj, "trial": trial,
                 "episode": ep.name if ep is not None else None,
@@ -249,7 +282,28 @@ def main():
                                     trial_dir / "overlay")
                     rec["overlay_s"] = time.perf_counter() - t_ov0
                 else:
-                    rec["overlay_s"] = 0.0  # live mode: no saved frames available
+                    if live_capture_dir is not None:
+                        # Asynchronous image transfer may finish slightly after pose is ready.
+                        img_dir = live_capture_dir / "images"
+                        deadline = time.perf_counter() + max(0.0, args.overlay_wait_s)
+                        n_expected = len(intr_undist)
+                        while time.perf_counter() < deadline:
+                            n_now = len(list(img_dir.glob("*.png"))) if img_dir.exists() else 0
+                            if n_now >= n_expected:
+                                break
+                            time.sleep(0.1)
+                        t_ov0 = time.perf_counter()
+                        _render_overlay(pose, live_capture_dir, intr_undist, extrinsics_full, H, W,
+                                        orch._sil.glctx, orch._sil.mesh_tensors,
+                                        trial_dir / "overlay")
+                        rec["overlay_s"] = time.perf_counter() - t_ov0
+                        n_saved = len(list((trial_dir / "overlay").glob("*.png"))) if (trial_dir / "overlay").exists() else 0
+                        if n_saved == 0:
+                            print(f"  [overlay] no images rendered. capture images missing/late: {img_dir}")
+                        else:
+                            print(f"  [overlay] saved under: {trial_dir / 'overlay'}")
+                    else:
+                        rec["overlay_s"] = 0.0
                 rec["total_s"] = float(timing["total_s"]) + rec["overlay_s"]
                 print(f"  OK   total {rec['total_s']:.2f}s "
                       f"(collect {timing['dispatch_to_collected_s']:.2f} "
@@ -279,6 +333,17 @@ def main():
                 json.dump(records, f, indent=2, default=str)
             print(f"\nsummary -> {out_root}/_summary.json")
     finally:
+        if rcc is not None:
+            if args.stop_stream_on_exit:
+                try:
+                    print("[stream] stopping camera stream...")
+                    rcc.stop()
+                except Exception:
+                    pass
+            try:
+                rcc.end()
+            except Exception:
+                pass
         orch.close()
 
 
