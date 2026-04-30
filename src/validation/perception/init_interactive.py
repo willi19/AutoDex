@@ -29,7 +29,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import cv2
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -97,45 +96,6 @@ def _load_calib(ep: Path):
     H = next(iter(intrinsics_full.values()))["height"]
     W = next(iter(intrinsics_full.values()))["width"]
     return intrinsics_full, extrinsics_full, H, W
-
-
-def _render_overlay(pose, image_root: Path, intr_undist, extr, H, W, glctx, mesh_tensors,
-                     out_dir: Path, color_bgr=(0, 200, 0), label: str = ""):
-    import torch
-    from Utils import nvdiffrast_render
-    out_dir.mkdir(parents=True, exist_ok=True)
-    color = np.array(color_bgr, dtype=np.float32)
-    overlays = []
-    for s in sorted(intr_undist.keys()):
-        p = image_root / "images" / f"{s}.png"
-        if not p.exists():
-            continue
-        bgr = cv2.imread(str(p))
-        if bgr is None:
-            continue
-        K = intr_undist[s].astype(np.float32)
-        pose_cam = extr[s] @ pose
-        pt = torch.as_tensor(pose_cam, device="cuda", dtype=torch.float32).reshape(1, 4, 4)
-        rc, _, _ = nvdiffrast_render(K=K, H=H, W=W, ob_in_cams=pt,
-                                     glctx=glctx, mesh_tensors=mesh_tensors, use_light=False)
-        render = rc[0].detach().cpu().numpy()
-        mask = render.sum(axis=2) > 0
-        overlay = bgr.copy()
-        overlay[mask] = (overlay[mask] * 0.5 + color * 0.5).astype(np.uint8)
-        if label:
-            cv2.putText(overlay, f"{label} {s}", (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
-        cv2.imwrite(str(out_dir / f"{s}.png"), overlay)
-        overlays.append(cv2.resize(overlay, (W // 2, H // 2)))
-    if overlays:
-        n_cols = 4
-        n_rows = (len(overlays) + n_cols - 1) // n_cols
-        h, w = overlays[0].shape[:2]
-        grid = np.zeros((n_rows * h, n_cols * w, 3), dtype=np.uint8)
-        for i, ov in enumerate(overlays):
-            r, c = i // n_cols, i % n_cols
-            grid[r*h:(r+1)*h, c*w:(c+1)*w] = ov
-        cv2.imwrite(str(out_dir / "grid.png"), grid)
 
 
 def main():
@@ -240,7 +200,6 @@ def main():
         print(f"[init] dispatched in {time.perf_counter()-t0:.1f}s "
               f"(daemons may still be loading models — first trial will reflect that)")
 
-        intr_undist = {s: intrinsics_full[s]["K_undist"] for s in intrinsics_full}
         records: List[Dict[str, Any]] = []
         trial = 0
         while True:
@@ -249,12 +208,11 @@ def main():
             if ans == "q":
                 break
 
-            trial_dir = out_root / f"{trial:02d}"
+            trial_ts = time.strftime("%Y%m%d_%H%M%S")
+            trial_dir = out_root / trial_ts
             trial_dir.mkdir(parents=True, exist_ok=True)
             t_start = time.perf_counter()
-            live_capture_dir = None
-            if args.mode == "live":
-                live_capture_dir = trial_dir / "capture"
+            live_capture_dir = trial_dir / "capture" if args.mode == "live" else None
 
             pose, timing = orch.trigger_init(
                 prompt=args.prompt,
@@ -266,7 +224,7 @@ def main():
             wall = time.perf_counter() - t_start
 
             rec: Dict[str, Any] = {
-                "obj": args.obj, "trial": trial,
+                "obj": args.obj, "trial": trial, "trial_ts": trial_ts,
                 "episode": ep.name if ep is not None else None,
                 "mode": args.mode, "wall_s": wall, **timing,
             }
@@ -277,31 +235,11 @@ def main():
             else:
                 rec["ok"] = True
                 np.save(trial_dir / "pose_world.npy", pose)
-                pre_pose = np.asarray(timing.get("pre_sil_pose"), dtype=np.float64).reshape(4, 4) \
-                    if timing.get("pre_sil_pose") is not None else None
-                if pre_pose is not None:
-                    np.save(trial_dir / "pose_world_pre.npy", pre_pose)
-                image_root = ep if (args.mode == "disk" and ep is not None) else live_capture_dir
-                if image_root is not None:
-                    t_ov0 = time.perf_counter()
-                    if pre_pose is not None:
-                        _render_overlay(pre_pose, image_root, intr_undist, extrinsics_full, H, W,
-                                        orch._sil.glctx, orch._sil.mesh_tensors,
-                                        trial_dir / "overlay_pre",
-                                        color_bgr=(0, 200, 0), label="pre")
-                    _render_overlay(pose, image_root, intr_undist, extrinsics_full, H, W,
-                                    orch._sil.glctx, orch._sil.mesh_tensors,
-                                    trial_dir / "overlay_post",
-                                    color_bgr=(0, 0, 255), label="post")
-                    rec["overlay_s"] = time.perf_counter() - t_ov0
-                else:
-                    rec["overlay_s"] = 0.0
-                rec["total_s"] = float(timing["total_s"]) + rec["overlay_s"]
+                rec["total_s"] = float(timing["total_s"])
                 print(f"  OK   total {rec['total_s']:.2f}s "
                       f"(collect {timing['dispatch_to_collected_s']:.2f} "
                       f"iou {timing['iou_select_s']:.2f} "
-                      f"sil {timing['sil_refine_s']:.2f} "
-                      f"ov {rec['overlay_s']:.2f})  "
+                      f"sil {timing['sil_refine_s']:.2f})  "
                       f"iou={timing.get('best_iou', 0):.3f}")
             with open(trial_dir / "timing.json", "w") as f:
                 json.dump(rec, f, indent=2, default=str)

@@ -297,7 +297,11 @@ class InitDaemon:
                 img_und = cv2.remap(img_bgr, mapx, mapy, cv2.INTER_LINEAR)
                 rgb = cv2.cvtColor(img_und, cv2.COLOR_BGR2RGB)
                 if save_capture_dir:
-                    cv2.imwrite(str(Path(save_capture_dir) / "images" / f"{s}.png"), img_und)
+                    out_path = str(Path(save_capture_dir) / "images" / f"{s}.png")
+                    threading.Thread(
+                        target=cv2.imwrite, args=(out_path, img_und),
+                        daemon=True,
+                    ).start()
             else:
                 # disk mode: image is already undistorted
                 rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
