@@ -9,9 +9,9 @@
 
 set -e
 
-HAND="${1:-inspire_left}"
+HAND="${1:-inspire}"
 N="${2:-100}"
-VERSION="v3"
+VERSION="robothome"
 
 PYTHON=/home/mingi/miniconda3/envs/mingi/bin/python
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"

@@ -1,0 +1,157 @@
+## FR3 + Inspire F1 (RH56F1) Right Hand
+## 7-DOF FR3 arm + 6-DOF (actuated) Inspire F1 right hand.
+## Hand link names follow inspire_f1_hand_right.urdf:
+##   palm:          base_link, plam_1, plam_2, plam_3, plam_force_sensor
+##   fingers:       right_thumb_{1..4}, right_{index,middle,ring,little}_{1,2}
+##   tips/sensors:  *_tip, *_force_sensor (5 each)
+robot_cfg:
+    kinematics:
+        use_usd_kinematics: False
+        usd_path: ""
+        usd_robot_root: ""
+        isaac_usd_path: ""
+        usd_flip_joints: {}
+        usd_flip_joint_limits: []
+
+        urdf_path: "robot/fr3_inspire_f1_description/fr3_inspire_f1.urdf"
+        asset_root_path: "robot/fr3_inspire_f1_description"
+
+        base_link: "base"
+        ee_link: "base_link"
+        link_names: [
+            "fr3_link0", "fr3_link1", "fr3_link2", "fr3_link3",
+            "fr3_link4", "fr3_link5", "fr3_link6", "fr3_link7",
+            "base_link", "plam_1", "plam_2", "plam_3", "plam_force_sensor",
+            "right_thumb_1", "right_thumb_2", "right_thumb_3", "right_thumb_4",
+            "right_index_1", "right_index_2",
+            "right_middle_1", "right_middle_2",
+            "right_ring_1", "right_ring_2",
+            "right_little_1", "right_little_2",
+            "thumb_tip", "index_tip", "middle_tip", "ring_tip", "little_tip",
+            "thumb_force_sensor", "index_force_sensor", "middle_force_sensor",
+            "ring_force_sensor", "little_force_sensor"
+        ]
+
+        collision_link_names: [
+            "fr3_link0", "fr3_link1", "fr3_link2", "fr3_link3",
+            "fr3_link4", "fr3_link5", "fr3_link6", "fr3_link7",
+            "base_link", "plam_1", "plam_2", "plam_3", "plam_force_sensor",
+            "right_thumb_1", "right_thumb_2", "right_thumb_3", "right_thumb_4",
+            "right_index_1", "right_index_2",
+            "right_middle_1", "right_middle_2",
+            "right_ring_1", "right_ring_2",
+            "right_little_1", "right_little_2",
+            "thumb_tip", "index_tip", "middle_tip", "ring_tip", "little_tip",
+            "thumb_force_sensor", "index_force_sensor", "middle_force_sensor",
+            "ring_force_sensor", "little_force_sensor"
+        ]
+
+        collision_spheres: "spheres/fr3_inspire_f1.yml"
+        collision_sphere_buffer: 0.0
+        self_collision_ignore: {
+            "fr3_link0": ["fr3_link1"],
+            "fr3_link1": ["fr3_link2"],
+            "fr3_link2": ["fr3_link3"],
+            "fr3_link3": ["fr3_link4"],
+            "fr3_link4": ["fr3_link5"],
+            "fr3_link5": ["fr3_link6", "fr3_link7"],
+            "fr3_link6": ["fr3_link7", "base_link",
+                          "plam_1", "plam_2", "plam_3", "plam_force_sensor",
+                          "right_thumb_1", "right_thumb_2", "right_thumb_3", "right_thumb_4",
+                          "right_index_1", "right_index_2",
+                          "right_middle_1", "right_middle_2",
+                          "right_ring_1", "right_ring_2",
+                          "right_little_1", "right_little_2",
+                          "thumb_tip", "index_tip", "middle_tip", "ring_tip", "little_tip",
+                          "thumb_force_sensor", "index_force_sensor",
+                          "middle_force_sensor", "ring_force_sensor", "little_force_sensor"],
+            "fr3_link7": ["base_link",
+                          "plam_1", "plam_2", "plam_3", "plam_force_sensor",
+                          "right_thumb_1", "right_thumb_2", "right_thumb_3", "right_thumb_4",
+                          "right_index_1", "right_index_2",
+                          "right_middle_1", "right_middle_2",
+                          "right_ring_1", "right_ring_2",
+                          "right_little_1", "right_little_2",
+                          "thumb_tip", "index_tip", "middle_tip", "ring_tip", "little_tip",
+                          "thumb_force_sensor", "index_force_sensor",
+                          "middle_force_sensor", "ring_force_sensor", "little_force_sensor"],
+            "base_link": ["plam_1", "plam_2", "plam_3", "plam_force_sensor",
+                          "right_thumb_1", "right_thumb_2",
+                          "right_index_1", "right_middle_1", "right_ring_1", "right_little_1"],
+            "plam_1": ["plam_2", "plam_3", "plam_force_sensor"],
+            "plam_2": ["plam_3", "plam_force_sensor",
+                       "right_thumb_1", "right_thumb_2", "right_thumb_3"],
+            "plam_3": ["plam_force_sensor",
+                       "right_thumb_1", "right_thumb_2", "right_thumb_3",
+                       "right_index_1", "right_middle_1", "right_ring_1", "right_little_1"],
+            "plam_force_sensor": [],
+            "right_thumb_1": ["right_thumb_2"],
+            "right_thumb_2": ["right_thumb_3"],
+            "right_thumb_3": ["right_thumb_4", "thumb_tip", "thumb_force_sensor"],
+            "right_thumb_4": ["thumb_tip", "thumb_force_sensor"],
+            "right_index_1":  ["right_index_2"],
+            "right_index_2":  ["index_tip", "index_force_sensor"],
+            "right_middle_1": ["right_middle_2"],
+            "right_middle_2": ["middle_tip", "middle_force_sensor"],
+            "right_ring_1":   ["right_ring_2"],
+            "right_ring_2":   ["ring_tip", "ring_force_sensor"],
+            "right_little_1": ["right_little_2"],
+            "right_little_2": ["little_tip", "little_force_sensor"]
+        }
+        self_collision_buffer: {
+            "fr3_link0": 0,
+            "fr3_link1": 0,
+            "fr3_link2": 0,
+            "fr3_link3": 0,
+            "fr3_link4": 0,
+            "fr3_link5": 0,
+            "fr3_link6": 0,
+            "fr3_link7": 0,
+            "base_link": 0.0,
+            "plam_1": -0.003,
+            "plam_2": -0.003,
+            "plam_3": -0.003,
+            "plam_force_sensor": -0.002,
+            "right_thumb_1": -0.005, "right_thumb_2": -0.005,
+            "right_thumb_3": -0.005, "right_thumb_4": -0.005,
+            "right_index_1": -0.005, "right_index_2": -0.005,
+            "right_middle_1": -0.005, "right_middle_2": -0.005,
+            "right_ring_1": -0.005, "right_ring_2": -0.005,
+            "right_little_1": -0.005, "right_little_2": -0.005,
+            "thumb_tip": -0.002, "index_tip": -0.002, "middle_tip": -0.002,
+            "ring_tip": -0.002, "little_tip": -0.002,
+            "thumb_force_sensor": -0.002, "index_force_sensor": -0.002,
+            "middle_force_sensor": -0.002, "ring_force_sensor": -0.002,
+            "little_force_sensor": -0.002
+        }
+
+        use_global_cumul: True
+        mesh_link_names: [
+            "fr3_link0", "fr3_link1", "fr3_link2", "fr3_link3",
+            "fr3_link4", "fr3_link5", "fr3_link6", "fr3_link7",
+            "base_link", "plam_1", "plam_2", "plam_3", "plam_force_sensor",
+            "right_thumb_1", "right_thumb_2", "right_thumb_3", "right_thumb_4",
+            "right_index_1", "right_index_2",
+            "right_middle_1", "right_middle_2",
+            "right_ring_1", "right_ring_2",
+            "right_little_1", "right_little_2",
+            "thumb_tip", "index_tip", "middle_tip", "ring_tip", "little_tip",
+            "thumb_force_sensor", "index_force_sensor", "middle_force_sensor",
+            "ring_force_sensor", "little_force_sensor"
+        ]
+        cspace:
+            joint_names: [
+                "fr3_joint1", "fr3_joint2", "fr3_joint3", "fr3_joint4",
+                "fr3_joint5", "fr3_joint6", "fr3_joint7",
+                "right_thumb_1_joint", "right_thumb_2_joint",
+                "right_index_1_joint", "right_middle_1_joint",
+                "right_ring_1_joint", "right_little_1_joint"
+            ]
+            retract_config: [
+                0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            ]
+            cspace_distance_weight: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+            null_space_weight:      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            max_jerk: 500.0
+            max_acceleration: 15.0

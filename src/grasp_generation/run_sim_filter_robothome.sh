@@ -12,8 +12,8 @@
 
 set -e
 
-HAND="${1:-inspire_left}"
-VERSION="v3"
+HAND="${1:-inspire}"
+VERSION="${2:-robothome}"
 WORKERS=8
 
 PYTHON=/home/mingi/miniconda3/envs/mingi/bin/python

@@ -15,7 +15,7 @@
 
 set -e
 
-HAND="${1:-inspire_left}"
+HAND="${1:-inspire}"
 shift || true
 SCENE_TYPES=("$@")
 [ ${#SCENE_TYPES[@]} -eq 0 ] && SCENE_TYPES=(box shelf wall)
@@ -59,4 +59,4 @@ for scene in "${SCENE_TYPES[@]}"; do
 done
 
 echo
-echo "[$(date '+%H:%M:%S')] All done. Output at: $REPO_ROOT/bodex_outputs/$HAND/v3/"
+echo "[$(date '+%H:%M:%S')] All done. Output at: $REPO_ROOT/bodex_outputs/$HAND/robothome/"

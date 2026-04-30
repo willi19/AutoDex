@@ -49,6 +49,10 @@ HERE = Path(__file__).resolve().parent
 URDF_PATH = HERE / "fr3_inspire_left.urdf"
 SCENE_MESH_PATH = HERE / "scene_mesh.obj"
 TRAJ_DIR = HERE / "traj"
+GRASP_CACHE_DIR = HERE / "grasp_cache"
+# How close the object pose has to be (translation/rotation matrix entries) for
+# a cached IK+collision result to be reused. ~5mm / a few degrees.
+GRASP_CACHE_ATOL = 5e-3
 
 # Fixed waypoint→waypoint trajectories to pre-compute and cache. These are
 # scene-only (no manipulated object) and reusable across pick-and-trash runs.
@@ -65,7 +69,19 @@ FIXED_TRAJ_PAIRS = [
 # can't tell us the spin angle. Anything else (crushed cans, irregular
 # shapes) gets a single orientation — Y-rotated copies would be physically
 # wrong grasps.
-Y_SYMMETRIC_OBJECTS = {"paperCup", "Jp_Water"}
+Y_SYMMETRIC_OBJECTS = {"paperCup", "Jp_Water", "big_Oi_Ocha"}
+
+# Post-grasp lift sequence: list of Cartesian world-frame offsets (meters)
+# applied one-after-another. Each entry becomes a separate IK + plan_js stage.
+# Default: just lift 10cm up.
+# big_Oi_Ocha / paperCup / Jp_Water: lift 15cm up, THEN move 20cm in +y so
+# the carried object clears the shelf before the lift→place plan runs.
+DEFAULT_LIFT_OFFSETS = [(0.0, 0.0, 0.10)]
+LIFT_OFFSETS = {
+    "big_Oi_Ocha": [(0.0, 0.0, 0.15), (0.0, 0.20, 0.0)],
+    "paperCup":    [(0.0, 0.0, 0.15), (0.0, 0.20, 0.0)],
+    "Jp_Water":    [(0.0, 0.0, 0.15), (0.0, 0.20, 0.0)],
+}
 SCENE_VOXEL_PATH = Path("/home/mingi/Downloads/scene_voxel.npz")
 HANDEYE_PATH = HERE / "hand_eye_result.pkl"
 # Robot region (in world frame) to mask out from the scene SDF — same region
@@ -84,6 +100,21 @@ CANDIDATE_ROOT = Path(f"/home/mingi/AutoDex/candidates/{HAND_NAME}/{CANDIDATE_VE
 FLOATING_HAND_URDF = (Path("/home/mingi/AutoDex/autodex/planner/src/curobo/content/assets")
                       / "robot/inspire_description/inspire_left_floating.urdf")
 
+# Two-robot setup: jangja (장자, FR3 + inspire_left) at world origin (=
+# viewer origin = jangja base), seoja (서자, FR3 + inspire_f1 right hand) at
+# +1.50m on jangja's +x axis, ~180° rotated. Base pose computed from handeye
+# files at startup (see _compute_seoja_base_pose).
+SEOJA_URDF_PATH = (Path("/home/mingi/AutoDex/autodex/planner/src/curobo/content/assets")
+                   / "robot/fr3_inspire_f1_description/fr3_inspire_f1.urdf")
+SEOJA_ROBOT_CFG_NAME = "fr3_inspire_f1.yml"
+HANDEYE_PATH_JANGJA = HERE / "hand_eye_result.pkl"  # active = jangja
+HANDEYE_PATH_SEOJA  = Path("/home/mingi/Downloads/hand_eye_result (6).pkl")
+SEOJA_HAND_ACTUATED = [
+    "right_thumb_1_joint", "right_thumb_2_joint",
+    "right_index_1_joint", "right_middle_1_joint",
+    "right_ring_1_joint", "right_little_1_joint",
+]
+
 
 def _camel(name: str) -> str:
     parts = name.strip().split()
@@ -101,12 +132,99 @@ def parse_tracking_key(key: str):
     return after.strip(), 1
 
 
+DEMO_CANDIDATES = {
+    # obj_name -> (subsampled_dir, list of npz indices). BODex can't generate
+    # grasps for flat-on-table objects, so we use captured demo trajectories
+    # as candidates instead. Each (file × Z-rotation) becomes one candidate.
+    "chocoSong-i": (HERE / "subsampled" / "choco",
+                    ["0", "2", "3", "4", "7", "8", "9"]),
+}
+DEMO_Z_ANGLES_DEG = [0, 60, 120, 180, 240, 300]
+
+# Captured-demo hand_qpos columns are stored in raw controller order which is
+# the REVERSE of URDF/HAND_ACTUATED order (raw[0]=little, raw[5]=thumb_1).
+# Use raw[:, RAW_HAND_TO_URDF] to get HAND_ACTUATED-ordered columns. Mirrors
+# test_demo_plan.py's _hand_qpos_urdf_order; without this swap thumb/little
+# ended up swapped in viewer playback.
+RAW_HAND_TO_URDF = [5, 4, 3, 2, 1, 0]
+
+
+def _hand_qpos_urdf_order(d: np.lib.npyio.NpzFile) -> np.ndarray:
+    """Return demo hand qpos in HAND_ACTUATED column order. Honors a stored
+    `hand_qpos_order` field if present; otherwise assumes raw controller order
+    and applies RAW_HAND_TO_URDF.
+    """
+    hand = np.asarray(d["hand_qpos"], dtype=np.float64)
+    order = str(d["hand_qpos_order"].item()) if "hand_qpos_order" in d.files else "raw"
+    if order == "urdf":
+        return hand
+    if order == "raw":
+        return hand[:, RAW_HAND_TO_URDF]
+    raise ValueError(f"unknown hand_qpos_order={order!r}")
+
+
+def _load_demo_candidates(obj_name: str):
+    """Build BODex-shape candidates from saved subsampled demo trajectories.
+
+    Each subsampled npz has wrist_rel_se3 (N,4,4) in object-local frame
+    (rotation = I, translation = wrist - occluded_centroid). We use the
+    last waypoint as the grasp pose and sweep R_z about the object center.
+    """
+    cfg = DEMO_CANDIDATES.get(obj_name)
+    if cfg is None:
+        return []
+    sub_dir, idxs = cfg
+    out = []
+    for i in idxs:
+        f = sub_dir / f"{i}.npz"
+        if not f.exists():
+            continue
+        d = np.load(f)
+        wrist_rel = d["wrist_rel_se3"]      # (N, 4, 4) in object frame
+        hand = _hand_qpos_urdf_order(d)     # (N, 6) in HAND_ACTUATED order
+        last = wrist_rel[-1]
+        finger_open = hand[0]
+        finger_grasp = hand[-1]
+        source_start = int(d["start"]) if "start" in d.files else 0
+        source_stride = int(d["stride"]) if "stride" in d.files else 1
+        for ang_deg in DEMO_Z_ANGLES_DEG:
+            ang = math.radians(ang_deg)
+            cz, sz = math.cos(ang), math.sin(ang)
+            Rz = np.array([
+                [cz, -sz, 0.0, 0.0],
+                [sz,  cz, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ])
+            wrist_obj = Rz @ last
+            out.append({
+                "scene": "demo",
+                "scene_id": f"choco_{i}",
+                "grasp_id": f"z{ang_deg:03d}",
+                "wrist_obj": wrist_obj.astype(float),
+                "pregrasp": np.asarray(finger_open, dtype=float),
+                "grasp": np.asarray(finger_grasp, dtype=float),
+                # Full demo for execution: wrist sequence in object frame
+                # (Z-rotated) + finger qpos sequence.
+                "demo_wrist_rel_seq": (Rz @ wrist_rel).astype(float),
+                "demo_hand_qpos_seq": np.asarray(hand, dtype=float),
+                "demo_source_start": source_start,
+                "demo_source_stride": source_stride,
+            })
+    return out
+
+
 def load_candidates_for_obj(obj_name: str):
     """Load all BODex grasp candidates for the given object across all scenes.
 
     Returns list of dicts: {scene, scene_id, grasp_id, wrist_obj (4,4),
     pregrasp (6,), grasp (6,)}. wrist_obj is in object-local frame.
     """
+    # Demo-trajectory exception: objects without BODex candidates fall back
+    # to captured demos under subsampled/.
+    if obj_name in DEMO_CANDIDATES:
+        return _load_demo_candidates(obj_name)
+
     # Candidate dirs use mixed naming (camelCase like `paperCup`, underscore
     # like `pepper_tuna`). Tracking keys feed in the underscore form, and
     # `_camel` only collapses spaces — so `_camel("paper_cup") == "paper_cup"`.
@@ -151,6 +269,46 @@ def load_candidates_for_obj(obj_name: str):
                     "grasp": np.asarray(g, dtype=float),
                 })
     return out
+
+
+def _grasp_cache_path(base: str):
+    return GRASP_CACHE_DIR / f"{base}.npz"
+
+
+def save_grasp_cache(base: str, T_obj: np.ndarray, cands: list):
+    """Persist IK + collision results for `base` at `T_obj`. wrist_world is
+    re-derived on load (it's just T_obj @ wrist_obj), so we strip it here.
+    """
+    GRASP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = []
+    for c in cands:
+        d = dict(c)
+        d.pop("wrist_world", None)
+        payload.append(d)
+    np.savez(_grasp_cache_path(base),
+             T_obj=np.asarray(T_obj, dtype=np.float64),
+             cands=np.array(payload, dtype=object))
+
+
+def try_load_grasp_cache(base: str, T_obj: np.ndarray):
+    """Return cached cands list if `base` has a cache file whose stored T_obj
+    is within GRASP_CACHE_ATOL of the current pose. Else None.
+    """
+    p = _grasp_cache_path(base)
+    if not p.exists():
+        return None
+    try:
+        d = np.load(p, allow_pickle=True)
+        T_cached = np.asarray(d["T_obj"])
+        if not np.allclose(T_cached, T_obj, atol=GRASP_CACHE_ATOL, rtol=0):
+            return None
+        cands = list(d["cands"])
+        for c in cands:
+            c["wrist_world"] = T_obj @ c["wrist_obj"]
+        return cands
+    except Exception as e:
+        print(f"[grasp cache] load failed: {e}")
+        return None
 
 
 def find_mesh_dir(base_name: str):
@@ -201,6 +359,127 @@ def euler_xyz_to_mat(rx, ry, rz):
     return R.from_euler("xyz", [rx, ry, rz]).as_matrix()
 
 
+# ----- Demo trajectory IK helpers (ported from test_demo_plan.py) -----
+# Used only by the per-waypoint backward IK chain on captured demo trajectories
+# (chocoSong-i, etc.). Sparse keyframe IK + linear interpolation + wrist/hand
+# smoothing makes the chain robust against per-frame null-space branch flips.
+DEMO_IK_KEYFRAME_RAW_STRIDE = 60  # IK every ~N original capture frames
+DEMO_SMOOTH_WRIST_POS_WINDOW = 7
+DEMO_SMOOTH_WRIST_ROT_WINDOW = 7
+DEMO_SMOOTH_HAND_WINDOW = 7
+DEMO_MAX_HAND_STEP = 0.05      # rad/frame clamp on hand qpos
+DEMO_MAX_ARM_STEP = 0.0        # rad/frame clamp on arm; <=0 disables
+DEMO_SMOOTH_JOINT_WINDOW = 1   # post-interp arm smoothing; 1 disables
+
+
+def _odd_window(n: int, length: int) -> int:
+    n = int(max(1, n))
+    n = min(n, max(1, int(length)))
+    if n % 2 == 0:
+        n = max(1, n - 1)
+    return n
+
+
+def _moving_average_reflect(x: np.ndarray, window: int) -> np.ndarray:
+    x = np.asarray(x)
+    window = _odd_window(window, len(x))
+    if window <= 1 or len(x) <= 2:
+        return x.copy()
+    pad = window // 2
+    kernel = np.ones(window, dtype=np.float64) / float(window)
+    padded = np.pad(x, [(pad, pad)] + [(0, 0)] * (x.ndim - 1), mode="edge")
+    out = np.empty_like(x, dtype=np.float64)
+    for i in range(len(x)):
+        out[i] = np.tensordot(kernel, padded[i:i + window], axes=(0, 0))
+    return out.astype(x.dtype, copy=False)
+
+
+def _smooth_wrist_rel_sequence(wrist_rel: np.ndarray, pos_window: int,
+                               rot_window: int) -> np.ndarray:
+    """Low-pass filter demo wrist SE(3) before IK. Endpoints preserved.
+
+    Quaternion signs are made continuous before averaging so q/-q does not
+    inject a fake rotation jump.
+    """
+    out = np.asarray(wrist_rel, dtype=np.float64).copy()
+    if len(out) <= 2:
+        return out
+    first = out[0].copy()
+    last = out[-1].copy()
+    if pos_window > 1:
+        out[:, :3, 3] = _moving_average_reflect(out[:, :3, 3], pos_window)
+    if rot_window > 1:
+        quat = R.from_matrix(out[:, :3, :3]).as_quat()  # xyzw
+        for i in range(1, len(quat)):
+            if float(np.dot(quat[i - 1], quat[i])) < 0.0:
+                quat[i] *= -1.0
+        quat = _moving_average_reflect(quat, rot_window)
+        quat /= np.linalg.norm(quat, axis=1, keepdims=True).clip(1e-12)
+        out[:, :3, :3] = R.from_quat(quat).as_matrix()
+    out[0] = first
+    out[-1] = last
+    return out
+
+
+def _limit_joint_steps(q_seq: np.ndarray, joint_idx: list,
+                       max_step: float) -> np.ndarray:
+    out = np.asarray(q_seq, dtype=np.float32).copy()
+    if max_step <= 0.0 or len(out) <= 1:
+        return out
+    idx = np.asarray(joint_idx, dtype=np.int64)
+    q0 = out[0, idx].copy()
+    qn = out[-1, idx].copy()
+    for k in range(1, len(out)):
+        dq = out[k, idx] - out[k - 1, idx]
+        out[k, idx] = out[k - 1, idx] + np.clip(dq, -max_step, max_step)
+    out[-1, idx] = qn
+    for k in range(len(out) - 2, -1, -1):
+        dq = out[k, idx] - out[k + 1, idx]
+        out[k, idx] = out[k + 1, idx] + np.clip(dq, -max_step, max_step)
+    out[0, idx] = q0
+    return out
+
+
+def _smooth_joint_sequence(q_seq: np.ndarray, joint_idx: list,
+                           window: int) -> np.ndarray:
+    out = np.asarray(q_seq, dtype=np.float32).copy()
+    window = _odd_window(window, len(out))
+    if window <= 1 or len(out) <= 2:
+        return out
+    idx = np.asarray(joint_idx, dtype=np.int64)
+    smoothed = _moving_average_reflect(out[:, idx], window)
+    out[:, idx] = smoothed
+    out[0, idx] = q_seq[0, idx]
+    out[-1, idx] = q_seq[-1, idx]
+    return out
+
+
+def _keyframe_indices(length: int, stride: int) -> np.ndarray:
+    if length <= 0:
+        return np.zeros(0, dtype=np.int64)
+    stride = max(1, int(stride))
+    idx = list(range(0, length, stride))
+    if idx[-1] != length - 1:
+        idx.append(length - 1)
+    return np.asarray(idx, dtype=np.int64)
+
+
+def _linear_interpolate_q(key_idx: np.ndarray, key_q: np.ndarray,
+                          length: int) -> np.ndarray:
+    key_idx = np.asarray(key_idx, dtype=np.int64)
+    key_q = np.asarray(key_q, dtype=np.float32)
+    if len(key_idx) == 0:
+        return np.zeros((length, key_q.shape[-1]), dtype=np.float32)
+    if len(key_idx) == 1:
+        return np.repeat(key_q[:1], length, axis=0).astype(np.float32)
+    out = np.empty((length, key_q.shape[1]), dtype=np.float32)
+    for a, b, qa, qb in zip(key_idx[:-1], key_idx[1:], key_q[:-1], key_q[1:]):
+        span = max(1, int(b - a))
+        alpha = (np.arange(a, b + 1, dtype=np.float32) - float(a)) / float(span)
+        out[a:b + 1] = (1.0 - alpha[:, None]) * qa[None, :] + alpha[:, None] * qb[None, :]
+    return out
+
+
 # ----- cuRobo collision wrapper -----
 class CuroboChecker:
     """Owns RobotWorld, allows updating world meshes (scene + dynamic objects)
@@ -213,6 +492,32 @@ class CuroboChecker:
                  collision_activation_distance: float = 0.0):
         self.tensor_args = TensorDeviceType()
         self.cfg_dict = load_yaml(join_path(get_robot_configs_path(), robot_cfg_name))
+        # Captured demo grasps legitimately have fingers touching each other
+        # (thumb-index pinch, etc.). The hand also stays in the same closed
+        # config throughout lift→place, so any cross-finger sphere overlap
+        # at the start persists at the goal — there's no trajectory motion
+        # that could resolve it. Extend self_collision_ignore so every pair
+        # of inspire hand links (thumb / index / middle / ring / little, +
+        # base_link) is ignored. fr3 self-collision and fr3↔hand collision
+        # are unchanged.
+        kin_root = self.cfg_dict["robot_cfg"]["kinematics"]
+        sci = kin_root.setdefault("self_collision_ignore", {})
+        _hand_links = [
+            "base_link",
+            "left_thumb_1", "left_thumb_2", "left_thumb_3", "left_thumb_4",
+            "left_index_1", "left_index_2",
+            "left_middle_1", "left_middle_2",
+            "left_ring_1", "left_ring_2",
+            "left_little_1", "left_little_2",
+        ]
+        for a in _hand_links:
+            existing = list(sci.get(a, []))
+            for b in _hand_links:
+                if a == b:
+                    continue
+                if b not in existing:
+                    existing.append(b)
+            sci[a] = existing
         self._collision_activation_distance = collision_activation_distance
         self._world_meshes = {}  # name -> CuroboMesh
         # Per-object trimesh proxies for objects added at runtime (proximity
@@ -337,6 +642,10 @@ class CuroboChecker:
             # We've verified start/goal collision-free with 4 sphere checks,
             # so skip graph entirely and let trajopt drive the plan.
             enable_graph=False,
+            # cuRobo's default `enable_graph_attempt=3` flips graph back ON
+            # after 3 failed trajopt attempts — None here disables that
+            # fallback so trajopt-only stays trajopt-only.
+            enable_graph_attempt=None,
             enable_opt=True,
             max_attempts=20,
             enable_finetune_trajopt=True,
@@ -711,6 +1020,179 @@ class CuroboChecker:
             q_all = q_all[:, 0, :]
         return succ_all, q_all
 
+    def _ensure_demo_chain_ik_solver(self):
+        """Lazy IK solver dedicated to backward IK along a captured demo
+        trajectory (chocoSong-i, etc.).
+
+        Differences from the main / grasp IK solvers:
+          - World contains the static scene mesh ONLY — dynamic target
+            objects are excluded. Rationale: the captured demo wrist is on/
+            near the target object so the target would always trigger a
+            false-positive collision; the scene (table/walls) however still
+            constrains the franka arm so the trajectory can't pass through
+            the table. The approach plan (pick_start → first waypoint) is
+            unchanged and still uses full-collision motion_gen, so inspire
+            hand vs scene/object IS checked there exactly like a normal
+            BODex grasp.
+          - Inspire (hand) collision is disabled by stripping all `left_*`
+            and `base_link` entries from `collision_link_names` (and the
+            corresponding self_collision_buffer / ignore entries). Net
+            effect: only fr3_link0..7 spheres participate in collision, so
+            the captured hand trajectory which legitimately contacts the
+            object/table is not flagged.
+          - `null_space_weight = arm 1.0 / hand 0.0` makes `retract_config`
+            (= the next waypoint's qpos in the backward chain) act as a real
+            continuity prior on the arm. Hand is overwritten from captured
+            demo qpos after IK, so its weight stays 0.
+          - cuda_graph=False because demo objects are infrequent and the chain
+            is sequential (next call's retract depends on previous result), so
+            graph capture wouldn't amortize.
+        """
+        if getattr(self, "_demo_chain_ik_solver", None) is not None:
+            return
+        import copy
+        chain_cfg = copy.deepcopy(self.cfg_dict)
+        kin = chain_cfg["robot_cfg"]["kinematics"]
+        cspace = kin["cspace"]
+        n_total = len(cspace["joint_names"])
+        cspace["null_space_weight"] = (
+            [1.0] * len(ARM_JOINTS) + [0.0] * (n_total - len(ARM_JOINTS))
+        )
+        # Keep only fr3 links in collision; drop base_link + every left_*.
+        def _is_fr3(link: str) -> bool:
+            return link.startswith("fr3_link")
+        kin["collision_link_names"] = [
+            ln for ln in kin.get("collision_link_names", []) if _is_fr3(ln)
+        ]
+        if "self_collision_buffer" in kin:
+            kin["self_collision_buffer"] = {
+                ln: v for ln, v in kin["self_collision_buffer"].items() if _is_fr3(ln)
+            }
+        if "self_collision_ignore" in kin:
+            kin["self_collision_ignore"] = {
+                a: [b for b in bs if _is_fr3(b)]
+                for a, bs in kin["self_collision_ignore"].items() if _is_fr3(a)
+            }
+        # Scene mesh only — exclude dynamic target objects so a wrist touching
+        # the target is not flagged.
+        scene_meshes = [m for k, m in self._world_meshes.items()
+                        if k == SCENE_MESH_KEY]
+        wc_scene = WorldConfig(mesh=scene_meshes)
+        ik_cfg = IKSolverConfig.load_from_robot_config(
+            chain_cfg, wc_scene, tensor_args=self.tensor_args,
+            num_seeds=32,
+            collision_activation_distance=0.005,
+            use_cuda_graph=False,
+        )
+        self._demo_chain_ik_solver = IKSolver(ik_cfg)
+
+    def _solve_ik_demo_chain(self, target_T: np.ndarray,
+                             retract_q: np.ndarray | None):
+        """Single-pose IK on the demo-chain solver. Returns (success, q)."""
+        self._ensure_demo_chain_ik_solver()
+        rot = target_T[:3, :3]
+        qxyzw = R.from_matrix(rot).as_quat()
+        pos_t = torch.tensor([target_T[0, 3], target_T[1, 3], target_T[2, 3]],
+                             device=self.tensor_args.device,
+                             dtype=self.tensor_args.dtype).view(1, 3)
+        quat_t = torch.tensor([qxyzw[3], qxyzw[0], qxyzw[1], qxyzw[2]],
+                              device=self.tensor_args.device,
+                              dtype=self.tensor_args.dtype).view(1, 4)
+        goal = CuroboPose(position=pos_t, quaternion=quat_t)
+        retract_t = None
+        if retract_q is not None:
+            retract_t = torch.tensor(
+                np.asarray(retract_q, dtype=np.float32).reshape(1, -1),
+                device=self.tensor_args.device,
+                dtype=self.tensor_args.dtype,
+            )
+        with self._lock:
+            result = self._demo_chain_ik_solver.solve_single(
+                goal, retract_config=retract_t,
+            )
+        succ = bool(result.success.view(-1)[0].item())
+        q = result.solution.view(-1).detach().cpu().numpy()
+        return succ, q
+
+    def solve_demo_chain(self, T_obj: np.ndarray, wrist_rel_seq: np.ndarray,
+                         hand_qpos_seq: np.ndarray, q_last: np.ndarray,
+                         arm_idx: list, hand_idx: list,
+                         source_stride: int = 1,
+                         keyframe_raw_stride: int = DEMO_IK_KEYFRAME_RAW_STRIDE):
+        """Backward keyframe IK along a captured demo trajectory.
+
+        The demo trajectory is N captured wrist poses in object frame. Solving
+        IK for every frame is both expensive and prone to per-frame null-space
+        branch flips, so we instead:
+          1. Smooth wrist SE(3) (continuous quaternions + moving average).
+          2. Pick sparse keyframes (~every `keyframe_raw_stride` original
+             capture frames) including the last frame.
+          3. Backward-chain IK across keyframes, seeding each waypoint with
+             the next waypoint's solved qpos for arm-joint continuity.
+          4. Linear-interpolate dense arm qpos for the original demo frames.
+          5. Smooth hand qpos and clamp per-frame deltas, then write hand
+             joints back into the dense arm sequence.
+
+        Args:
+            T_obj: 4x4 object pose in world.
+            wrist_rel_seq: (N, 4, 4) wrist SE(3) in object frame, with any
+                Z-rotation already applied. Last waypoint is the grasp.
+            hand_qpos_seq: (N, 6) demo hand qpos in HAND_ACTUATED order.
+            q_last: cuRobo-ordered qpos for the FINAL waypoint, already solved
+                via the main IK path. Used to seed the backward chain so the
+                grasp pose is preserved exactly.
+            arm_idx: cuRobo joint indices for the 7 arm joints.
+            hand_idx: cuRobo joint indices for the 6 actuated hand joints.
+
+        Returns dict with:
+          - "arm_qpos_seq": (N, n_dof) cuRobo-ordered, hand overlaid; or None
+            on chain failure.
+          - "fail_frame": int or None.
+        """
+        wrist_rel = _smooth_wrist_rel_sequence(
+            np.asarray(wrist_rel_seq, dtype=np.float64),
+            DEMO_SMOOTH_WRIST_POS_WINDOW, DEMO_SMOOTH_WRIST_ROT_WINDOW,
+        )
+        hand_raw = np.asarray(hand_qpos_seq, dtype=np.float64)
+        hand = _moving_average_reflect(hand_raw, DEMO_SMOOTH_HAND_WINDOW)
+        # Lock endpoints so first/last frame match captured pre-grasp / grasp.
+        hand[0] = hand_raw[0]
+        hand[-1] = hand_raw[-1]
+        hand = _limit_joint_steps(
+            hand, list(range(hand.shape[1])), DEMO_MAX_HAND_STEP,
+        )
+        N = len(wrist_rel)
+        key_stride = max(1, int(math.ceil(
+            float(keyframe_raw_stride) / max(1, int(source_stride))
+        )))
+        key_idx = _keyframe_indices(N, key_stride)
+        K = len(key_idx)
+        arm_key_seq = [None] * K
+        arm_key_seq[K - 1] = np.asarray(q_last, dtype=np.float32)
+        fail_frame = None
+        # Backward chain over keyframes only.
+        for ki in range(K - 2, -1, -1):
+            frame_i = int(key_idx[ki])
+            target_T = T_obj @ wrist_rel[frame_i]
+            ok_k, q_k = self._solve_ik_demo_chain(target_T, arm_key_seq[ki + 1])
+            if not ok_k:
+                fail_frame = frame_i
+                return {"arm_qpos_seq": None, "fail_frame": fail_frame,
+                        "n_key": K, "key_stride": key_stride}
+            arm_key_seq[ki] = np.asarray(q_k, dtype=np.float32)
+        arm_key_arr = np.stack(arm_key_seq, axis=0).astype(np.float32)
+        arm_seq_arr = _linear_interpolate_q(key_idx, arm_key_arr, N)
+        arm_seq_arr = _limit_joint_steps(arm_seq_arr, arm_idx, DEMO_MAX_ARM_STEP)
+        arm_seq_arr = _smooth_joint_sequence(
+            arm_seq_arr, arm_idx, DEMO_SMOOTH_JOINT_WINDOW,
+        )
+        # Overlay smoothed hand qpos (open → closed) onto the dense arm seq.
+        for k in range(N):
+            for h, ci in enumerate(hand_idx):
+                arm_seq_arr[k, ci] = float(hand[k, h])
+        return {"arm_qpos_seq": arm_seq_arr, "fail_frame": None,
+                "n_key": K, "key_stride": key_stride}
+
     def plan_js(self, q_start: np.ndarray, q_goal: np.ndarray,
                 exclude_obstacle: str | None = None):
         """Joint-space motion plan from q_start → q_goal (curobo joint order).
@@ -964,7 +1446,12 @@ class FloatingHand:
 
 # ----- URDF -> viser -----
 class ViserURDF:
-    def __init__(self, server: viser.ViserServer, urdf_path: Path, root: str = "/robot"):
+    def __init__(self, server: viser.ViserServer, urdf_path: Path,
+                 root: str = "/robot", base_pose: np.ndarray | None = None):
+        """If `base_pose` (4x4) is provided, the root frame is positioned at
+        that pose so the entire URDF tree renders offset from world origin.
+        Used for the seoja robot which sits at +1.5m from jangja (which is at
+        viewer origin)."""
         self.urdf = yourdfpy.URDF.load(
             str(urdf_path), mesh_dir=str(urdf_path.parent),
             build_collision_scene_graph=False, load_collision_meshes=False,
@@ -975,7 +1462,13 @@ class ViserURDF:
         # link_name -> {mesh_local: trimesh.Trimesh in link frame,
         #               base_color: (r,g,b), handle: viser mesh handle}
         self.links = {}
-        server.scene.add_frame(root, show_axes=False)
+        if base_pose is not None:
+            pos, wxyz = mat_to_pos_wxyz(np.asarray(base_pose, dtype=np.float64))
+            self.root_handle = server.scene.add_frame(
+                root, show_axes=False, position=pos, wxyz=wxyz,
+            )
+        else:
+            self.root_handle = server.scene.add_frame(root, show_axes=False)
 
         scene = self.urdf.scene
         for joint in self.urdf.joint_map.values():
@@ -1053,8 +1546,8 @@ class App:
                                    position=(0, 0, 0), cell_size=0.1)
         _step("viser server up")
 
-        self.viser_urdf = ViserURDF(self.server, URDF_PATH)
-        _step("ViserURDF loaded")
+        self.viser_urdf = ViserURDF(self.server, URDF_PATH, root="/robot_jangja")
+        _step("ViserURDF (jangja) loaded")
         self.actuated = list(self.viser_urdf.urdf.actuated_joint_names)
         self.q_actuated = np.zeros(len(self.actuated))
         for jn, val in zip(ARM_JOINTS, ARM_HOME):
@@ -1067,6 +1560,32 @@ class App:
             lo = lim.lower if lim and lim.lower is not None else -3.14
             hi = lim.upper if lim and lim.upper is not None else 3.14
             self.joint_limits[jn] = (float(lo), float(hi))
+
+        # Stage A: render the seoja (FR3 + inspire_f1) URDF as a visual-only
+        # second robot at its handeye-derived base pose in jangja frame. No
+        # cuRobo for seoja yet — Stage B. Seoja keeps its own last-commanded
+        # qpos (init at retract pose).
+        T_seoja_in_jangja = self._compute_seoja_base_pose()
+        self.seoja_base_pose = T_seoja_in_jangja
+        if T_seoja_in_jangja is not None and SEOJA_URDF_PATH.exists():
+            self.viser_urdf_seoja = ViserURDF(
+                self.server, SEOJA_URDF_PATH, root="/robot_seoja",
+                base_pose=T_seoja_in_jangja,
+            )
+            self.actuated_seoja = list(self.viser_urdf_seoja.urdf.actuated_joint_names)
+            self.q_actuated_seoja = np.zeros(len(self.actuated_seoja))
+            for jn, val in zip(ARM_JOINTS, ARM_HOME):
+                if jn in self.actuated_seoja:
+                    self.q_actuated_seoja[self.actuated_seoja.index(jn)] = val
+            self.viser_urdf_seoja.update_cfg(self.q_actuated_seoja)
+            _step("ViserURDF (seoja) loaded")
+        else:
+            self.viser_urdf_seoja = None
+            self.actuated_seoja = []
+            self.q_actuated_seoja = np.zeros(0)
+            print(f"[init] seoja URDF not loaded (path exists: "
+                  f"{SEOJA_URDF_PATH.exists()}, base pose: "
+                  f"{T_seoja_in_jangja is not None})")
 
         self._add_scene_mesh()
         self._add_handeye_frame()
@@ -1146,9 +1665,18 @@ class App:
         self._build_gui()
         self._refresh_grasp_objects()
         self._refresh_robot()
-        # Auto-load the latest tracking JSON so objects come back after a
-        # restart without needing to click "Load Tracking" every time.
-        if self.tracking_files:
+        # Auto-restore the scene on startup. Prefer the saved `Save object
+        # poses` snapshot (traj/object_poses.npz) since it's the explicit
+        # last-known-good scene; fall back to the latest tracking_*.json
+        # only if no snapshot exists.
+        snapshot = TRAJ_DIR / "object_poses.npz"
+        if snapshot.exists():
+            try:
+                self._load_object_poses()
+                self._refresh_grasp_objects()
+            except Exception as e:
+                print(f"[init] auto-load object_poses.npz failed: {e}")
+        elif self.tracking_files:
             try:
                 self._load_tracking_json(self.tracking_files[0])
                 self._refresh_grasp_objects()
@@ -1170,6 +1698,22 @@ class App:
         return self.curobo.fk_ee(self._q_curobo())
 
     # scene
+    def _compute_seoja_base_pose(self) -> np.ndarray | None:
+        """Return the 4x4 SE(3) pose of seoja base in jangja (= world) frame.
+
+        T_seoja_in_jangja = inv(Z_jangja) @ Z_seoja, where Z_* is the
+        camera_T_robot transform from each robot's handeye result.
+        """
+        try:
+            Zj = np.asarray(joblib.load(HANDEYE_PATH_JANGJA)["Z"], dtype=np.float64)
+            Zs = np.asarray(joblib.load(HANDEYE_PATH_SEOJA)["Z"], dtype=np.float64)
+        except Exception as e:
+            print(f"[seoja] failed to load handeye files: {e}")
+            return None
+        T = np.linalg.inv(Zj) @ Zs
+        print(f"[seoja] base pose in jangja frame: t={T[:3,3].round(4).tolist()}")
+        return T
+
     def _add_scene_mesh(self):
         if not SCENE_MESH_PATH.exists():
             return
@@ -1287,6 +1831,14 @@ class App:
             )
             self.grasp_slider.on_update(lambda _: self._on_grasp_slider())
             self.grasp_status = srv.add_text("This candidate", "—", disabled=True)
+            # Post-grasp lift mode. Two presets:
+            #   pocket OFF (default): +z 10cm only
+            #   pocket ON:            +z 15cm → +y 20cm (clears shelf/box)
+            # The dict in LIFT_OFFSETS is no longer consulted; this
+            # checkbox is the single source of truth at plan time.
+            self.pocket_mode_chk = srv.add_checkbox(
+                "Pocket mode (+z 15cm → +y 20cm)", False,
+            )
             srv.add_button("Plan to this grasp").on_click(lambda _: self._plan_to_grasp())
             self.plan_status = srv.add_text("Plan status", "—", disabled=True)
             self.traj_slider = srv.add_slider(
@@ -1655,7 +2207,7 @@ class App:
             with srv.add_folder(instance, expand_by_default=False) as folder:
                 sx = srv.add_slider("x", min=-1.0, max=1.5, step=0.005, initial_value=float(T[0, 3]))
                 sy = srv.add_slider("y", min=-1.0, max=1.0, step=0.005, initial_value=float(T[1, 3]))
-                sz = srv.add_slider("z", min=-0.2, max=1.5, step=0.005, initial_value=float(T[2, 3]))
+                sz = srv.add_slider("z", min=-0.5, max=1.5, step=0.005, initial_value=float(T[2, 3]))
                 srx = srv.add_slider("roll",  min=-3.14, max=3.14, step=0.01, initial_value=0.0)
                 sry = srv.add_slider("pitch", min=-3.14, max=3.14, step=0.01, initial_value=0.0)
                 srz = srv.add_slider("yaw",   min=-3.14, max=3.14, step=0.01, initial_value=0.0)
@@ -1775,6 +2327,14 @@ class App:
                 T_obj = np.linalg.inv(self.handeye_Z) @ T_raw
             else:
                 T_obj = T_raw
+            # chocoSong-i: tracking rotation is unreliable (Z-axis comes
+            # out flipped) — drop rotation and force identity. Z position
+            # is also off (~10-20cm too high); user adjusts via the per-
+            # object z slider (range widened to -0.5..1.5).
+            if base == "chocoSong-i" or mesh_dir.name == "chocoSong-i":
+                T_pos_only = np.eye(4)
+                T_pos_only[:3, 3] = T_obj[:3, 3]
+                T_obj = T_pos_only
             self._set_object_pose(instance, T_obj)
             added += 1
         print(f"[tracking] loaded {added}/{len(poses)} objects from {filename}")
@@ -1963,6 +2523,27 @@ class App:
 
         T_obj = entry["T"]
 
+        # Try disk cache first — IK + collision is the slow step (~18s/100
+        # poses) and results only depend on (base, T_obj).
+        cached = try_load_grasp_cache(base, T_obj)
+        if cached is not None:
+            cached.sort(key=lambda c: {"success": 0, "collision": 1,
+                                        "ik_fail": 2}[c["status"]])
+            self._candidates = cached
+            n_succ = sum(1 for c in cached if c["status"] == "success")
+            n_coll = sum(1 for c in cached if c["status"] == "collision")
+            n_fail = sum(1 for c in cached if c["status"] == "ik_fail")
+            self.grasp_stats.value = (
+                f"object={base}  total={len(cached)}  "
+                f"success={n_succ}  collision={n_coll}  ik_fail={n_fail}  "
+                f"(from cache)"
+            )
+            self.grasp_slider.max = max(1, len(cached) - 1)
+            self.grasp_slider.value = 0
+            self._show_candidate(0)
+            print(f"[grasp] cache HIT for {base} ({len(cached)} candidates)")
+            return
+
         # IK target is the wrist pose directly (cuRobo's ee_link is "wrist").
         target_Ts = np.empty((len(cands), 4, 4), dtype=np.float64)
         for i, c in enumerate(cands):
@@ -1984,18 +2565,34 @@ class App:
                     ci = self.curobo.curobo_joint_names.index(jn)
                     retract_q[ci] = float(v)
 
-        # Batched IK against scene-only world (matches planner.py reference).
+        # Demo candidates have grasp orientations far from pick_start. The
+        # cuda-graph-cached `_grasp_ik_solver` has strong null_space_weight
+        # pulling toward retract_q, so for demo we instead use the
+        # non-cuda-graph `self.ik_solver` (which has null_space_weight = 0
+        # by default → no bias) one-at-a-time. BODex still uses the fast
+        # batched path biased by pick_start.
+        demo_mask = np.array([("demo_wrist_rel_seq" in c) for c in cands], dtype=bool)
+        succ_arr = np.zeros(len(cands), dtype=bool)
+        q_arr = np.zeros((len(cands), len(self.curobo.curobo_joint_names)),
+                         dtype=np.float32)
         t0 = time.perf_counter()
-        try:
-            succ_arr, q_arr = self.curobo.solve_ik_batch(
-                target_Ts, retract_q=retract_q,
-            )
-        except Exception as e:
-            print(f"[grasp] batch IK error: {e}")
-            succ_arr = np.zeros(len(cands), dtype=bool)
-            q_arr = np.zeros((len(cands), len(self.curobo.curobo_joint_names)),
-                             dtype=np.float32)
-        print(f"[grasp] batch IK ({len(cands)} poses) "
+        if (~demo_mask).any():
+            try:
+                ss, qq = self.curobo.solve_ik_batch(
+                    target_Ts[~demo_mask], retract_q=retract_q,
+                )
+                succ_arr[~demo_mask] = ss
+                q_arr[~demo_mask] = qq
+            except Exception as e:
+                print(f"[grasp] batch IK error (bodex): {e}")
+        for i in np.where(demo_mask)[0]:
+            try:
+                ok_i, q_i = self.curobo.solve_ik(target_Ts[i], retract_q=None)
+                succ_arr[i] = bool(ok_i)
+                q_arr[i] = q_i
+            except Exception as e:
+                print(f"[grasp] single IK error (demo {i}): {e}")
+        print(f"[grasp] IK ({len(cands)} poses) "
               f"ok={int(succ_arr.sum())} in {time.perf_counter() - t0:.2f}s")
 
         # Collision check against the scene-only world (table/floor) plus
@@ -2012,7 +2609,11 @@ class App:
             c["ik_success"] = ok
             c["ik_q"] = np.asarray(q_arr[i]) if ok else None
             in_coll = False
-            if ok:
+            # Demo (contact-based) grasps: skip scene + self collision —
+            # the captured trajectory legitimately makes contact with the
+            # table/object, so collision flagging would always reject.
+            is_demo = "demo_wrist_rel_seq" in c
+            if ok and not is_demo:
                 try:
                     # Check the SAME q that plan_js will see — IK keeps the
                     # solver's hand seed (~retract qpos), but we override hand
@@ -2036,6 +2637,43 @@ class App:
             else:
                 c["status"] = "success"
 
+            # Demo trajectory: keyframe-stride backward IK + linear
+            # interpolation, smoothing, hand qpos overlay. The solver used
+            # here is `_demo_chain_ik_solver` — scene-mesh-only world
+            # (dynamic target excluded), inspire collision spheres stripped
+            # so only fr3 links collide, arm-only null_space_weight for
+            # continuity. The captured demo legitimately contacts the
+            # target/table with the hand, so excluding the target object and
+            # disabling hand collision here is intentional. Approach
+            # planning (pick_start → first waypoint) still uses full
+            # collision, so that motion is checked normally.
+            if c.get("status") == "success" and "demo_wrist_rel_seq" in c:
+                seq_rel = np.asarray(c["demo_wrist_rel_seq"])
+                seq_hand = np.asarray(c["demo_hand_qpos_seq"])
+                arm_idx = [self.curobo.curobo_joint_names.index(jn)
+                           for jn in ARM_JOINTS]
+                hand_idx = [self.curobo.curobo_joint_names.index(jn)
+                            for jn in FloatingHand.HAND_ACTUATED]
+                source_stride = int(c.get("demo_source_stride", 1))
+                chain = self.curobo.solve_demo_chain(
+                    T_obj=T_obj,
+                    wrist_rel_seq=seq_rel,
+                    hand_qpos_seq=seq_hand,
+                    q_last=np.asarray(c["ik_q"], dtype=np.float32),
+                    arm_idx=arm_idx,
+                    hand_idx=hand_idx,
+                    source_stride=source_stride,
+                )
+                if chain["arm_qpos_seq"] is not None:
+                    c["demo_arm_qpos_seq"] = chain["arm_qpos_seq"]
+                    c["demo_seq_in_collision"] = False
+                    c["demo_n_key"] = chain["n_key"]
+                    c["demo_key_stride"] = chain["key_stride"]
+                else:
+                    c["demo_arm_qpos_seq"] = None
+                    c["demo_chain_fail_frame"] = chain["fail_frame"]
+                    c["status"] = "ik_fail"
+
         # Sort: success first, then collision, then ik_fail
         order = {"success": 0, "collision": 1, "ik_fail": 2}
         cands.sort(key=lambda c: order[c["status"]])
@@ -2050,6 +2688,10 @@ class App:
         self.grasp_slider.max = max(1, len(cands) - 1)
         self.grasp_slider.value = 0
         self._show_candidate(0)
+        try:
+            save_grasp_cache(base, T_obj, cands)
+        except Exception as e:
+            print(f"[grasp cache] save failed: {e}")
 
     def _on_grasp_slider(self):
         i = int(self.grasp_slider.value)
@@ -2087,12 +2729,36 @@ class App:
         if not c["ik_success"]:
             self.plan_status.value = "selected candidate has no IK solution"
             return
+        # Resolve target object name (instance + canonical base) up-front so
+        # later stages can use them for LIFT_OFFSETS lookup and obstacle
+        # exclusion without re-deriving.
+        instance = self.grasp_obj_dropdown.value
+        base = instance
+        while base not in self.object_names and "_" in base:
+            base = base.rsplit("_", 1)[0]
         # Goal qpos (curobo joint order)
         q_goal_curobo = c["ik_q"].copy()
         # Override hand joints with pregrasp (so we keep arm IK + open hand)
         for k, jn in enumerate(FloatingHand.HAND_ACTUATED):
             ci = self.curobo.curobo_joint_names.index(jn)
             q_goal_curobo[ci] = float(c["pregrasp"][k])
+
+        # Demo candidates ship a full per-waypoint qpos sequence
+        # (chocoSong-i etc.). Insert it between the approach plan and the
+        # lift so playback shows pick_start → first waypoint → captured
+        # demo (open→closed hand) → lift. Non-demo candidates plan straight
+        # to the grasp pose as before.
+        demo_seq = c.get("demo_arm_qpos_seq")
+        if demo_seq is not None:
+            demo_seq = np.asarray(demo_seq, dtype=np.float64)
+            q_pg_goal = demo_seq[0].copy()
+            # Last demo waypoint already has the closed grasp hand qpos
+            # baked in by solve_demo_chain — use it directly as the post-
+            # grasp / lift starting state (no extra hand override).
+            q_grasp_curobo = demo_seq[-1].copy()
+        else:
+            q_pg_goal = q_goal_curobo
+            q_grasp_curobo = q_goal_curobo
 
         # Start from `pick_start` waypoint — fixed pre-pick pose so the plan
         # is always close-range (planning from far away tends to fail).
@@ -2118,7 +2784,7 @@ class App:
             mg_wcc = None
             print(f"[plan] motion_gen world checker access error: {e}")
         for label, q in [("start", q_start_curobo),
-                         ("end", q_goal_curobo)]:
+                         ("end", q_pg_goal)]:
             try:
                 w_grasp = self.curobo.world_collide_scene_from_q(q)
                 x_sph = self.curobo.query(q)
@@ -2147,7 +2813,7 @@ class App:
             except Exception as e:
                 print(f"[plan] {label} check error: {e}")
         try:
-            traj_pg = self.curobo.plan_js(q_start_curobo, q_goal_curobo)
+            traj_pg = self.curobo.plan_js(q_start_curobo, q_pg_goal)
         except Exception as e:
             self.plan_status.value = f"plan error: {e}"
             print(f"[plan] {e}")
@@ -2157,26 +2823,47 @@ class App:
             self.plan_status.value = f"plan FAIL (pick→grasp): {status}"
             return
 
-        # Stage 2: 5cm Z-up lift via IK seeded at grasp_qpos.
-        T_lift_world = c["wrist_world"].copy()
-        T_lift_world[2, 3] += 0.05
-        try:
-            ok_lift, q_lift = self.curobo.solve_ik(T_lift_world, retract_q=q_goal_curobo)
-        except Exception as e:
-            print(f"[plan] lift IK error: {e}")
-            ok_lift, q_lift = False, None
-        if not ok_lift or q_lift is None:
-            self.plan_status.value = "lift IK FAIL"
-            return
-        # Keep hand at grasp pose during lift (still carrying object).
-        q_lift = np.asarray(q_lift, dtype=np.float64).copy()
-        for jn in FloatingHand.HAND_ACTUATED:
-            ci = self.curobo.curobo_joint_names.index(jn)
-            q_lift[ci] = float(q_goal_curobo[ci])
-        # Direct interpolation grasp→lift (small motion, no obstacle to avoid).
-        n_lift = 30
-        alphas = np.linspace(0.0, 1.0, n_lift)
-        traj_lift = (1 - alphas)[:, None] * q_goal_curobo[None, :] + alphas[:, None] * q_lift[None, :]
+        # Stage 2: post-grasp lift sequence. Each entry is a Cartesian
+        # world-frame offset applied on top of the previous wrist pose. We
+        # IK each waypoint and JOINT-SPACE LINEAR INTERPOLATE between
+        # consecutive qpos — these motions are short and the target is
+        # already in the hand, so a straight joint interp is faster and
+        # more robust than re-running trajopt for each stage.
+        # Mode is driven by the "Pocket mode" checkbox (single source of
+        # truth):
+        #   OFF: [+z 10cm]                           (default)
+        #   ON:  [+z 15cm, +y 20cm]                  (clears shelf/box)
+        if bool(self.pocket_mode_chk.value):
+            offsets = [(0.0, 0.0, 0.15), (0.0, 0.20, 0.0)]
+        else:
+            offsets = [(0.0, 0.0, 0.10)]
+        T_cur = c["wrist_world"].copy()
+        q_cur = q_grasp_curobo.copy()
+        traj_lift_segments = []
+        n_steps_per_stage = 30
+        alphas = np.linspace(0.0, 1.0, n_steps_per_stage)
+        for stage_i, (dx, dy, dz) in enumerate(offsets, start=1):
+            T_cur = T_cur.copy()
+            T_cur[0, 3] += dx
+            T_cur[1, 3] += dy
+            T_cur[2, 3] += dz
+            try:
+                ok_lift, q_next = self.curobo.solve_ik(T_cur, retract_q=q_cur)
+            except Exception as e:
+                print(f"[plan] lift stage {stage_i} IK error: {e}")
+                ok_lift, q_next = False, None
+            if not ok_lift or q_next is None:
+                self.plan_status.value = f"lift IK FAIL (stage {stage_i})"
+                return
+            q_next = np.asarray(q_next, dtype=np.float64).copy()
+            for jn in FloatingHand.HAND_ACTUATED:
+                ci = self.curobo.curobo_joint_names.index(jn)
+                q_next[ci] = float(q_grasp_curobo[ci])
+            seg = (1 - alphas)[:, None] * q_cur[None, :] + alphas[:, None] * q_next[None, :]
+            traj_lift_segments.append(seg)
+            q_cur = q_next
+        traj_lift = np.concatenate(traj_lift_segments, axis=0)
+        q_lift = q_cur
 
         # Stage 3: lift_qpos → place_start_qpos (cuRobo plan_js).
         wp_ps = self._load_waypoint("place_start")
@@ -2190,11 +2877,67 @@ class App:
         # Carry the grasp hand pose into place_start (don't drop the object).
         for jn in FloatingHand.HAND_ACTUATED:
             ci = self.curobo.curobo_joint_names.index(jn)
-            q_place_curobo[ci] = float(q_goal_curobo[ci])
+            q_place_curobo[ci] = float(q_grasp_curobo[ci])
         # Target object is now in the hand — exclude it from the world so
         # motion_gen doesn't treat it as a fixed obstacle hand-overlapping
         # itself.
         instance = self.grasp_obj_dropdown.value
+        # Diagnostics: q_lift and q_place_curobo against the SAME world
+        # motion_gen will see (target object excluded). If trajopt fails we
+        # need to know whether it's start/goal feasibility (collision /
+        # self-collision) or the optimizer not finding a path.
+        excl_name = f"obj::{instance}"
+        excl_meshes = [m for k, m in self.curobo._world_meshes.items()
+                       if k != excl_name]
+        wc_lp = WorldConfig(mesh=excl_meshes)
+        try:
+            self.curobo._ensure_motion_gen()
+            with self.curobo._lock:
+                self.curobo._motion_gen.clear_world_cache()
+                self.curobo._motion_gen.update_world(wc_lp)
+            mg_wcc_lp = self.curobo._motion_gen.world_coll_checker
+        except Exception as e:
+            mg_wcc_lp = None
+            print(f"[plan] lift→place world swap error: {e}")
+        for label, q in [("lift_start", q_lift),
+                         ("place_goal", q_place_curobo)]:
+            try:
+                x_sph = self.curobo.query(q)
+                s = self.curobo.self_collide(x_sph)
+                w_mg_str = "n/a"
+                if mg_wcc_lp is not None:
+                    x_sph_t = torch.tensor(x_sph.reshape(1, 1, -1, 4),
+                                           dtype=self.curobo.tensor_args.dtype,
+                                           device=self.curobo.tensor_args.device)
+                    buf = CollisionQueryBuffer.initialize_from_shape(
+                        x_sph_t.shape, self.curobo.tensor_args, mg_wcc_lp.collision_types,
+                    )
+                    d = mg_wcc_lp.get_sphere_distance(
+                        x_sph_t, buf,
+                        self.curobo._sphere_weight, self.curobo._sphere_act,
+                        sum_collisions=False,
+                    )
+                    w_mg = (d.view(-1).detach().cpu().numpy() > 0)
+                    w_mg_str = f"{int(w_mg.sum())}/{w_mg.size}"
+                # Per-joint magnitude of motion to spot impossible plans.
+                arm_idx_dbg = [self.curobo.curobo_joint_names.index(jn)
+                               for jn in ARM_JOINTS]
+                d_arm = np.degrees(q_place_curobo[arm_idx_dbg] - q_lift[arm_idx_dbg])
+                d_arm_str = "  ".join(f"{v:+6.1f}°" for v in d_arm)
+                print(f"[plan] lift→place {label}: "
+                      f"motion_gen_world={w_mg_str}  "
+                      f"self={int(s.sum())}/{s.size}  "
+                      f"d_arm[deg]={d_arm_str}")
+            except Exception as e:
+                print(f"[plan] lift→place {label} check error: {e}")
+        # Restore world cache (plan_js below will swap again, but it expects
+        # the full world to start from).
+        try:
+            with self.curobo._lock:
+                self.curobo._motion_gen.clear_world_cache()
+                self.curobo._motion_gen.update_world(self.curobo._motion_gen_world)
+        except Exception:
+            pass
         try:
             traj_lp = self.curobo.plan_js(
                 q_lift, q_place_curobo,
@@ -2209,16 +2952,29 @@ class App:
             self.plan_status.value = f"plan FAIL (lift→place): {status}"
             return
 
-        # Concatenate. grasp_frame = index where the hand first reaches
-        # grasp_qpos (end of stage 1, before the lift).
-        grasp_frame = len(traj_pg) - 1
-        traj = np.concatenate([traj_pg, traj_lift, traj_lp], axis=0)
-
-        self._traj = traj
-        self.plan_status.value = (
-            f"plan OK: pg={len(traj_pg)} lift={len(traj_lift)} "
-            f"lp={len(traj_lp)} total={len(traj)}"
-        )
+        # Concatenate. grasp_frame = index where the hand first reaches the
+        # final grasp qpos (end of demo for demo candidates, end of approach
+        # plan for non-demo). For demo we splice the captured trajectory
+        # between traj_pg and traj_lift; we drop the duplicate first frame
+        # since traj_pg already ends at demo_seq[0].
+        if demo_seq is not None:
+            traj_demo = demo_seq[1:].astype(traj_pg.dtype, copy=False)
+            traj_pre_lift = np.concatenate([traj_pg, traj_demo], axis=0)
+            grasp_frame = len(traj_pre_lift) - 1
+            traj = np.concatenate([traj_pre_lift, traj_lift, traj_lp], axis=0)
+            self._traj = traj
+            self.plan_status.value = (
+                f"plan OK (demo): pg={len(traj_pg)} demo={len(traj_demo)} "
+                f"lift={len(traj_lift)} lp={len(traj_lp)} total={len(traj)}"
+            )
+        else:
+            grasp_frame = len(traj_pg) - 1
+            traj = np.concatenate([traj_pg, traj_lift, traj_lp], axis=0)
+            self._traj = traj
+            self.plan_status.value = (
+                f"plan OK: pg={len(traj_pg)} lift={len(traj_lift)} "
+                f"lp={len(traj_lp)} total={len(traj)}"
+            )
         self.traj_slider.max = max(1, len(traj) - 1)
         self.traj_slider.value = 0
         self._on_traj_slider()
@@ -2227,10 +2983,7 @@ class App:
         # `_pick_start__to_grasp_` format (replay regex matches it), but the
         # npz now contains the concat trajectory through place_start; the
         # `grasp_frame` index tells replay where to attach the carried object.
-        instance = self.grasp_obj_dropdown.value
-        base = instance
-        while base not in self.object_names and "_" in base:
-            base = base.rsplit("_", 1)[0]
+        # `instance` / `base` already resolved at the top of _plan_to_grasp.
         ts = time.strftime("%Y%m%d_%H%M%S")
         TRAJ_DIR.mkdir(exist_ok=True)
         out = TRAJ_DIR / (

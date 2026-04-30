@@ -333,7 +333,7 @@
     <child link="left_middle_2" />
     <axis xyz="0 0 1" />
     <limit lower="0" upper="3.14" effort="10" velocity="1.1" />
-    <mimic joint="left_middle_1_joint" multiplier="1.05" offset="0" />
+    <mimic joint="left_middle_1_joint" multiplier="0.88" offset="0.15" />
   </joint>
   <link name="left_ring_1">
     <inertial>

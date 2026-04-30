@@ -9,7 +9,7 @@ base_cfg_file: "base_grasp.yml"
 particle_file: "particle_grasp_debug.yml"
 gradient_file: "gradient_grasp_fc.yml"
 
-exp_name: 'v3'
+exp_name: 'robothome'
 seed_num: 200
 seeder_cfg:
   obj_sample:
