@@ -14,7 +14,6 @@ Channels:
     REQ/REP control:    CommandReceiver  port 6893  (init/run/exit)
     PUB masks:          DataPublisher    port 5006  ("init_mask")
     PUB poses:          DataPublisher    port 5007  ("init_pose")
-    PUB images:         DataPublisher    port 5008  ("init_image")
 
 Init payload (sent once when robot PC selects an object):
     {
@@ -80,15 +79,13 @@ class InitDaemon:
     Pipeline per camera: SHM read → undistort → SAM3 mask (PUB) → FPose (PUB).
     """
 
-    def __init__(self, port_mask: int, port_pose: int, port_cmd: int, port_image: int):
+    def __init__(self, port_mask: int, port_pose: int, port_cmd: int):
         self.port_mask = port_mask
         self.port_pose = port_pose
         self.port_cmd = port_cmd
-        self.port_image = port_image
 
         self.pub_mask = DataPublisher(port=port_mask, name="init_mask")
         self.pub_pose = DataPublisher(port=port_pose, name="init_pose")
-        self.pub_image = DataPublisher(port=port_image, name="init_image")
 
         # Preload SAM3 now (object-agnostic, slow ~5-30s first time). FoundPose
         # is object-specific so it loads on /init per-object.
@@ -222,26 +219,6 @@ class InitDaemon:
         }]
         self.pub_pose.send_data(meta, [pose.tobytes()])
 
-    def _publish_image_async(self, req_id: int, serial: str, bgr_undist: np.ndarray) -> None:
-        """Publish undistorted image as JPEG in background."""
-        def _work():
-            try:
-                ok, buf = cv2.imencode(".jpg", bgr_undist, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                if not ok:
-                    return
-                h, w = bgr_undist.shape[:2]
-                meta = [{
-                    "req_id": int(req_id),
-                    "serial": serial,
-                    "h": int(h),
-                    "w": int(w),
-                    "ts": time.time(),
-                }]
-                self.pub_image.send_data(meta, [buf.tobytes()])
-            except Exception as exc:
-                logger.warning(f"[img_pub] {serial}: {exc}")
-        threading.Thread(target=_work, daemon=True).start()
-
     def _do_run(self) -> None:
         if self.sam3 is None or self.fp is None:
             logger.error("[run] not initialized (no models)")
@@ -319,7 +296,6 @@ class InitDaemon:
                 mapx, mapy = self.undistort_maps[s]
                 img_und = cv2.remap(img_bgr, mapx, mapy, cv2.INTER_LINEAR)
                 rgb = cv2.cvtColor(img_und, cv2.COLOR_BGR2RGB)
-                self._publish_image_async(req_id, s, img_und)
                 if save_capture_dir:
                     cv2.imwrite(str(Path(save_capture_dir) / "images" / f"{s}.png"), img_und)
             else:
@@ -361,7 +337,7 @@ class InitDaemon:
 
     def loop(self) -> None:
         logger.info(f"[daemon] cmd port {self.port_cmd}, mask port {self.port_mask}, "
-                    f"pose port {self.port_pose}, image port {self.port_image}")
+                    f"pose port {self.port_pose}")
         while not self.exit_event.is_set():
             if self.init_event.is_set():
                 try:
@@ -384,17 +360,15 @@ class InitDaemon:
         self.exit_event.set()
         self.pub_mask.close()
         self.pub_pose.close()
-        self.pub_image.close()
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port-mask", type=int, default=5006)
     parser.add_argument("--port-pose", type=int, default=5007)
-    parser.add_argument("--port-image", type=int, default=5008)
     parser.add_argument("--port-cmd", type=int, default=6893)
     args = parser.parse_args()
-    d = InitDaemon(args.port_mask, args.port_pose, args.port_cmd, args.port_image)
+    d = InitDaemon(args.port_mask, args.port_pose, args.port_cmd)
     try:
         d.loop()
     except KeyboardInterrupt:

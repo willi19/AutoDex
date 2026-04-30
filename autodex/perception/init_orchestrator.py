@@ -9,7 +9,6 @@ Channels (must match init_daemon.py):
     REQ:    CommandSender    port 6893  (control)
     SUB:    DataPublisher    port 5006  (init_mask)  — subscribed per capture IP
     SUB:    DataPublisher    port 5007  (init_pose)  — subscribed per capture IP
-    SUB:    DataPublisher    port 5008  (init_image) — subscribed per capture IP
 """
 from __future__ import annotations
 
@@ -119,7 +118,6 @@ class InitOrchestrator:
         capture_ips: List[str],
         port_mask: int = 5006,
         port_pose: int = 5007,
-        port_image: int = 5008,
         port_cmd: int = 6893,
         device: str = "cuda:0",
     ):
@@ -132,9 +130,6 @@ class InitOrchestrator:
 
         self.mask_buf = _Buffer()
         self.pose_buf = _Buffer()
-        self.image_buf = _Buffer()
-        self._save_dirs: Dict[int, Path] = {}
-        self._save_lock = threading.Lock()
 
         def _on_mask(item, blob):
             req = int(item["req_id"]); s = str(item["serial"])
@@ -158,28 +153,12 @@ class InitOrchestrator:
                 entry["inliers"] = int(item.get("inliers", 0))
             self.pose_buf.put(req, s, entry)
 
-        def _on_image(item, blob):
-            req = int(item["req_id"]); s = str(item["serial"])
-            arr = np.frombuffer(blob, dtype=np.uint8)
-            bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if bgr is None:
-                return
-            self.image_buf.put(req, s, {"image": bgr, "ts": float(item.get("ts", 0.0))})
-            with self._save_lock:
-                out_dir = self._save_dirs.get(req)
-            if out_dir is not None:
-                (out_dir / "images").mkdir(parents=True, exist_ok=True)
-                cv2.imwrite(str(out_dir / "images" / f"{s}.png"), bgr)
-
         self._mask_thread = _SubThread("init_mask", capture_ips, port_mask,
                                        self.mask_buf, _on_mask)
         self._pose_thread = _SubThread("init_pose", capture_ips, port_pose,
                                        self.pose_buf, _on_pose)
-        self._image_thread = _SubThread("init_image", capture_ips, port_image,
-                                        self.image_buf, _on_image)
         self._mask_thread.start()
         self._pose_thread.start()
-        self._image_thread.start()
         time.sleep(0.3)  # let SUB sockets connect
 
         # robot-side state set by init_object()
@@ -299,7 +278,7 @@ class InitOrchestrator:
         n_expected = n_expected_serials or len(self.intrinsics_undist)
 
         # Drop any buffered payloads from prior trials (only keep current req_id).
-        for buf in (self.mask_buf, self.pose_buf, self.image_buf):
+        for buf in (self.mask_buf, self.pose_buf):
             with buf._lock:
                 buf._d.clear()
 
@@ -310,8 +289,6 @@ class InitOrchestrator:
             run_info["capture_dir"] = _to_home_relative(capture_dir)
         if save_capture_dir is not None:
             run_info["save_capture_dir"] = _to_home_relative(save_capture_dir)
-            with self._save_lock:
-                self._save_dirs[int(request_id)] = Path(save_capture_dir).expanduser()
         with contextlib.redirect_stdout(io.StringIO()):
             self.cmd.send_command("run", wait=False, cmd_info=run_info)
 
@@ -356,9 +333,7 @@ class InitOrchestrator:
             if m.get("mask") is not None and m["mask"].any()
         }
         if not candidates or not masks_bool:
-            with self._save_lock:
-                self._save_dirs.pop(int(request_id), None)
-            self.mask_buf.drop(request_id); self.pose_buf.drop(request_id); self.image_buf.drop(request_id)
+            self.mask_buf.drop(request_id); self.pose_buf.drop(request_id)
             return None, {
                 "reason": "no_candidates_or_masks",
                 "n_candidates": len(candidates), "n_masks": len(masks_bool),
@@ -382,9 +357,7 @@ class InitOrchestrator:
         logger.info(f"[orch] IoU select: best={best_serial} mean_iou={best_iou:.3f} "
                     f"(took {t_iou:.2f}s)")
         if best_pose is None:
-            with self._save_lock:
-                self._save_dirs.pop(int(request_id), None)
-            self.mask_buf.drop(request_id); self.pose_buf.drop(request_id); self.image_buf.drop(request_id)
+            self.mask_buf.drop(request_id); self.pose_buf.drop(request_id)
             return None, {"reason": "iou_select_failed", "per_cand": per_cand}
 
         # Sil refine on robot PC using collected masks.
@@ -419,8 +392,6 @@ class InitOrchestrator:
             "best_iou": float(best_iou),
             "sil_loss": float(sil_loss),
         }
-        with self._save_lock:
-            self._save_dirs.pop(int(request_id), None)
         self.mask_buf.drop(request_id); self.pose_buf.drop(request_id)
         return np.asarray(refined, dtype=np.float64), timing
 
@@ -428,7 +399,7 @@ class InitOrchestrator:
         # Stop our SUB threads. Do NOT call self.cmd.end() — that broadcasts
         # "exit" and kills the daemons, which we want to keep alive across
         # interactive sessions. Just close the local sockets.
-        self._mask_thread.stop(); self._pose_thread.stop(); self._image_thread.stop()
+        self._mask_thread.stop(); self._pose_thread.stop()
         try:
             for s in self.cmd.sockets.values():
                 s.close()

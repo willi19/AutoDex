@@ -151,7 +151,6 @@ def main():
     parser.add_argument("--pc-list", type=str, nargs="+", default=DEFAULT_PC_LIST)
     parser.add_argument("--port-mask", type=int, default=5006)
     parser.add_argument("--port-pose", type=int, default=5007)
-    parser.add_argument("--port-image", type=int, default=5008)
     parser.add_argument("--port-cmd", type=int, default=6893)
     parser.add_argument("--sil-iters", type=int, default=100)
     parser.add_argument("--sil-lr", type=float, default=0.002)
@@ -166,8 +165,6 @@ def main():
                         help="(live + auto-start-stream) Seconds to wait after starting stream.")
     parser.add_argument("--stop-stream-on-exit", action="store_true",
                         help="(live + auto-start-stream) Stop stream when this script exits.")
-    parser.add_argument("--overlay-wait-s", type=float, default=5.0,
-                        help="(live) Wait up to this many seconds for async capture images before overlay.")
     args = parser.parse_args()
 
     from paradex.utils.system import get_pc_ip, get_camera_list
@@ -223,7 +220,7 @@ def main():
 
     orch = InitOrchestrator(
         pc_list=args.pc_list, capture_ips=pc_ips,
-        port_mask=args.port_mask, port_pose=args.port_pose, port_image=args.port_image, port_cmd=args.port_cmd,
+        port_mask=args.port_mask, port_pose=args.port_pose, port_cmd=args.port_cmd,
     )
     try:
         print("\n[init] sending init to capture PCs (FoundPose load ~3s/PC for new object)...")
@@ -283,25 +280,11 @@ def main():
                     rec["overlay_s"] = time.perf_counter() - t_ov0
                 else:
                     if live_capture_dir is not None:
-                        # Asynchronous image transfer may finish slightly after pose is ready.
-                        img_dir = live_capture_dir / "images"
-                        deadline = time.perf_counter() + max(0.0, args.overlay_wait_s)
-                        n_expected = len(intr_undist)
-                        while time.perf_counter() < deadline:
-                            n_now = len(list(img_dir.glob("*.png"))) if img_dir.exists() else 0
-                            if n_now >= n_expected:
-                                break
-                            time.sleep(0.1)
                         t_ov0 = time.perf_counter()
                         _render_overlay(pose, live_capture_dir, intr_undist, extrinsics_full, H, W,
                                         orch._sil.glctx, orch._sil.mesh_tensors,
                                         trial_dir / "overlay")
                         rec["overlay_s"] = time.perf_counter() - t_ov0
-                        n_saved = len(list((trial_dir / "overlay").glob("*.png"))) if (trial_dir / "overlay").exists() else 0
-                        if n_saved == 0:
-                            print(f"  [overlay] no images rendered. capture images missing/late: {img_dir}")
-                        else:
-                            print(f"  [overlay] saved under: {trial_dir / 'overlay'}")
                     else:
                         rec["overlay_s"] = 0.0
                 rec["total_s"] = float(timing["total_s"]) + rec["overlay_s"]
