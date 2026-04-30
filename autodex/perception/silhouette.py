@@ -154,7 +154,13 @@ class SilhouetteOptimizer:
         if self._glcam_t is None:
             self._glcam_t = torch.tensor(glcam_in_cvcam, device=self.device, dtype=torch.float32)
 
-        opt_views = []
+        masks_raw: List[np.ndarray] = []
+        cam_ids: List[str] = []
+        mask_t_list: List[torch.Tensor] = []
+        extrinsic_list: List[torch.Tensor] = []
+        proj_list: List[torch.Tensor] = []
+        H_ref: Optional[int] = None
+        W_ref: Optional[int] = None
         for view in views:
             if "mask_path" in view:
                 mask = cv2.imread(view["mask_path"], cv2.IMREAD_GRAYSCALE)
@@ -168,23 +174,29 @@ class SilhouetteOptimizer:
             mask_t = torch.tensor(mask_soft, device=self.device, dtype=torch.float32)
             extrinsic_t = torch.tensor(view["extrinsic"], device=self.device, dtype=torch.float32)
             H, W = mask_t.shape
+            if H_ref is None:
+                H_ref, W_ref = H, W
+            elif (H, W) != (H_ref, W_ref):
+                raise ValueError(
+                    f"All views must share (H, W); got {(H, W)} vs {(H_ref, W_ref)}"
+                )
             proj = projection_matrix_from_intrinsics(view["K"], height=H, width=W, znear=0.001, zfar=100)
-            proj_t = torch.as_tensor(
-                proj.reshape(4, 4),
-                device=self.device,
-                dtype=torch.float32,
-            )
+            proj_t = torch.as_tensor(proj.reshape(4, 4), device=self.device, dtype=torch.float32)
 
-            opt_views.append({
-                "cam_id": view.get("cam_id", ""),
-                "mask_raw": mask,
-                "mask_t": mask_t,
-                "K": view["K"],
-                "extrinsic_t": extrinsic_t,
-                "proj_t": proj_t,
-                "H": H,
-                "W": W,
-            })
+            masks_raw.append(mask)
+            cam_ids.append(view.get("cam_id", ""))
+            mask_t_list.append(mask_t)
+            extrinsic_list.append(extrinsic_t)
+            proj_list.append(proj_t)
+
+        N = len(mask_t_list)
+        if N == 0:
+            raise ValueError("optimize() requires at least one view")
+
+        mask_batch = torch.stack(mask_t_list, dim=0)            # (N, H, W)
+        extrinsic_batch = torch.stack(extrinsic_list, dim=0)    # (N, 4, 4)
+        proj_batch = torch.stack(proj_list, dim=0)              # (N, 4, 4)
+        H, W = H_ref, W_ref
 
         r6d_init = self._matrix_to_rotation_6d(pose_world_init_t[:3, :3].unsqueeze(0))[0]
         t_init = pose_world_init_t[:3, 3]
@@ -196,38 +208,39 @@ class SilhouetteOptimizer:
             optimizer.zero_grad()
             pose_world = self._build_pose_from_r6d_t(optim_r6d, optim_t)
 
-            total_loss = 0.0
-            for view_idx, view in enumerate(opt_views):
-                pose_cam_t = (view["extrinsic_t"] @ pose_world).reshape(1, 4, 4)
-                alpha_t = self._render_silhouette_fast(
-                    H=view["H"],
-                    W=view["W"],
-                    ob_in_cams=pose_cam_t,
-                    glctx=self.glctx,
-                    mesh_tensors=self.mesh_tensors,
-                    pos_homo=self._pos_homo,
-                    proj_t=view["proj_t"],
-                    glcam_t=self._glcam_t,
-                    antialias=antialias,
+            pose_cam_batch = extrinsic_batch @ pose_world                  # (N, 4, 4)
+            alpha_t = self._render_silhouette_batched(
+                H=H, W=W,
+                ob_in_cams=pose_cam_batch,
+                glctx=self.glctx,
+                mesh_tensors=self.mesh_tensors,
+                pos_homo=self._pos_homo,
+                proj_t=proj_batch,
+                glcam_t=self._glcam_t,
+                antialias=antialias,
+            )                                                              # (N, H, W, 1)
+            render_masks = alpha_t[..., 0]                                 # (N, H, W)
+            render_masks = self._blur_mask_torch_batched(
+                render_masks, mask_blur_ksize, mask_blur_sigma
+            )                                                              # (N, H, W)
+
+            loss = F.mse_loss(render_masks, mask_batch, reduction="mean")
+            if use_iou:
+                loss = loss + iou_weight * self._silhouette_iou_loss_batched(
+                    render_masks, mask_batch
                 )
-                render_mask = alpha_t[0, :, :, 0]
-                render_mask = self._blur_mask_torch(render_mask, mask_blur_ksize, mask_blur_sigma)
-                sil_mse = F.mse_loss(render_mask, view["mask_t"], reduction="mean")
-                total_loss = total_loss + sil_mse
-                if use_iou:
-                    sil_iou = self._silhouette_iou_loss(render_mask, view["mask_t"])
-                    total_loss = total_loss + (iou_weight * sil_iou)
-                if debug and (it % debug_every == 0) and view_idx < debug_max_views:
+
+            if debug and (it % debug_every == 0):
+                for view_idx in range(min(debug_max_views, N)):
                     self._save_debug_pair(
                         frame_idx=frame_idx,
                         iter_idx=it + 1,
-                        cam_id=view["cam_id"] or f"view{view_idx}",
-                        render_mask=render_mask,
-                        target_mask=view["mask_raw"],
+                        cam_id=cam_ids[view_idx] or f"view{view_idx}",
+                        render_mask=render_masks[view_idx],
+                        target_mask=masks_raw[view_idx],
                         debug_dir=debug_dir,
                     )
 
-            loss = total_loss / float(len(opt_views))
             loss.backward()
             optimizer.step()
 
@@ -256,6 +269,13 @@ class SilhouetteOptimizer:
         return 1 - (intersection / (union + 1e-9))
 
     @staticmethod
+    def _silhouette_iou_loss_batched(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        intersection = (pred * target).sum(dim=(1, 2))
+        union = (pred + target).clamp(0, 1).sum(dim=(1, 2))
+        per_view = 1 - (intersection / (union + 1e-9))
+        return per_view.mean()
+
+    @staticmethod
     def _blur_mask_torch(mask: torch.Tensor, ksize: int, sigma: float) -> torch.Tensor:
         if (ksize is None or ksize <= 1) and (sigma is None or sigma <= 0):
             return mask
@@ -268,6 +288,20 @@ class SilhouetteOptimizer:
         mask_t = mask[None, None, :, :]
         blurred = F.avg_pool2d(mask_t, kernel_size=ksize, stride=1, padding=ksize // 2)
         return blurred[0, 0]
+
+    @staticmethod
+    def _blur_mask_torch_batched(masks: torch.Tensor, ksize: int, sigma: float) -> torch.Tensor:
+        if (ksize is None or ksize <= 1) and (sigma is None or sigma <= 0):
+            return masks
+        if ksize is None or ksize <= 1:
+            ksize = int(max(1, 2 * round(3 * sigma) + 1))
+        if ksize <= 1:
+            return masks
+        if ksize % 2 == 0:
+            ksize += 1
+        m = masks.unsqueeze(1)
+        blurred = F.avg_pool2d(m, kernel_size=ksize, stride=1, padding=ksize // 2)
+        return blurred.squeeze(1)
 
     @staticmethod
     def _save_debug_pair(
@@ -340,6 +374,30 @@ class SilhouetteOptimizer:
         ob_in_glcams = glcam_t[None] @ ob_in_cams
         pos_clip = (proj_t @ ob_in_glcams)[:, None] @ pos_homo[None, ..., None]
         pos_clip = pos_clip[..., 0]
+        rast_out, _ = dr.rasterize(glctx, pos_clip, faces, resolution=np.asarray([H, W]))
+        alpha = torch.clamp(rast_out[..., -1:], 0, 1)
+        if antialias:
+            alpha = dr.antialias(alpha, rast_out, pos_clip, faces)
+        alpha = torch.flip(alpha, dims=[1])
+        return alpha
+
+    def _render_silhouette_batched(self, H, W, ob_in_cams, glctx, mesh_tensors,
+                                    pos_homo, proj_t, glcam_t, antialias: bool):
+        """Batched silhouette render across N cameras in a single rasterize call.
+
+        ob_in_cams: (N, 4, 4) world->cam pose per view (== extrinsic @ pose_world)
+        proj_t:     (N, 4, 4) GL projection matrix per view
+        glcam_t:    (4, 4)    glcam_in_cvcam (shared)
+        pos_homo:   (V, 4)    mesh vertices in homogeneous coords (shared)
+        Returns alpha: (N, H, W, 1)
+        """
+        import nvdiffrast.torch as dr
+
+        faces = mesh_tensors["faces"]
+        ob_in_glcams = glcam_t[None] @ ob_in_cams              # (N, 4, 4)
+        proj_pose = proj_t @ ob_in_glcams                       # (N, 4, 4)
+        pos_clip = proj_pose[:, None] @ pos_homo[None, ..., None]   # (N, V, 4, 1)
+        pos_clip = pos_clip[..., 0]                             # (N, V, 4)
         rast_out, _ = dr.rasterize(glctx, pos_clip, faces, resolution=np.asarray([H, W]))
         alpha = torch.clamp(rast_out[..., -1:], 0, 1)
         if antialias:

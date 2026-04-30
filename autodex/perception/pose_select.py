@@ -46,6 +46,73 @@ def _render_silhouette(
     return rc[0].detach().cpu().numpy().sum(axis=2) > 0
 
 
+def _build_view_batch(
+    masks: Dict[str, np.ndarray],
+    intrinsics: Dict[str, np.ndarray],
+    extrinsics: Dict[str, np.ndarray],
+    H: int,
+    W: int,
+    device: str = "cuda",
+):
+    """Stack per-view tensors used by batched IoU rendering.
+
+    Returns (serials, mask_batch (N,H,W) bool, extrinsic_batch (N,4,4),
+             proj_batch (N,4,4), glcam_t (4,4)) or None if no valid views.
+    """
+    from Utils import projection_matrix_from_intrinsics, glcam_in_cvcam
+
+    serials: list = []
+    mask_list: list = []
+    extr_list: list = []
+    proj_list: list = []
+    for s, mask in masks.items():
+        if s not in intrinsics or s not in extrinsics:
+            continue
+        K = np.asarray(intrinsics[s], dtype=np.float32)
+        proj = projection_matrix_from_intrinsics(K, height=H, width=W,
+                                                  znear=0.001, zfar=100)
+        proj_list.append(torch.as_tensor(proj.reshape(4, 4), device=device,
+                                          dtype=torch.float32))
+        extr_list.append(torch.as_tensor(np.asarray(extrinsics[s]),
+                                          device=device, dtype=torch.float32))
+        mask_list.append(torch.as_tensor(mask, device=device, dtype=torch.bool))
+        serials.append(s)
+
+    if not serials:
+        return None
+
+    mask_batch = torch.stack(mask_list, dim=0)
+    extrinsic_batch = torch.stack(extr_list, dim=0)
+    proj_batch = torch.stack(proj_list, dim=0)
+    glcam_t = torch.as_tensor(glcam_in_cvcam, device=device, dtype=torch.float32)
+    return serials, mask_batch, extrinsic_batch, proj_batch, glcam_t
+
+
+def _render_silhouette_bool_batched(
+    H: int, W: int,
+    ob_in_cams: torch.Tensor,   # (N, 4, 4)
+    proj_t: torch.Tensor,       # (N, 4, 4)
+    glcam_t: torch.Tensor,      # (4, 4)
+    glctx,
+    mesh_tensors,
+) -> torch.Tensor:
+    """Batched silhouette mask render. Returns bool (N, H, W)."""
+    import nvdiffrast.torch as dr
+    from Utils import to_homo_torch
+
+    pos = mesh_tensors["pos"]
+    faces = mesh_tensors["faces"]
+    pos_homo = to_homo_torch(pos)
+    ob_in_glcams = glcam_t[None] @ ob_in_cams                     # (N, 4, 4)
+    proj_pose = proj_t @ ob_in_glcams                              # (N, 4, 4)
+    pos_clip = proj_pose[:, None] @ pos_homo[None, ..., None]      # (N, V, 4, 1)
+    pos_clip = pos_clip[..., 0]                                    # (N, V, 4)
+    rast_out, _ = dr.rasterize(glctx, pos_clip, faces, resolution=np.asarray([H, W]))
+    sil = rast_out[..., -1] > 0                                    # (N, H, W)
+    sil = torch.flip(sil, dims=[1])
+    return sil
+
+
 def compute_cross_view_iou(
     pose_world: np.ndarray,
     masks: Dict[str, np.ndarray],
@@ -56,49 +123,30 @@ def compute_cross_view_iou(
     glctx,
     mesh_tensors,
 ) -> Tuple[float, Dict[str, float]]:
-    """Mean IoU of rendered mesh vs SAM mask across all views.
+    """Mean IoU of rendered mesh vs SAM mask across all views (batched).
 
-    Stays on GPU per-view (boolean ops, intersection/union, division), only
-    transfers the final per-view scalars to CPU once at the end.
-
-    Args:
-        pose_world: 4x4 object pose in world frame.
-        masks: serial -> bool (H, W) mask. Skip serials missing here.
-        intrinsics: serial -> 3x3 K.
-        extrinsics: serial -> 4x4 world->cam.
-        H, W: image size.
-        glctx, mesh_tensors: nvdiffrast context + mesh tensors (pre-built).
-
-    Returns:
-        mean_iou, per_view_iou (serial -> float).
+    Stacks all valid views into a single rasterize call instead of looping.
+    Returns mean IoU and per-view IoU (serial -> float).
     """
-    from Utils import nvdiffrast_render
-
-    iou_tensors: list = []
-    serials: list = []
-    for s, mask in masks.items():
-        if s not in intrinsics or s not in extrinsics:
-            continue
-        K = np.asarray(intrinsics[s], dtype=np.float32)
-        pose_cam = extrinsics[s] @ pose_world
-        pt = torch.as_tensor(pose_cam, device="cuda", dtype=torch.float32).reshape(1, 4, 4)
-        rc, _, _ = nvdiffrast_render(
-            K=K, H=H, W=W, ob_in_cams=pt, glctx=glctx,
-            mesh_tensors=mesh_tensors, use_light=False,
-        )
-        sil_bool = rc[0].sum(dim=2) > 0
-        m_b = torch.as_tensor(mask, device="cuda")
-        inter = (sil_bool & m_b).sum().float()
-        union = (sil_bool | m_b).sum().float()
-        iou_tensors.append(torch.where(union > 0, inter / union,
-                                        torch.zeros_like(inter)))
-        serials.append(s)
-
-    if not iou_tensors:
+    batch = _build_view_batch(masks, intrinsics, extrinsics, H, W)
+    if batch is None:
         return 0.0, {}
-    iou_arr = torch.stack(iou_tensors).cpu().tolist()
+    serials, mask_batch, extrinsic_batch, proj_batch, glcam_t = batch
+
+    pose_world_t = torch.as_tensor(pose_world, device="cuda", dtype=torch.float32)
+    pose_cam_batch = extrinsic_batch @ pose_world_t                # (N, 4, 4)
+    sil = _render_silhouette_bool_batched(
+        H=H, W=W, ob_in_cams=pose_cam_batch, proj_t=proj_batch,
+        glcam_t=glcam_t, glctx=glctx, mesh_tensors=mesh_tensors,
+    )                                                              # (N, H, W) bool
+
+    inter = (sil & mask_batch).sum(dim=(1, 2)).float()
+    union = (sil | mask_batch).sum(dim=(1, 2)).float()
+    per_view_iou = torch.where(union > 0, inter / union, torch.zeros_like(inter))
+
+    iou_arr = per_view_iou.cpu().tolist()
     per_view = dict(zip(serials, iou_arr))
-    return float(np.mean(iou_arr)), per_view
+    return float(np.mean(iou_arr)) if iou_arr else 0.0, per_view
 
 
 def select_best_pose_by_iou(
