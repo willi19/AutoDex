@@ -375,6 +375,7 @@ class InitOrchestrator:
             initial_pose_world=best_pose,
             views=views,
             iters=sil_iters, lr=sil_lr,
+            antialias=True,
         )
         t_sil = time.perf_counter() - t_sil0
         logger.info(f"[orch] sil refine: {t_sil:.2f}s ({sil_iters} iters)")
@@ -391,6 +392,7 @@ class InitOrchestrator:
             "best_serial": best_serial,
             "best_iou": float(best_iou),
             "sil_loss": float(sil_loss),
+            "pre_sil_pose": np.asarray(best_pose, dtype=np.float64).tolist(),
         }
         self.mask_buf.drop(request_id); self.pose_buf.drop(request_id)
         return np.asarray(refined, dtype=np.float64), timing

@@ -99,10 +99,12 @@ def _load_calib(ep: Path):
     return intrinsics_full, extrinsics_full, H, W
 
 
-def _render_overlay(pose, image_root: Path, intr_undist, extr, H, W, glctx, mesh_tensors, out_dir: Path):
+def _render_overlay(pose, image_root: Path, intr_undist, extr, H, W, glctx, mesh_tensors,
+                     out_dir: Path, color_bgr=(0, 200, 0), label: str = ""):
     import torch
     from Utils import nvdiffrast_render
     out_dir.mkdir(parents=True, exist_ok=True)
+    color = np.array(color_bgr, dtype=np.float32)
     overlays = []
     for s in sorted(intr_undist.keys()):
         p = image_root / "images" / f"{s}.png"
@@ -119,7 +121,10 @@ def _render_overlay(pose, image_root: Path, intr_undist, extr, H, W, glctx, mesh
         render = rc[0].detach().cpu().numpy()
         mask = render.sum(axis=2) > 0
         overlay = bgr.copy()
-        overlay[mask] = (overlay[mask] * 0.5 + np.array([0, 200, 0]) * 0.5).astype(np.uint8)
+        overlay[mask] = (overlay[mask] * 0.5 + color * 0.5).astype(np.uint8)
+        if label:
+            cv2.putText(overlay, f"{label} {s}", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
         cv2.imwrite(str(out_dir / f"{s}.png"), overlay)
         overlays.append(cv2.resize(overlay, (W // 2, H // 2)))
     if overlays:
@@ -272,21 +277,25 @@ def main():
             else:
                 rec["ok"] = True
                 np.save(trial_dir / "pose_world.npy", pose)
-                if args.mode == "disk" and ep is not None:
+                pre_pose = np.asarray(timing.get("pre_sil_pose"), dtype=np.float64).reshape(4, 4) \
+                    if timing.get("pre_sil_pose") is not None else None
+                if pre_pose is not None:
+                    np.save(trial_dir / "pose_world_pre.npy", pre_pose)
+                image_root = ep if (args.mode == "disk" and ep is not None) else live_capture_dir
+                if image_root is not None:
                     t_ov0 = time.perf_counter()
-                    _render_overlay(pose, ep, intr_undist, extrinsics_full, H, W,
+                    if pre_pose is not None:
+                        _render_overlay(pre_pose, image_root, intr_undist, extrinsics_full, H, W,
+                                        orch._sil.glctx, orch._sil.mesh_tensors,
+                                        trial_dir / "overlay_pre",
+                                        color_bgr=(0, 200, 0), label="pre")
+                    _render_overlay(pose, image_root, intr_undist, extrinsics_full, H, W,
                                     orch._sil.glctx, orch._sil.mesh_tensors,
-                                    trial_dir / "overlay")
+                                    trial_dir / "overlay_post",
+                                    color_bgr=(0, 0, 255), label="post")
                     rec["overlay_s"] = time.perf_counter() - t_ov0
                 else:
-                    if live_capture_dir is not None:
-                        t_ov0 = time.perf_counter()
-                        _render_overlay(pose, live_capture_dir, intr_undist, extrinsics_full, H, W,
-                                        orch._sil.glctx, orch._sil.mesh_tensors,
-                                        trial_dir / "overlay")
-                        rec["overlay_s"] = time.perf_counter() - t_ov0
-                    else:
-                        rec["overlay_s"] = 0.0
+                    rec["overlay_s"] = 0.0
                 rec["total_s"] = float(timing["total_s"]) + rec["overlay_s"]
                 print(f"  OK   total {rec['total_s']:.2f}s "
                       f"(collect {timing['dispatch_to_collected_s']:.2f} "
