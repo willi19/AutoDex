@@ -129,47 +129,68 @@ def main():
 
     print("[fp] estimating per-view ...")
     per_view = fp.estimate_per_view(images, masks, K, T)
+    ok = {s: v for s, v in per_view.items() if v is not None}
+    for s in sorted(per_view.keys()):
+        print(f"  {s}: {'OK' if per_view[s] is not None else 'FAIL'}")
 
-    overlays = {}
-    for s in sorted(images.keys()):
-        v = per_view.get(s)
-        ov_rgb = images[s].copy()
-        if v is not None:
-            pose = v["pose_world"]
-            ov_rgb = _render_overlay(ov_rgb, pose, K[s], T[s], H, W,
-                                     glctx, mt, color=(0, 200, 0), alpha=0.5)
-            label = f"{s} q={v.get('quality', 0):.2f} in={v.get('inliers', 0)}"
-        else:
-            label = f"{s} FAIL"
-        ov_bgr = cv2.cvtColor(ov_rgb, cv2.COLOR_RGB2BGR)
-        cv2.putText(ov_bgr, label, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
-                    (255, 255, 255), 2)
-        overlays[s] = ov_bgr
-        print(f"  {s}: {'OK' if v is not None else 'FAIL'}")
+    # ── IoU best pose + silhouette refinement (matches foundpose_overlay_grid.py) ──
+    from autodex.perception.pose_select import select_best_pose_by_iou
+    cands_fp = {s: v["pose_world"] for s, v in ok.items()}
+    best_s, p_fp_pre, _, _ = select_best_pose_by_iou(
+        candidates=cands_fp, masks=masks,
+        intrinsics=K, extrinsics=T, H=H, W=W, glctx=glctx, mesh_tensors=mt,
+    )
+    print(f"[fp] best by IoU: {best_s}")
 
-    cols = 6
-    rows = (len(overlays) + cols - 1) // cols
-    scale = 0.3
-    keys = sorted(overlays.keys())
-    oh, ow = overlays[keys[0]].shape[:2]
-    th, tw = int(oh * scale), int(ow * scale)
-    grid = np.full((rows * th, cols * tw, 3), 40, dtype=np.uint8)
-    for i, k in enumerate(keys):
-        r, c = divmod(i, cols)
-        grid[r * th:(r + 1) * th, c * tw:(c + 1) * tw] = cv2.resize(overlays[k], (tw, th))
+    sil_views = [{
+        "mask": (masks[best_s].astype(np.uint8) * 255),
+        "K": K[best_s].astype(np.float32),
+        "extrinsic": T[best_s].astype(np.float64),
+    }]
+    print(f"[sil] refining over best view {best_s} ...")
+    p_fp_post, sil_loss = sil_opt.optimize(p_fp_pre, sil_views, iters=100, lr=0.002, antialias=True)
+    print(f"[sil] refine done: final_loss={sil_loss:.6f}")
 
-    out = args.out or str(ep / "foundpose_init_overlay.png")
-    cv2.imwrite(out, grid)
-    print(f"[done] saved {out}")
+    def _grid(pose, color, label_prefix):
+        ovs = {}
+        for s in sorted(images.keys()):
+            ov = _render_overlay(images[s], pose, K[s], T[s], H, W,
+                                  glctx, mt, color=color, alpha=0.5)
+            ov_bgr = cv2.cvtColor(ov, cv2.COLOR_RGB2BGR)
+            cv2.putText(ov_bgr, f"{label_prefix}{s}", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+            ovs[s] = ov_bgr
+        cols = 6
+        rows = (len(ovs) + cols - 1) // cols
+        scale = 0.3
+        keys = sorted(ovs.keys())
+        oh, ow = ovs[keys[0]].shape[:2]
+        th, tw = int(oh * scale), int(ow * scale)
+        g = np.full((rows * th, cols * tw, 3), 40, dtype=np.uint8)
+        for i, k in enumerate(keys):
+            r, c = divmod(i, cols)
+            g[r * th:(r + 1) * th, c * tw:(c + 1) * tw] = cv2.resize(ovs[k], (tw, th))
+        return g
+
+    pre_grid = _grid(p_fp_pre, (0, 200, 0), "pre ")
+    post_grid = _grid(p_fp_post, (0, 0, 255), "post ")
+
+    out_pre = args.out or str(ep / "foundpose_init_overlay_pre.png")
+    out_post = str(ep / "foundpose_init_overlay_post.png")
+    cv2.imwrite(out_pre, pre_grid)
+    cv2.imwrite(out_post, post_grid)
+    print(f"[done] saved {out_pre}")
+    print(f"[done] saved {out_post}")
 
     # Save raw per-view poses too
     poses_out = ep / "foundpose_init_poses.json"
-    dump = {}
+    dump = {"per_view": {}, "best_by_iou": best_s,
+            "fp_pre": p_fp_pre.tolist(), "fp_post": p_fp_post.tolist()}
     for s, v in per_view.items():
         if v is None:
-            dump[s] = None
+            dump["per_view"][s] = None
             continue
-        dump[s] = {
+        dump["per_view"][s] = {
             "pose_world": v["pose_world"].tolist(),
             "quality": float(v.get("quality", 0)),
             "inliers": int(v.get("inliers", 0)),
