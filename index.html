@@ -83,13 +83,13 @@
     <div class="wrap" style="margin-top:2.6rem;">
       <div class="prose">
         <p>AutoDex is an <b>automated real-world data-collection system</b> for dexterous grasping. It bridges the gap between scalable candidate generation and slow human teleoperation by physically testing generated grasps with a multi-finger robot hand and recording the outcome of each attempt.</p>
-        <p>The system automates unattended collection end to end: multi-view object pose estimation, candidate filtering and motion planning, collision-monitored execution, lift-and-hold outcome labeling, and object reset between trials. Across <b>100</b> household objects, AutoDex collects <b>3,593</b> physically labeled grasp trials with Allegro and Inspire hands. In our experiments, it achieves <b>4.8&times;</b> higher collection throughput than teleoperation, and retrieved grasps from the AutoDex database achieve <b>76%</b> real-world success compared with <b>34%</b> without real-world validation.</p>
+        <p>The system automates unattended collection end to end: multi-view object pose estimation, candidate filtering and motion planning, collision-monitored execution, lift-and-hold outcome labeling, and object reset between trials. Across <b>100</b> household objects, AutoDex collects <b>2,610</b> physically labeled grasp trials with Allegro and Inspire hands. In our experiments, it achieves <b>4.8&times;</b> higher collection throughput than teleoperation, and retrieved grasps from the AutoDex database achieve <b>76%</b> real-world success compared with <b>34%</b> without real-world validation.</p>
       </div>
     </div>
 
     <div class="wrap-wide" style="margin-top:2.6rem;">
       <div class="stat-strip">
-        <div class="stat"><div class="num">3,593</div><div class="lbl">grasp trials</div></div>
+        <div class="stat"><div class="num">2,610</div><div class="lbl">grasp trials</div></div>
         <div class="stat"><div class="num">100</div><div class="lbl">diverse objects</div></div>
         <div class="stat"><div class="num">4.8&times;</div><div class="lbl">faster than teleoperation</div></div>
         <div class="stat"><div class="num">2</div><div class="lbl">robot hands (Allegro, Inspire)</div></div>
@@ -172,8 +172,10 @@
   <!-- ================= DATASET / SCALE ================= -->
   <section class="soft" id="dataset">
     <div class="wrap-wide">
-      <h2 class="sec-title">3,593 Physically Labeled Grasp Trials</h2>
+      <h2 class="sec-title">2,610 Physically Labeled Grasp Trials</h2>
       <p class="sec-sub">Through autonomous real-robot execution, AutoDex collects dexterous-grasp trials across 100 objects, two hands, and multiple scene conditions. Each trial stores the executed grasp configuration, synchronized robot trajectory, 20-view RGB video, tracked object motion, and lift-and-hold success-or-failure label.</p>
+
+      <p style="text-align:center;margin:0 0 18px"><a class="hbtn" href="https://willi19.github.io/autodex-gallery/index.html" target="_blank" rel="noopener"><i class="fas fa-database"></i> Browse the Dataset</a></p>
 
       <div class="frame"><video class="lazyplay" controls autoplay muted loop playsinline poster="static/images/wall_poster.jpg"><source src="static/videos/dataset_wall.mp4" type="video/mp4"></video></div>
     </div>
